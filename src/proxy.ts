@@ -101,6 +101,8 @@ interface PendingExec {
   execMsgId: number;
   toolCallId: string;
   toolName: string;
+  /** Decoded arguments JSON string for SSE tool_calls emission. */
+  decodedArgs: string;
 }
 
 /** A bridge kept alive across requests for tool result continuation. */
@@ -553,15 +555,7 @@ function makeHeartbeatBytes(): Uint8Array {
 
 interface StreamState {
   thinkingActive: boolean;
-  /** Currently accumulating MCP tool call from interaction updates. */
-  currentToolCall: {
-    id: string;
-    name: string;
-    partialJson: string;
-    index: number;
-  } | null;
   toolCallIndex: number;
-  sentToolCalls: boolean;
   pendingExecs: PendingExec[];
 }
 
@@ -572,22 +566,12 @@ function processServerMessage(
   sendFrame: (data: Uint8Array) => void,
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
-  onToolCallStart: (index: number, id: string, name: string) => void,
-  onToolCallDelta: (index: number, delta: string) => void,
-  onToolCallEnd: (index: number, id: string, name: string, args: string) => void,
   onMcpExec: (exec: PendingExec) => void,
 ): void {
   const msgCase = msg.message.case;
 
   if (msgCase === "interactionUpdate") {
-    handleInteractionUpdate(
-      msg.message.value,
-      state,
-      onText,
-      onToolCallStart,
-      onToolCallDelta,
-      onToolCallEnd,
-    );
+    handleInteractionUpdate(msg.message.value, onText);
   } else if (msgCase === "kvServerMessage") {
     handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
   } else if (msgCase === "execServerMessage") {
@@ -600,13 +584,14 @@ function processServerMessage(
   }
 }
 
+/**
+ * Handle interaction updates — text and thinking only.
+ * MCP tool calls are handled entirely via mcpArgs exec messages,
+ * not through interaction update callbacks.
+ */
 function handleInteractionUpdate(
   update: any,
-  state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
-  onToolCallStart: (index: number, id: string, name: string) => void,
-  onToolCallDelta: (index: number, delta: string) => void,
-  onToolCallEnd: (index: number, id: string, name: string, args: string) => void,
 ): void {
   const updateCase = update.message?.case;
 
@@ -616,40 +601,10 @@ function handleInteractionUpdate(
   } else if (updateCase === "thinkingDelta") {
     const delta = update.message.value.text || "";
     if (delta) onText(delta, true);
-  } else if (updateCase === "toolCallStarted") {
-    const toolCall = update.message.value.toolCall;
-    if (toolCall?.mcpToolCall) {
-      const mcpCall = toolCall.mcpToolCall;
-      const args = mcpCall.args || {};
-      const id = args.toolCallId || crypto.randomUUID();
-      const name = args.name || args.toolName || "";
-      const index = state.toolCallIndex++;
-      state.currentToolCall = { id, name, partialJson: "", index };
-      state.sentToolCalls = true;
-      onToolCallStart(index, id, name);
-    }
-  } else if (updateCase === "toolCallDelta" || updateCase === "partialToolCall") {
-    if (state.currentToolCall) {
-      const delta = update.message.value.argsTextDelta || "";
-      state.currentToolCall.partialJson += delta;
-      onToolCallDelta(state.currentToolCall.index, delta);
-    }
-  } else if (updateCase === "toolCallCompleted") {
-    if (state.currentToolCall) {
-      const tc = state.currentToolCall;
-      // Try to use the final decoded args from the completed message
-      const toolCall = update.message.value.toolCall;
-      let finalArgs = tc.partialJson;
-      if (toolCall?.mcpToolCall?.args?.args) {
-        try {
-          const decoded = decodeMcpArgsMap(toolCall.mcpToolCall.args.args);
-          finalArgs = JSON.stringify(decoded);
-        } catch {}
-      }
-      onToolCallEnd(tc.index, tc.id, tc.name, finalArgs);
-      state.currentToolCall = null;
-    }
   }
+  // toolCallStarted, partialToolCall, toolCallDelta, toolCallCompleted
+  // are intentionally ignored. MCP tool calls flow through the exec
+  // message path (mcpArgs → mcpResult), not interaction updates.
 }
 
 function handleKvMessage(
@@ -745,14 +700,15 @@ function handleExecMessage(
     );
   } else if (execCase === "mcpArgs") {
     // The model wants to execute one of our MCP tools.
-    // We don't execute it here — we tell the caller so it can return
-    // tool_calls to OpenCode and pause the stream.
-    const args = execMsg.message.value;
+    // Decode the args and tell the caller so it can emit tool_calls SSE.
+    const mcpArgs = execMsg.message.value;
+    const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
     onMcpExec({
       execId: execMsg.execId,
       execMsgId: execMsg.id,
-      toolCallId: args.toolCallId,
-      toolName: args.toolName || args.name,
+      toolCallId: mcpArgs.toolCallId || crypto.randomUUID(),
+      toolName: mcpArgs.toolName || mcpArgs.name,
+      decodedArgs: JSON.stringify(decoded),
     });
   } else if (execCase === "listMcpResourcesExecArgs" ||
              execCase === "readMcpResourceExecArgs" ||
@@ -837,9 +793,7 @@ function handleStreamingResponse(
 
       const state: StreamState = {
         thinkingActive: false,
-        currentToolCall: null,
         toolCallIndex: 0,
-        sentToolCalls: false,
         pendingExecs: [],
       };
 
@@ -900,35 +854,32 @@ function handleStreamingResponse(
                   sendSSE(makeChunk({ content: text }));
                 }
               },
-              // onToolCallStart
-              (index, id, name) => {
-                sendSSE(makeChunk({
-                  tool_calls: [{
-                    index,
-                    id,
-                    type: "function",
-                    function: { name, arguments: "" },
-                  }],
-                }));
-              },
-              // onToolCallDelta
-              (index, delta) => {
-                sendSSE(makeChunk({
-                  tool_calls: [{
-                    index,
-                    function: { arguments: delta },
-                  }],
-                }));
-              },
-              // onToolCallEnd — nothing extra to send, AI SDK handles completion
-              () => {},
-              // onMcpExec — the model wants to execute a tool
+              // onMcpExec — the model wants to execute a tool.
               (exec) => {
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
 
+                // Close thinking if active
+                if (state.thinkingActive) {
+                  sendSSE(makeChunk({ content: "</think>" }));
+                  state.thinkingActive = false;
+                }
+
+                // Emit tool_calls with decoded arguments
+                const toolCallIndex = state.toolCallIndex++;
+                sendSSE(makeChunk({
+                  tool_calls: [{
+                    index: toolCallIndex,
+                    id: exec.toolCallId,
+                    type: "function",
+                    function: {
+                      name: exec.toolName,
+                      arguments: exec.decodedArgs,
+                    },
+                  }],
+                }));
+
                 // Keep the bridge alive for tool result continuation.
-                // End the SSE stream so OpenCode can execute tools and come back.
                 activeBridges.set(bridgeKey, {
                   bridge,
                   heartbeatTimer,
@@ -937,12 +888,6 @@ function handleStreamingResponse(
                   pendingExecs: state.pendingExecs,
                   onResume: null,
                 });
-
-                // Close thinking if active
-                if (state.thinkingActive) {
-                  sendSSE(makeChunk({ content: "</think>" }));
-                  state.thinkingActive = false;
-                }
 
                 sendSSE(makeChunk({}, "tool_calls"));
                 sendDone();
@@ -964,8 +909,7 @@ function handleStreamingResponse(
           if (state.thinkingActive) {
             sendSSE(makeChunk({ content: "</think>" }));
           }
-          const finishReason = state.sentToolCalls ? "tool_calls" : "stop";
-          sendSSE(makeChunk({}, finishReason));
+          sendSSE(makeChunk({}, "stop"));
           sendDone();
           closeController();
         }
@@ -1081,9 +1025,7 @@ function handleToolResultResume(
 
       const state: StreamState = {
         thinkingActive: false,
-        currentToolCall: null,
         toolCallIndex: 0,
-        sentToolCalls: false,
         pendingExecs: [],
       };
 
@@ -1136,27 +1078,27 @@ function handleToolResultResume(
                   sendSSE(makeChunk({ content: text }));
                 }
               },
-              (index, id, name) => {
-                sendSSE(makeChunk({
-                  tool_calls: [{
-                    index, id,
-                    type: "function",
-                    function: { name, arguments: "" },
-                  }],
-                }));
-              },
-              (index, delta) => {
-                sendSSE(makeChunk({
-                  tool_calls: [{
-                    index,
-                    function: { arguments: delta },
-                  }],
-                }));
-              },
-              () => {},
               (exec) => {
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
+
+                if (state.thinkingActive) {
+                  sendSSE(makeChunk({ content: "</think>" }));
+                  state.thinkingActive = false;
+                }
+
+                const toolCallIndex = state.toolCallIndex++;
+                sendSSE(makeChunk({
+                  tool_calls: [{
+                    index: toolCallIndex,
+                    id: exec.toolCallId,
+                    type: "function",
+                    function: {
+                      name: exec.toolName,
+                      arguments: exec.decodedArgs,
+                    },
+                  }],
+                }));
 
                 activeBridges.set(bridgeKey, {
                   bridge,
@@ -1166,11 +1108,6 @@ function handleToolResultResume(
                   pendingExecs: state.pendingExecs,
                   onResume: null,
                 });
-
-                if (state.thinkingActive) {
-                  sendSSE(makeChunk({ content: "</think>" }));
-                  state.thinkingActive = false;
-                }
 
                 sendSSE(makeChunk({}, "tool_calls"));
                 sendDone();
@@ -1192,8 +1129,7 @@ function handleToolResultResume(
           if (state.thinkingActive) {
             sendSSE(makeChunk({ content: "</think>" }));
           }
-          const finishReason = state.sentToolCalls ? "tool_calls" : "stop";
-          sendSSE(makeChunk({}, finishReason));
+          sendSSE(makeChunk({}, "stop"));
           sendDone();
           closeController();
         }
@@ -1266,9 +1202,7 @@ async function collectFullResponse(
   let pendingBuffer = Buffer.alloc(0);
   const state: StreamState = {
     thinkingActive: false,
-    currentToolCall: null,
     toolCallIndex: 0,
-    sentToolCalls: false,
     pendingExecs: [],
   };
 
@@ -1297,7 +1231,7 @@ async function collectFullResponse(
           (data) => bridge.write(data),
           state,
           (text) => { fullText += text; },
-          () => {}, () => {}, () => {}, () => {},
+          () => {},
         );
       } catch {
         // Skip
