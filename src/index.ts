@@ -19,7 +19,7 @@ const CURSOR_PROVIDER_ID = "cursor";
 
 /**
  * OpenCode plugin that provides Cursor authentication and model access.
- * Register in opencode.json: { "plugin": ["opencode-cursor-auth"] }
+ * Register in opencode.json: { "plugin": ["opencode-cursor-oauth"] }
  */
 export const CursorAuthPlugin: Plugin = async (
   input: PluginInput,
