@@ -26,9 +26,19 @@ import {
   AgentConversationTurnStructureSchema,
   ConversationTurnStructureSchema,
   AssistantMessageSchema,
+  BackgroundShellSpawnResultSchema,
+  DeleteResultSchema,
+  DeleteRejectedSchema,
+  DiagnosticsResultSchema,
   ExecClientMessageSchema,
+  FetchErrorSchema,
+  FetchResultSchema,
   GetBlobResultSchema,
+  GrepErrorSchema,
+  GrepResultSchema,
   KvClientMessageSchema,
+  LsRejectedSchema,
+  LsResultSchema,
   McpErrorSchema,
   McpResultSchema,
   McpSuccessSchema,
@@ -37,12 +47,20 @@ import {
   McpToolNotFoundSchema,
   McpToolResultContentItemSchema,
   ModelDetailsSchema,
+  ReadRejectedSchema,
+  ReadResultSchema,
   RequestContextResultSchema,
   RequestContextSchema,
   RequestContextSuccessSchema,
   SetBlobResultSchema,
+  ShellRejectedSchema,
+  ShellResultSchema,
   UserMessageActionSchema,
   UserMessageSchema,
+  WriteRejectedSchema,
+  WriteResultSchema,
+  WriteShellStdinErrorSchema,
+  WriteShellStdinResultSchema,
   type AgentServerMessage,
   type ExecServerMessage,
   type KvServerMessage,
@@ -663,7 +681,6 @@ function handleExecMessage(
   const execCase = execMsg.message.case;
 
   if (execCase === "requestContextArgs") {
-    // Pass our MCP tool definitions so the model knows about OpenCode's tools
     const requestContext = create(RequestContextSchema, {
       rules: [],
       repositoryInfo: [],
@@ -674,33 +691,17 @@ function handleExecMessage(
       fileContents: {},
       customSubagents: [],
     });
-
     const result = create(RequestContextResultSchema, {
       result: {
         case: "success",
         value: create(RequestContextSuccessSchema, { requestContext }),
       },
     });
+    sendExecResult(execMsg, "requestContextResult", result, sendFrame);
+    return;
+  }
 
-    const execClientMessage = create(ExecClientMessageSchema, {
-      id: execMsg.id,
-      execId: execMsg.execId,
-      message: {
-        case: "requestContextResult" as any,
-        value: result as any,
-      },
-    });
-
-    const clientMessage = create(AgentClientMessageSchema, {
-      message: { case: "execClientMessage", value: execClientMessage },
-    });
-
-    sendFrame(
-      frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)),
-    );
-  } else if (execCase === "mcpArgs") {
-    // The model wants to execute one of our MCP tools.
-    // Decode the args and tell the caller so it can emit tool_calls SSE.
+  if (execCase === "mcpArgs") {
     const mcpArgs = execMsg.message.value;
     const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
     onMcpExec({
@@ -710,32 +711,139 @@ function handleExecMessage(
       toolName: mcpArgs.toolName || mcpArgs.name,
       decodedArgs: JSON.stringify(decoded),
     });
-  } else if (execCase === "listMcpResourcesExecArgs" ||
-             execCase === "readMcpResourceExecArgs" ||
-             execCase === "recordScreenArgs" ||
-             execCase === "computerUseArgs") {
-    // Unsupported exec types — send empty result
-    const caseMap: Record<string, string> = {
-      listMcpResourcesExecArgs: "listMcpResourcesExecResult",
-      readMcpResourceExecArgs: "readMcpResourceExecResult",
-      recordScreenArgs: "recordScreenResult",
-      computerUseArgs: "computerUseResult",
-    };
-    const resultCase = caseMap[execCase];
-    if (resultCase) {
-      const execClientMessage = create(ExecClientMessageSchema, {
-        id: execMsg.id,
-        execId: execMsg.execId,
-        message: { case: resultCase as any, value: create(McpResultSchema, {}) as any },
-      });
-      const clientMessage = create(AgentClientMessageSchema, {
-        message: { case: "execClientMessage", value: execClientMessage },
-      });
-      sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
-    }
+    return;
   }
-  // All other exec types (shell, read, write, grep, etc.) are silently ignored.
-  // The model will see no result and fall back to text generation.
+
+  // --- Reject native Cursor tools ---
+  // The model tries these first. We must respond with rejection/error
+  // so it falls back to our MCP tools (registered via RequestContext).
+  const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
+
+  if (execCase === "readArgs") {
+    const args = execMsg.message.value;
+    const result = create(ReadResultSchema, {
+      result: { case: "rejected", value: create(ReadRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
+    });
+    sendExecResult(execMsg, "readResult", result, sendFrame);
+    return;
+  }
+  if (execCase === "lsArgs") {
+    const args = execMsg.message.value;
+    const result = create(LsResultSchema, {
+      result: { case: "rejected", value: create(LsRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
+    });
+    sendExecResult(execMsg, "lsResult", result, sendFrame);
+    return;
+  }
+  if (execCase === "grepArgs") {
+    const result = create(GrepResultSchema, {
+      result: { case: "error", value: create(GrepErrorSchema, { error: REJECT_REASON }) },
+    });
+    sendExecResult(execMsg, "grepResult", result, sendFrame);
+    return;
+  }
+  if (execCase === "writeArgs") {
+    const args = execMsg.message.value;
+    const result = create(WriteResultSchema, {
+      result: { case: "rejected", value: create(WriteRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
+    });
+    sendExecResult(execMsg, "writeResult", result, sendFrame);
+    return;
+  }
+  if (execCase === "deleteArgs") {
+    const args = execMsg.message.value;
+    const result = create(DeleteResultSchema, {
+      result: { case: "rejected", value: create(DeleteRejectedSchema, { path: args.path, reason: REJECT_REASON }) },
+    });
+    sendExecResult(execMsg, "deleteResult", result, sendFrame);
+    return;
+  }
+  if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
+    const args = execMsg.message.value;
+    const result = create(ShellResultSchema, {
+      result: {
+        case: "rejected",
+        value: create(ShellRejectedSchema, {
+          command: args.command ?? "",
+          workingDirectory: args.workingDirectory ?? "",
+          reason: REJECT_REASON,
+          isReadonly: false,
+        }),
+      },
+    });
+    sendExecResult(execMsg, "shellResult", result, sendFrame);
+    return;
+  }
+  if (execCase === "backgroundShellSpawnArgs") {
+    const args = execMsg.message.value;
+    const result = create(BackgroundShellSpawnResultSchema, {
+      result: {
+        case: "rejected",
+        value: create(ShellRejectedSchema, {
+          command: args.command ?? "",
+          workingDirectory: args.workingDirectory ?? "",
+          reason: REJECT_REASON,
+          isReadonly: false,
+        }),
+      },
+    });
+    sendExecResult(execMsg, "backgroundShellSpawnResult", result, sendFrame);
+    return;
+  }
+  if (execCase === "writeShellStdinArgs") {
+    const result = create(WriteShellStdinResultSchema, {
+      result: { case: "error", value: create(WriteShellStdinErrorSchema, { error: REJECT_REASON }) },
+    });
+    sendExecResult(execMsg, "writeShellStdinResult", result, sendFrame);
+    return;
+  }
+  if (execCase === "fetchArgs") {
+    const args = execMsg.message.value;
+    const result = create(FetchResultSchema, {
+      result: { case: "error", value: create(FetchErrorSchema, { url: args.url ?? "", error: REJECT_REASON }) },
+    });
+    sendExecResult(execMsg, "fetchResult", result, sendFrame);
+    return;
+  }
+  if (execCase === "diagnosticsArgs") {
+    const result = create(DiagnosticsResultSchema, {});
+    sendExecResult(execMsg, "diagnosticsResult", result, sendFrame);
+    return;
+  }
+
+  // MCP resource/screen/computer exec types
+  const miscCaseMap: Record<string, string> = {
+    listMcpResourcesExecArgs: "listMcpResourcesExecResult",
+    readMcpResourceExecArgs: "readMcpResourceExecResult",
+    recordScreenArgs: "recordScreenResult",
+    computerUseArgs: "computerUseResult",
+  };
+  const resultCase = miscCaseMap[execCase as string];
+  if (resultCase) {
+    sendExecResult(execMsg, resultCase, create(McpResultSchema, {}), sendFrame);
+    return;
+  }
+
+  // Unknown exec type — log and ignore
+  console.error(`[proxy] unhandled exec: ${execCase}`);
+}
+
+/** Send an exec client message back to Cursor. */
+function sendExecResult(
+  execMsg: ExecServerMessage,
+  messageCase: string,
+  value: unknown,
+  sendFrame: (data: Uint8Array) => void,
+): void {
+  const execClientMessage = create(ExecClientMessageSchema, {
+    id: execMsg.id,
+    execId: execMsg.execId,
+    message: { case: messageCase as any, value: value as any },
+  });
+  const clientMessage = create(AgentClientMessageSchema, {
+    message: { case: "execClientMessage", value: execClientMessage },
+  });
+  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
 // --- Bridge Key ---
