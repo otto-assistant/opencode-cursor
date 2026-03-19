@@ -1,0 +1,125 @@
+/**
+ * Smoke test: verify the proxy starts, accepts requests, and the
+ * plugin exports the correct shape.
+ */
+import { startProxy, stopProxy, getProxyPort } from "../src/proxy";
+import { generateCursorAuthParams, getTokenExpiry } from "../src/auth";
+import { CursorAuthPlugin } from "../src/index";
+
+async function testProxyStartStop() {
+  console.log("[test] Starting proxy...");
+  const port = await startProxy(async () => "test-token");
+  console.log(`[test] Proxy started on port ${port}`);
+
+  if (typeof port !== "number" || port < 1) {
+    throw new Error(`Expected a valid port number, got ${port}`);
+  }
+  if (getProxyPort() !== port) {
+    throw new Error("getProxyPort() mismatch");
+  }
+
+  // Test that the proxy responds to /v1/models
+  const modelsRes = await fetch(`http://localhost:${port}/v1/models`);
+  if (!modelsRes.ok) {
+    throw new Error(`/v1/models returned ${modelsRes.status}`);
+  }
+  const modelsBody = await modelsRes.json();
+  if (modelsBody.object !== "list") {
+    throw new Error(`Expected object=list, got ${modelsBody.object}`);
+  }
+  console.log("[test] /v1/models OK");
+
+  // Test that /v1/chat/completions rejects empty messages
+  const badRes = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "test", messages: [] }),
+  });
+  if (badRes.status !== 400) {
+    throw new Error(`Expected 400 for empty messages, got ${badRes.status}`);
+  }
+  console.log("[test] Empty message validation OK");
+
+  // Test 404 for unknown routes
+  const notFoundRes = await fetch(`http://localhost:${port}/unknown`);
+  if (notFoundRes.status !== 404) {
+    throw new Error(`Expected 404, got ${notFoundRes.status}`);
+  }
+  console.log("[test] 404 handling OK");
+
+  stopProxy();
+  if (getProxyPort() !== undefined) {
+    throw new Error("Proxy port should be undefined after stop");
+  }
+  console.log("[test] Proxy stop OK");
+}
+
+async function testAuthParams() {
+  console.log("[test] Generating auth params...");
+  const params = await generateCursorAuthParams();
+
+  if (!params.verifier || !params.challenge || !params.uuid || !params.loginUrl) {
+    throw new Error("Missing auth params");
+  }
+  if (!params.loginUrl.includes("cursor.com/loginDeepControl")) {
+    throw new Error(`Unexpected login URL: ${params.loginUrl}`);
+  }
+  if (!params.loginUrl.includes(params.uuid)) {
+    throw new Error("Login URL missing UUID");
+  }
+  console.log("[test] Auth params OK");
+}
+
+async function testTokenExpiry() {
+  console.log("[test] Testing token expiry parsing...");
+
+  // Create a fake JWT with exp in the future
+  const header = btoa(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  const futureExp = Math.floor(Date.now() / 1000) + 7200; // 2 hours from now
+  const payload = btoa(JSON.stringify({ exp: futureExp }));
+  const fakeJwt = `${header}.${payload}.fakesig`;
+
+  const expiry = getTokenExpiry(fakeJwt);
+  const expectedMin = futureExp * 1000 - 5 * 60 * 1000 - 1000;
+  const expectedMax = futureExp * 1000 - 5 * 60 * 1000 + 1000;
+
+  if (expiry < expectedMin || expiry > expectedMax) {
+    throw new Error(`Token expiry ${expiry} out of expected range [${expectedMin}, ${expectedMax}]`);
+  }
+
+  // Test fallback for invalid token
+  const fallbackExpiry = getTokenExpiry("not-a-jwt");
+  const now = Date.now();
+  if (fallbackExpiry < now || fallbackExpiry > now + 4000 * 1000) {
+    throw new Error(`Fallback expiry ${fallbackExpiry} unexpected`);
+  }
+
+  console.log("[test] Token expiry OK");
+}
+
+async function testPluginShape() {
+  console.log("[test] Checking plugin export shape...");
+
+  if (typeof CursorAuthPlugin !== "function") {
+    throw new Error("CursorAuthPlugin is not a function");
+  }
+
+  console.log("[test] Plugin shape OK");
+}
+
+
+async function main() {
+  try {
+    await testProxyStartStop();
+    await testAuthParams();
+    await testTokenExpiry();
+    await testPluginShape();
+    console.log("\n✓ All smoke tests passed");
+    process.exit(0);
+  } catch (err) {
+    console.error("\n✗ Smoke test failed:", err);
+    process.exit(1);
+  }
+}
+
+main();
