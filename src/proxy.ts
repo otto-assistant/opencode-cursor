@@ -172,6 +172,8 @@ function spawnBridge(accessToken: string): {
   end: () => void;
   onData: (cb: (chunk: Buffer) => void) => void;
   onClose: (cb: (code: number) => void) => void;
+  /** True while the bridge subprocess is still running. */
+  get alive(): boolean;
 } {
   const proc = Bun.spawn(["node", BRIDGE_PATH], {
     stdin: "pipe",
@@ -190,6 +192,10 @@ function spawnBridge(accessToken: string): {
     data: null as ((chunk: Buffer) => void) | null,
     close: null as ((code: number) => void) | null,
   };
+
+  // Track exit state so late onClose registrations fire immediately.
+  let exited = false;
+  let exitCode = 1;
 
   (async () => {
     const reader = proc.stdout.getReader();
@@ -213,11 +219,15 @@ function spawnBridge(accessToken: string): {
       // Stream ended
     }
 
-    proc.exited.then((code) => cbs.close?.(code ?? 1));
+    const code = await proc.exited ?? 1;
+    exited = true;
+    exitCode = code;
+    cbs.close?.(code);
   })();
 
   return {
     proc,
+    get alive() { return !exited; },
     write(data) {
       try { proc.stdin.write(lpEncode(data)); } catch {}
     },
@@ -228,7 +238,14 @@ function spawnBridge(accessToken: string): {
       } catch {}
     },
     onData(cb) { cbs.data = cb; },
-    onClose(cb) { cbs.close = cb; },
+    onClose(cb) {
+      if (exited) {
+        // Process already exited — invoke immediately so streams don't hang.
+        queueMicrotask(() => cb(exitCode));
+      } else {
+        cbs.close = cb;
+      }
+    },
   };
 }
 
@@ -321,20 +338,33 @@ function handleChatCompletion(
   const activeBridge = activeBridges.get(bridgeKey);
 
   if (activeBridge && toolResults.length > 0) {
-    // Resume an existing bridge with tool results
     activeBridges.delete(bridgeKey);
-    return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey);
+
+    if (activeBridge.bridge.alive) {
+      // Resume the live bridge with tool results
+      return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey);
+    }
+
+    // Bridge died (timeout, server disconnect, etc.).
+    // Clean up and fall through to start a fresh bridge.
+    clearInterval(activeBridge.heartbeatTimer);
+    activeBridge.bridge.end();
   }
 
   // Clean up stale bridge if present
-  if (activeBridge) {
+  if (activeBridge && activeBridges.has(bridgeKey)) {
     clearInterval(activeBridge.heartbeatTimer);
     activeBridge.bridge.end();
     activeBridges.delete(bridgeKey);
   }
 
+  // Build the request. When tool results are present but the bridge died,
+  // we must still include the last user text so Cursor has context.
   const mcpTools = buildMcpToolDefinitions(tools);
-  const payload = buildCursorRequest(modelId, systemPrompt, userText, turns);
+  const effectiveUserText = userText || (toolResults.length > 0
+    ? toolResults.map((r) => r.content).join("\n")
+    : "");
+  const payload = buildCursorRequest(modelId, systemPrompt, effectiveUserText, turns);
   payload.mcpTools = mcpTools;
 
   if (body.stream === false) {
@@ -866,11 +896,11 @@ function sendExecResult(
 
 /** Derive a stable key to associate a bridge with a conversation. */
 function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
-  // Use a hash of the first user message + model as a stable key.
-  // This is imperfect but sufficient for single-session use.
-  const firstUser = messages.find((m) => m.role === "user")?.content ?? "";
+  // Stable key from model + first user message text.
+  const firstUserMsg = messages.find((m) => m.role === "user");
+  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   return createHash("sha256")
-    .update(`${modelId}:${firstUser.slice(0, 200)}`)
+    .update(`${modelId}:${firstUserText.slice(0, 200)}`)
     .digest("hex")
     .slice(0, 16);
 }
@@ -1003,7 +1033,7 @@ function createBridgeStreamResponse(
 
       bridge.onData(processChunk);
 
-      bridge.onClose(() => {
+      bridge.onClose((code) => {
         clearInterval(heartbeatTimer);
         if (!mcpExecReceived) {
           if (state.thinkingActive) {
@@ -1012,6 +1042,15 @@ function createBridgeStreamResponse(
           sendSSE(makeChunk({}, "stop"));
           sendDone();
           closeController();
+        } else if (code !== 0) {
+          // Bridge died while tool calls are pending (timeout, crash, etc.).
+          // Close the SSE stream so the client doesn't hang forever.
+          sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
+          sendSSE(makeChunk({}, "stop"));
+          sendDone();
+          closeController();
+          // Remove stale entry so the next request doesn't try to resume it.
+          activeBridges.delete(bridgeKey);
         }
       });
     },
