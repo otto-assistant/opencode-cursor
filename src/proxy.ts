@@ -81,9 +81,15 @@ interface OpenAIToolCall {
   function: { name: string; arguments: string };
 }
 
+/** A single element in an OpenAI multi-part content array. */
+interface ContentPart {
+  type: string;
+  text?: string;
+}
+
 interface OpenAIMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
+  content: string | null | ContentPart[];
   tool_call_id?: string;
   tool_calls?: OpenAIToolCall[];
 }
@@ -357,6 +363,21 @@ interface ParsedMessages {
   toolResults: ToolResultInfo[];
 }
 
+/**
+ * Normalize OpenAI message content to a plain string.
+ * Content can arrive as a string, null, or an array of content parts
+ * (e.g. [{type:"text",text:"..."}]). The array form is used by the
+ * AI SDK for multi-part messages such as plan-mode system reminders.
+ */
+function textContent(content: OpenAIMessage["content"]): string {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  return content
+    .filter((p) => p.type === "text" && p.text)
+    .map((p) => p.text!)
+    .join("\n");
+}
+
 function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
   const pairs: Array<{ userText: string; assistantText: string }> = [];
@@ -365,7 +386,7 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   // Collect system messages
   const systemParts = messages
     .filter((m) => m.role === "system")
-    .map((m) => m.content ?? "");
+    .map((m) => textContent(m.content));
   if (systemParts.length > 0) {
     systemPrompt = systemParts.join("\n");
   }
@@ -378,16 +399,16 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     if (msg.role === "tool") {
       toolResults.push({
         toolCallId: msg.tool_call_id ?? "",
-        content: msg.content ?? "",
+        content: textContent(msg.content),
       });
     } else if (msg.role === "user") {
       if (pendingUser) {
         pairs.push({ userText: pendingUser, assistantText: "" });
       }
-      pendingUser = msg.content ?? "";
+      pendingUser = textContent(msg.content);
     } else if (msg.role === "assistant") {
       // Skip assistant messages that are just tool_calls with no text
-      const text = msg.content ?? "";
+      const text = textContent(msg.content);
       if (pendingUser) {
         pairs.push({ userText: pendingUser, assistantText: text });
         pendingUser = "";
