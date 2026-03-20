@@ -44,7 +44,6 @@ import {
   McpSuccessSchema,
   McpTextContentSchema,
   McpToolDefinitionSchema,
-  McpToolNotFoundSchema,
   McpToolResultContentItemSchema,
   ModelDetailsSchema,
   ReadRejectedSchema,
@@ -77,8 +76,6 @@ const SSE_HEADERS = {
   "Cache-Control": "no-cache",
   Connection: "keep-alive",
 } as const;
-
-
 
 interface OpenAIToolCall {
   id: string;
@@ -141,15 +138,12 @@ interface ActiveBridge {
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
-  /** Resolve function to resume streaming after tool results are sent. */
-  onResume: ((sendFrame: (data: Uint8Array) => void) => void) | null;
 }
 
 // Active bridges keyed by a session token (derived from conversation state).
 // When tool_calls are returned, the bridge stays alive. The next request
 // with tool results looks up the bridge and sends mcpResult messages.
 const activeBridges = new Map<string, ActiveBridge>();
-
 
 /** Length-prefix a message: [4-byte BE length][payload] */
 function lpEncode(data: Uint8Array): Buffer {
@@ -238,7 +232,6 @@ function spawnBridge(accessToken: string): {
   };
 }
 
-
 let proxyServer: ReturnType<typeof Bun.serve> | undefined;
 let proxyPort: number | undefined;
 
@@ -296,13 +289,12 @@ export function stopProxy(): void {
     proxyPort = undefined;
   }
   // Clean up any lingering bridges
-  for (const [key, active] of activeBridges) {
+  for (const active of activeBridges.values()) {
     clearInterval(active.heartbeatTimer);
     active.bridge.end();
-    activeBridges.delete(key);
   }
+  activeBridges.clear();
 }
-
 
 function handleChatCompletion(
   body: ChatCompletionRequest,
@@ -350,7 +342,6 @@ function handleChatCompletion(
   }
   return handleStreamingResponse(payload, accessToken, modelId, bridgeKey);
 }
-
 
 interface ToolResultInfo {
   toolCallId: string;
@@ -423,7 +414,6 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   return { systemPrompt, userText: lastUserText, turns: pairs, toolResults };
 }
 
-
 /** Convert OpenAI tool definitions to Cursor's MCP tool protobuf format. */
 function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
   return tools.map((t) => {
@@ -460,7 +450,6 @@ function decodeMcpArgsMap(args: Record<string, Uint8Array>): Record<string, unkn
   }
   return decoded;
 }
-
 
 function buildCursorRequest(
   modelId: string,
@@ -557,7 +546,6 @@ function buildCursorRequest(
   };
 }
 
-
 function parseConnectEndStream(data: Uint8Array): Error | null {
   try {
     const payload = JSON.parse(new TextDecoder().decode(data));
@@ -609,7 +597,6 @@ function createConnectFrameParser(
   };
 }
 
-
 interface StreamState {
   thinkingActive: boolean;
   toolCallIndex: number;
@@ -659,6 +646,23 @@ function handleInteractionUpdate(
   // message path (mcpArgs → mcpResult), not interaction updates.
 }
 
+/** Send a KV client response back to Cursor. */
+function sendKvResponse(
+  kvMsg: KvServerMessage,
+  messageCase: string,
+  value: unknown,
+  sendFrame: (data: Uint8Array) => void,
+): void {
+  const response = create(KvClientMessageSchema, {
+    id: kvMsg.id,
+    message: { case: messageCase as any, value: value as any },
+  });
+  const clientMsg = create(AgentClientMessageSchema, {
+    message: { case: "kvClientMessage", value: response },
+  });
+  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMsg)));
+}
+
 function handleKvMessage(
   kvMsg: KvServerMessage,
   blobStore: Map<string, Uint8Array>,
@@ -670,38 +674,18 @@ function handleKvMessage(
     const blobId = kvMsg.message.value.blobId;
     const blobIdKey = Buffer.from(blobId).toString("hex");
     const blobData = blobStore.get(blobIdKey);
-
-    const response = create(KvClientMessageSchema, {
-      id: kvMsg.id,
-      message: {
-        case: "getBlobResult",
-        value: create(GetBlobResultSchema, blobData ? { blobData } : {}),
-      },
-    });
-
-    const clientMsg = create(AgentClientMessageSchema, {
-      message: { case: "kvClientMessage", value: response },
-    });
-    sendFrame(
-      frameConnectMessage(toBinary(AgentClientMessageSchema, clientMsg)),
+    sendKvResponse(
+      kvMsg, "getBlobResult",
+      create(GetBlobResultSchema, blobData ? { blobData } : {}),
+      sendFrame,
     );
   } else if (kvCase === "setBlobArgs") {
     const { blobId, blobData } = kvMsg.message.value;
     blobStore.set(Buffer.from(blobId).toString("hex"), blobData);
-
-    const response = create(KvClientMessageSchema, {
-      id: kvMsg.id,
-      message: {
-        case: "setBlobResult",
-        value: create(SetBlobResultSchema, {}),
-      },
-    });
-
-    const clientMsg = create(AgentClientMessageSchema, {
-      message: { case: "kvClientMessage", value: response },
-    });
-    sendFrame(
-      frameConnectMessage(toBinary(AgentClientMessageSchema, clientMsg)),
+    sendKvResponse(
+      kvMsg, "setBlobResult",
+      create(SetBlobResultSchema, {}),
+      sendFrame,
     );
   }
 }
@@ -880,7 +864,6 @@ function sendExecResult(
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
-
 /** Derive a stable key to associate a bridge with a conversation. */
 function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
   // Use a hash of the first user message + model as a stable key.
@@ -891,7 +874,6 @@ function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
     .digest("hex")
     .slice(0, 16);
 }
-
 
 /** Create an SSE streaming Response that reads from a live bridge. */
 function createBridgeStreamResponse(
@@ -1000,7 +982,6 @@ function createBridgeStreamResponse(
                   blobStore,
                   mcpTools,
                   pendingExecs: state.pendingExecs,
-                  onResume: null,
                 });
 
                 sendSSE(makeChunk({}, "tool_calls"));
@@ -1039,6 +1020,16 @@ function createBridgeStreamResponse(
   return new Response(stream, { headers: SSE_HEADERS });
 }
 
+/** Spawn a bridge, send the initial request frame, and start heartbeat. */
+function startBridge(
+  accessToken: string,
+  requestBytes: Uint8Array,
+): { bridge: ReturnType<typeof spawnBridge>; heartbeatTimer: NodeJS.Timeout } {
+  const bridge = spawnBridge(accessToken);
+  bridge.write(frameConnectMessage(requestBytes));
+  const heartbeatTimer = setInterval(() => bridge.write(makeHeartbeatBytes()), 5_000);
+  return { bridge, heartbeatTimer };
+}
 
 function handleStreamingResponse(
   payload: CursorRequestPayload,
@@ -1046,20 +1037,13 @@ function handleStreamingResponse(
   modelId: string,
   bridgeKey: string,
 ): Response {
-  const bridge = spawnBridge(accessToken);
-  bridge.write(frameConnectMessage(payload.requestBytes));
-
-  const heartbeatTimer = setInterval(() => {
-    bridge.write(makeHeartbeatBytes());
-  }, 5_000);
-
+  const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     payload.blobStore, payload.mcpTools,
     modelId, bridgeKey,
   );
 }
-
 
 /** Resume a paused bridge by sending MCP results and continuing to stream. */
 function handleToolResultResume(
@@ -1124,7 +1108,6 @@ function handleToolResultResume(
   );
 }
 
-
 async function handleNonStreamingResponse(
   payload: CursorRequestPayload,
   accessToken: string,
@@ -1164,12 +1147,7 @@ async function collectFullResponse(
   const { promise, resolve } = Promise.withResolvers<string>();
   let fullText = "";
 
-  const bridge = spawnBridge(accessToken);
-  bridge.write(frameConnectMessage(payload.requestBytes));
-
-  const heartbeatTimer = setInterval(() => {
-    bridge.write(makeHeartbeatBytes());
-  }, 5_000);
+  const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
 
   const state: StreamState = {
     thinkingActive: false,
