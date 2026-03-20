@@ -44,7 +44,6 @@ import {
   McpSuccessSchema,
   McpTextContentSchema,
   McpToolDefinitionSchema,
-  McpToolNotFoundSchema,
   McpToolResultContentItemSchema,
   ModelDetailsSchema,
   ReadRejectedSchema,
@@ -72,7 +71,11 @@ import { resolve as pathResolve } from "node:path";
 const CURSOR_API_URL = "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
-
+const SSE_HEADERS = {
+  "Content-Type": "text/event-stream",
+  "Cache-Control": "no-cache",
+  Connection: "keep-alive",
+} as const;
 
 interface OpenAIToolCall {
   id: string;
@@ -135,15 +138,12 @@ interface ActiveBridge {
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
-  /** Resolve function to resume streaming after tool results are sent. */
-  onResume: ((sendFrame: (data: Uint8Array) => void) => void) | null;
 }
 
 // Active bridges keyed by a session token (derived from conversation state).
 // When tool_calls are returned, the bridge stays alive. The next request
 // with tool results looks up the bridge and sends mcpResult messages.
 const activeBridges = new Map<string, ActiveBridge>();
-
 
 /** Length-prefix a message: [4-byte BE length][payload] */
 function lpEncode(data: Uint8Array): Buffer {
@@ -172,6 +172,8 @@ function spawnBridge(accessToken: string): {
   end: () => void;
   onData: (cb: (chunk: Buffer) => void) => void;
   onClose: (cb: (code: number) => void) => void;
+  /** True while the bridge subprocess is still running. */
+  get alive(): boolean;
 } {
   const proc = Bun.spawn(["node", BRIDGE_PATH], {
     stdin: "pipe",
@@ -190,6 +192,10 @@ function spawnBridge(accessToken: string): {
     data: null as ((chunk: Buffer) => void) | null,
     close: null as ((code: number) => void) | null,
   };
+
+  // Track exit state so late onClose registrations fire immediately.
+  let exited = false;
+  let exitCode = 1;
 
   (async () => {
     const reader = proc.stdout.getReader();
@@ -213,11 +219,15 @@ function spawnBridge(accessToken: string): {
       // Stream ended
     }
 
-    proc.exited.then((code) => cbs.close?.(code ?? 1));
+    const code = await proc.exited ?? 1;
+    exited = true;
+    exitCode = code;
+    cbs.close?.(code);
   })();
 
   return {
     proc,
+    get alive() { return !exited; },
     write(data) {
       try { proc.stdin.write(lpEncode(data)); } catch {}
     },
@@ -228,10 +238,16 @@ function spawnBridge(accessToken: string): {
       } catch {}
     },
     onData(cb) { cbs.data = cb; },
-    onClose(cb) { cbs.close = cb; },
+    onClose(cb) {
+      if (exited) {
+        // Process already exited — invoke immediately so streams don't hang.
+        queueMicrotask(() => cb(exitCode));
+      } else {
+        cbs.close = cb;
+      }
+    },
   };
 }
-
 
 let proxyServer: ReturnType<typeof Bun.serve> | undefined;
 let proxyPort: number | undefined;
@@ -290,18 +306,17 @@ export function stopProxy(): void {
     proxyPort = undefined;
   }
   // Clean up any lingering bridges
-  for (const [key, active] of activeBridges) {
+  for (const active of activeBridges.values()) {
     clearInterval(active.heartbeatTimer);
     active.bridge.end();
-    activeBridges.delete(key);
   }
+  activeBridges.clear();
 }
-
 
 function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
-): Response {
+): Response | Promise<Response> {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
   const tools = body.tools ?? [];
@@ -323,20 +338,33 @@ function handleChatCompletion(
   const activeBridge = activeBridges.get(bridgeKey);
 
   if (activeBridge && toolResults.length > 0) {
-    // Resume an existing bridge with tool results
     activeBridges.delete(bridgeKey);
-    return handleToolResultResume(activeBridge, toolResults, modelId, tools, accessToken, bridgeKey);
+
+    if (activeBridge.bridge.alive) {
+      // Resume the live bridge with tool results
+      return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey);
+    }
+
+    // Bridge died (timeout, server disconnect, etc.).
+    // Clean up and fall through to start a fresh bridge.
+    clearInterval(activeBridge.heartbeatTimer);
+    activeBridge.bridge.end();
   }
 
   // Clean up stale bridge if present
-  if (activeBridge) {
+  if (activeBridge && activeBridges.has(bridgeKey)) {
     clearInterval(activeBridge.heartbeatTimer);
     activeBridge.bridge.end();
     activeBridges.delete(bridgeKey);
   }
 
+  // Build the request. When tool results are present but the bridge died,
+  // we must still include the last user text so Cursor has context.
   const mcpTools = buildMcpToolDefinitions(tools);
-  const payload = buildCursorRequest(modelId, systemPrompt, userText, turns);
+  const effectiveUserText = userText || (toolResults.length > 0
+    ? toolResults.map((r) => r.content).join("\n")
+    : "");
+  const payload = buildCursorRequest(modelId, systemPrompt, effectiveUserText, turns);
   payload.mcpTools = mcpTools;
 
   if (body.stream === false) {
@@ -344,7 +372,6 @@ function handleChatCompletion(
   }
   return handleStreamingResponse(payload, accessToken, modelId, bridgeKey);
 }
-
 
 interface ToolResultInfo {
   toolCallId: string;
@@ -417,7 +444,6 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   return { systemPrompt, userText: lastUserText, turns: pairs, toolResults };
 }
 
-
 /** Convert OpenAI tool definitions to Cursor's MCP tool protobuf format. */
 function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
   return tools.map((t) => {
@@ -454,7 +480,6 @@ function decodeMcpArgsMap(args: Record<string, Uint8Array>): Record<string, unkn
   }
   return decoded;
 }
-
 
 function buildCursorRequest(
   modelId: string,
@@ -551,7 +576,6 @@ function buildCursorRequest(
   };
 }
 
-
 function parseConnectEndStream(data: Uint8Array): Error | null {
   try {
     const payload = JSON.parse(new TextDecoder().decode(data));
@@ -577,6 +601,31 @@ function makeHeartbeatBytes(): Uint8Array {
   return frameConnectMessage(toBinary(AgentClientMessageSchema, heartbeat));
 }
 
+/**
+ * Create a stateful parser for Connect protocol frames.
+ * Handles buffering partial data across chunks.
+ */
+function createConnectFrameParser(
+  onMessage: (bytes: Uint8Array) => void,
+  onEndStream: (bytes: Uint8Array) => void,
+): (incoming: Buffer) => void {
+  let pending = Buffer.alloc(0);
+  return (incoming: Buffer) => {
+    pending = Buffer.concat([pending, incoming]);
+    while (pending.length >= 5) {
+      const flags = pending[0]!;
+      const msgLen = pending.readUInt32BE(1);
+      if (pending.length < 5 + msgLen) break;
+      const messageBytes = pending.subarray(5, 5 + msgLen);
+      pending = pending.subarray(5 + msgLen);
+      if (flags & CONNECT_END_STREAM_FLAG) {
+        onEndStream(messageBytes);
+      } else {
+        onMessage(messageBytes);
+      }
+    }
+  };
+}
 
 interface StreamState {
   thinkingActive: boolean;
@@ -627,6 +676,23 @@ function handleInteractionUpdate(
   // message path (mcpArgs → mcpResult), not interaction updates.
 }
 
+/** Send a KV client response back to Cursor. */
+function sendKvResponse(
+  kvMsg: KvServerMessage,
+  messageCase: string,
+  value: unknown,
+  sendFrame: (data: Uint8Array) => void,
+): void {
+  const response = create(KvClientMessageSchema, {
+    id: kvMsg.id,
+    message: { case: messageCase as any, value: value as any },
+  });
+  const clientMsg = create(AgentClientMessageSchema, {
+    message: { case: "kvClientMessage", value: response },
+  });
+  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMsg)));
+}
+
 function handleKvMessage(
   kvMsg: KvServerMessage,
   blobStore: Map<string, Uint8Array>,
@@ -638,38 +704,18 @@ function handleKvMessage(
     const blobId = kvMsg.message.value.blobId;
     const blobIdKey = Buffer.from(blobId).toString("hex");
     const blobData = blobStore.get(blobIdKey);
-
-    const response = create(KvClientMessageSchema, {
-      id: kvMsg.id,
-      message: {
-        case: "getBlobResult",
-        value: create(GetBlobResultSchema, blobData ? { blobData } : {}),
-      },
-    });
-
-    const clientMsg = create(AgentClientMessageSchema, {
-      message: { case: "kvClientMessage", value: response },
-    });
-    sendFrame(
-      frameConnectMessage(toBinary(AgentClientMessageSchema, clientMsg)),
+    sendKvResponse(
+      kvMsg, "getBlobResult",
+      create(GetBlobResultSchema, blobData ? { blobData } : {}),
+      sendFrame,
     );
   } else if (kvCase === "setBlobArgs") {
     const { blobId, blobData } = kvMsg.message.value;
     blobStore.set(Buffer.from(blobId).toString("hex"), blobData);
-
-    const response = create(KvClientMessageSchema, {
-      id: kvMsg.id,
-      message: {
-        case: "setBlobResult",
-        value: create(SetBlobResultSchema, {}),
-      },
-    });
-
-    const clientMsg = create(AgentClientMessageSchema, {
-      message: { case: "kvClientMessage", value: response },
-    });
-    sendFrame(
-      frameConnectMessage(toBinary(AgentClientMessageSchema, clientMsg)),
+    sendKvResponse(
+      kvMsg, "setBlobResult",
+      create(SetBlobResultSchema, {}),
+      sendFrame,
     );
   }
 }
@@ -848,22 +894,23 @@ function sendExecResult(
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
-
 /** Derive a stable key to associate a bridge with a conversation. */
 function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
-  // Use a hash of the first user message + model as a stable key.
-  // This is imperfect but sufficient for single-session use.
-  const firstUser = messages.find((m) => m.role === "user")?.content ?? "";
+  // Stable key from model + first user message text.
+  const firstUserMsg = messages.find((m) => m.role === "user");
+  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   return createHash("sha256")
-    .update(`${modelId}:${firstUser.slice(0, 200)}`)
+    .update(`${modelId}:${firstUserText.slice(0, 200)}`)
     .digest("hex")
     .slice(0, 16);
 }
 
-
-function handleStreamingResponse(
-  payload: CursorRequestPayload,
-  accessToken: string,
+/** Create an SSE streaming Response that reads from a live bridge. */
+function createBridgeStreamResponse(
+  bridge: ReturnType<typeof spawnBridge>,
+  heartbeatTimer: NodeJS.Timeout,
+  blobStore: Map<string, Uint8Array>,
+  mcpTools: McpToolDefinition[],
   modelId: string,
   bridgeKey: string,
 ): Response {
@@ -907,34 +954,8 @@ function handleStreamingResponse(
 
       let mcpExecReceived = false;
 
-      const bridge = spawnBridge(accessToken);
-      bridge.write(frameConnectMessage(payload.requestBytes));
-
-      const heartbeatTimer = setInterval(() => {
-        bridge.write(makeHeartbeatBytes());
-      }, 5_000);
-
-      let pendingBuffer = Buffer.alloc(0);
-
-      const processChunk = (incoming: Buffer) => {
-        pendingBuffer = Buffer.concat([pendingBuffer, incoming]);
-
-        while (pendingBuffer.length >= 5) {
-          const flags = pendingBuffer[0]!;
-          const msgLen = pendingBuffer.readUInt32BE(1);
-          if (pendingBuffer.length < 5 + msgLen) break;
-
-          const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
-          pendingBuffer = pendingBuffer.subarray(5 + msgLen);
-
-          if (flags & CONNECT_END_STREAM_FLAG) {
-            const endError = parseConnectEndStream(messageBytes);
-            if (endError) {
-              sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
-            }
-            continue;
-          }
-
+      const processChunk = createConnectFrameParser(
+        (messageBytes) => {
           try {
             const serverMessage = fromBinary(
               AgentServerMessageSchema,
@@ -942,11 +963,10 @@ function handleStreamingResponse(
             );
             processServerMessage(
               serverMessage,
-              payload.blobStore,
-              payload.mcpTools,
+              blobStore,
+              mcpTools,
               (data) => bridge.write(data),
               state,
-              // onText
               (text, isThinking) => {
                 if (isThinking) {
                   if (!state.thinkingActive) {
@@ -967,13 +987,11 @@ function handleStreamingResponse(
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
 
-                // Close thinking if active
                 if (state.thinkingActive) {
                   sendSSE(makeChunk({ content: "</think>" }));
                   state.thinkingActive = false;
                 }
 
-                // Emit tool_calls with decoded arguments
                 const toolCallIndex = state.toolCallIndex++;
                 sendSSE(makeChunk({
                   tool_calls: [{
@@ -991,10 +1009,9 @@ function handleStreamingResponse(
                 activeBridges.set(bridgeKey, {
                   bridge,
                   heartbeatTimer,
-                  blobStore: payload.blobStore,
-                  mcpTools: payload.mcpTools,
+                  blobStore,
+                  mcpTools,
                   pendingExecs: state.pendingExecs,
-                  onResume: null,
                 });
 
                 sendSSE(makeChunk({}, "tool_calls"));
@@ -1005,44 +1022,73 @@ function handleStreamingResponse(
           } catch {
             // Skip unparseable messages
           }
-        }
-      };
+        },
+        (endStreamBytes) => {
+          const endError = parseConnectEndStream(endStreamBytes);
+          if (endError) {
+            sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
+          }
+        },
+      );
 
       bridge.onData(processChunk);
 
-      bridge.onClose(() => {
+      bridge.onClose((code) => {
         clearInterval(heartbeatTimer);
         if (!mcpExecReceived) {
-          // Normal completion — no pending tool calls
           if (state.thinkingActive) {
             sendSSE(makeChunk({ content: "</think>" }));
           }
           sendSSE(makeChunk({}, "stop"));
           sendDone();
           closeController();
+        } else if (code !== 0) {
+          // Bridge died while tool calls are pending (timeout, crash, etc.).
+          // Close the SSE stream so the client doesn't hang forever.
+          sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
+          sendSSE(makeChunk({}, "stop"));
+          sendDone();
+          closeController();
+          // Remove stale entry so the next request doesn't try to resume it.
+          activeBridges.delete(bridgeKey);
         }
-        // If mcpExecReceived, we already closed the controller in onMcpExec
       });
     },
   });
 
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    },
-  });
+  return new Response(stream, { headers: SSE_HEADERS });
 }
 
+/** Spawn a bridge, send the initial request frame, and start heartbeat. */
+function startBridge(
+  accessToken: string,
+  requestBytes: Uint8Array,
+): { bridge: ReturnType<typeof spawnBridge>; heartbeatTimer: NodeJS.Timeout } {
+  const bridge = spawnBridge(accessToken);
+  bridge.write(frameConnectMessage(requestBytes));
+  const heartbeatTimer = setInterval(() => bridge.write(makeHeartbeatBytes()), 5_000);
+  return { bridge, heartbeatTimer };
+}
+
+function handleStreamingResponse(
+  payload: CursorRequestPayload,
+  accessToken: string,
+  modelId: string,
+  bridgeKey: string,
+): Response {
+  const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
+  return createBridgeStreamResponse(
+    bridge, heartbeatTimer,
+    payload.blobStore, payload.mcpTools,
+    modelId, bridgeKey,
+  );
+}
 
 /** Resume a paused bridge by sending MCP results and continuing to stream. */
 function handleToolResultResume(
   active: ActiveBridge,
   toolResults: ToolResultInfo[],
   modelId: string,
-  tools: OpenAIToolDef[],
-  accessToken: string,
   bridgeKey: string,
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
@@ -1094,196 +1140,43 @@ function handleToolResultResume(
     );
   }
 
-  // Now stream the continuation response.
-  // Reuse the same bridgeKey so subsequent tool calls can be found by deriveBridgeKey().
-  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
-  const created = Math.floor(Date.now() / 1000);
-  const stream = new ReadableStream({
-    start(controller) {
-      const encoder = new TextEncoder();
-      let closed = false;
-      const sendSSE = (data: object) => {
-        if (closed) return;
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
-      };
-      const sendDone = () => {
-        if (closed) return;
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-      };
-      const closeController = () => {
-        if (closed) return;
-        closed = true;
-        controller.close();
-      };
-
-      const makeChunk = (
-        delta: Record<string, unknown>,
-        finishReason: string | null = null,
-      ) => ({
-        id: completionId,
-        object: "chat.completion.chunk",
-        created,
-        model: modelId,
-        choices: [{ index: 0, delta, finish_reason: finishReason }],
-      });
-
-      const state: StreamState = {
-        thinkingActive: false,
-        toolCallIndex: 0,
-        pendingExecs: [],
-      };
-
-      let mcpExecReceived = false;
-
-      let pendingBuffer = Buffer.alloc(0);
-
-      const processChunk = (incoming: Buffer) => {
-        pendingBuffer = Buffer.concat([pendingBuffer, incoming]);
-
-        while (pendingBuffer.length >= 5) {
-          const flags = pendingBuffer[0]!;
-          const msgLen = pendingBuffer.readUInt32BE(1);
-          if (pendingBuffer.length < 5 + msgLen) break;
-
-          const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
-          pendingBuffer = pendingBuffer.subarray(5 + msgLen);
-
-          if (flags & CONNECT_END_STREAM_FLAG) {
-            const endError = parseConnectEndStream(messageBytes);
-            if (endError) {
-              sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
-            }
-            continue;
-          }
-
-          try {
-            const serverMessage = fromBinary(
-              AgentServerMessageSchema,
-              messageBytes,
-            );
-            processServerMessage(
-              serverMessage,
-              blobStore,
-              mcpTools,
-              (data) => bridge.write(data),
-              state,
-              (text, isThinking) => {
-                if (isThinking) {
-                  if (!state.thinkingActive) {
-                    state.thinkingActive = true;
-                    sendSSE(makeChunk({ role: "assistant", content: "<think>" }));
-                  }
-                  sendSSE(makeChunk({ content: text }));
-                } else {
-                  if (state.thinkingActive) {
-                    state.thinkingActive = false;
-                    sendSSE(makeChunk({ content: "</think>" }));
-                  }
-                  sendSSE(makeChunk({ content: text }));
-                }
-              },
-              (exec) => {
-                state.pendingExecs.push(exec);
-                mcpExecReceived = true;
-
-                if (state.thinkingActive) {
-                  sendSSE(makeChunk({ content: "</think>" }));
-                  state.thinkingActive = false;
-                }
-
-                const toolCallIndex = state.toolCallIndex++;
-                sendSSE(makeChunk({
-                  tool_calls: [{
-                    index: toolCallIndex,
-                    id: exec.toolCallId,
-                    type: "function",
-                    function: {
-                      name: exec.toolName,
-                      arguments: exec.decodedArgs,
-                    },
-                  }],
-                }));
-
-                activeBridges.set(bridgeKey, {
-                  bridge,
-                  heartbeatTimer,
-                  blobStore,
-                  mcpTools,
-                  pendingExecs: state.pendingExecs,
-                  onResume: null,
-                });
-
-                sendSSE(makeChunk({}, "tool_calls"));
-                sendDone();
-                closeController();
-              },
-            );
-          } catch {
-            // Skip unparseable messages
-          }
-        }
-      };
-
-      bridge.onData(processChunk);
-
-      bridge.onClose(() => {
-        clearInterval(heartbeatTimer);
-        if (!mcpExecReceived) {
-          if (state.thinkingActive) {
-            sendSSE(makeChunk({ content: "</think>" }));
-          }
-          sendSSE(makeChunk({}, "stop"));
-          sendDone();
-          closeController();
-        }
-      });
-    },
-  });
-
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    },
-  });
+  return createBridgeStreamResponse(
+    bridge, heartbeatTimer,
+    blobStore, mcpTools,
+    modelId, bridgeKey,
+  );
 }
 
-
-function handleNonStreamingResponse(
+async function handleNonStreamingResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   modelId: string,
-): Response {
+): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
+  const fullText = await collectFullResponse(payload, accessToken);
 
-  const responsePromise = collectFullResponse(payload, accessToken).then(
-    (fullText) =>
-      new Response(
-        JSON.stringify({
-          id: completionId,
-          object: "chat.completion",
-          created,
-          model: modelId,
-          choices: [
-            {
-              index: 0,
-              message: { role: "assistant", content: fullText },
-              finish_reason: "stop",
-            },
-          ],
-          usage: {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-          },
-        }),
-        { headers: { "Content-Type": "application/json" } },
-      ),
+  return new Response(
+    JSON.stringify({
+      id: completionId,
+      object: "chat.completion",
+      created,
+      model: modelId,
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: fullText },
+          finish_reason: "stop",
+        },
+      ],
+      usage: {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+      },
+    }),
+    { headers: { "Content-Type": "application/json" } },
   );
-
-  return responsePromise as unknown as Response;
 }
 
 async function collectFullResponse(
@@ -1293,34 +1186,16 @@ async function collectFullResponse(
   const { promise, resolve } = Promise.withResolvers<string>();
   let fullText = "";
 
-  const bridge = spawnBridge(accessToken);
+  const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
 
-  bridge.write(frameConnectMessage(payload.requestBytes));
-
-  const heartbeatTimer = setInterval(() => {
-    bridge.write(makeHeartbeatBytes());
-  }, 5_000);
-
-  let pendingBuffer = Buffer.alloc(0);
   const state: StreamState = {
     thinkingActive: false,
     toolCallIndex: 0,
     pendingExecs: [],
   };
 
-  bridge.onData((incoming) => {
-    pendingBuffer = Buffer.concat([pendingBuffer, incoming]);
-
-    while (pendingBuffer.length >= 5) {
-      const flags = pendingBuffer[0]!;
-      const msgLen = pendingBuffer.readUInt32BE(1);
-      if (pendingBuffer.length < 5 + msgLen) break;
-
-      const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
-      pendingBuffer = pendingBuffer.subarray(5 + msgLen);
-
-      if (flags & CONNECT_END_STREAM_FLAG) continue;
-
+  bridge.onData(createConnectFrameParser(
+    (messageBytes) => {
       try {
         const serverMessage = fromBinary(
           AgentServerMessageSchema,
@@ -1338,8 +1213,9 @@ async function collectFullResponse(
       } catch {
         // Skip
       }
-    }
-  });
+    },
+    () => {},
+  ));
 
   bridge.onClose(() => {
     clearInterval(heartbeatTimer);

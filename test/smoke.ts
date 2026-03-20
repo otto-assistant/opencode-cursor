@@ -109,7 +109,6 @@ async function testTokenExpiry() {
 async function testPluginShape() {
   console.log("[test] Checking plugin export shape...");
 
-
   const fakeInput = {
     client: { auth: { set: async () => {} } },
   } as any;

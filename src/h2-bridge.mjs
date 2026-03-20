@@ -84,10 +84,20 @@ const { accessToken, url, path: rpcPath } = config;
 
 const client = http2.connect(url || "https://api2.cursor.sh");
 
-const timeout = setTimeout(() => {
+// Guard against initial connection failure. Reset on any h2 activity
+// so long-running agent conversations (with tool call round-trips) survive.
+let timeout = setTimeout(killBridge, 30_000);
+
+function resetTimeout() {
+  clearTimeout(timeout);
+  timeout = setTimeout(killBridge, 120_000);
+}
+
+function killBridge() {
+  clearTimeout(timeout);
   client.destroy();
   process.exit(1);
-}, 120_000);
+}
 
 client.on("error", () => {
   clearTimeout(timeout);
@@ -109,6 +119,7 @@ const h2Stream = client.request({
 
 // Forward H2 response data → stdout (length-prefixed)
 h2Stream.on("data", (chunk) => {
+  resetTimeout();
   writeMessage(chunk);
 });
 
@@ -134,6 +145,7 @@ h2Stream.on("error", () => {
       break;
     }
     if (!h2Stream.closed && !h2Stream.destroyed) {
+      resetTimeout();
       h2Stream.write(msg);
     }
   }
