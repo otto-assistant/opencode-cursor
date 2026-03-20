@@ -29,16 +29,20 @@ async function testProxyStartStop() {
   }
   console.log("[test] /v1/models OK");
 
-  // Test that /v1/chat/completions rejects empty messages
+  // Test that /v1/chat/completions rejects requests with no user message
   const badRes = await fetch(`http://localhost:${port}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ model: "test", messages: [] }),
   });
   if (badRes.status !== 400) {
-    throw new Error(`Expected 400 for empty messages, got ${badRes.status}`);
+    throw new Error(`Expected 400 for missing user message, got ${badRes.status}`);
   }
-  console.log("[test] Empty message validation OK");
+  const badBody = await badRes.json();
+  if (!badBody.error?.message?.includes("No user message")) {
+    throw new Error(`Expected 'No user message' error, got: ${badBody.error?.message}`);
+  }
+  console.log("[test] Missing user message validation OK");
 
   // Test 404 for unknown routes
   const notFoundRes = await fetch(`http://localhost:${port}/unknown`);
@@ -67,6 +71,16 @@ async function testAuthParams() {
   if (!params.loginUrl.includes(params.uuid)) {
     throw new Error("Login URL missing UUID");
   }
+
+  // Verify PKCE: challenge must be base64url(SHA-256(verifier))
+  const data = new TextEncoder().encode(params.verifier);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const expectedChallenge = Buffer.from(hashBuffer).toString("base64url");
+  if (params.challenge !== expectedChallenge) {
+    throw new Error(
+      `PKCE challenge mismatch: expected ${expectedChallenge}, got ${params.challenge}`
+    );
+  }
   console.log("[test] Auth params OK");
 }
 
@@ -87,11 +101,14 @@ async function testTokenExpiry() {
     throw new Error(`Token expiry ${expiry} out of expected range [${expectedMin}, ${expectedMax}]`);
   }
 
-  // Test fallback for invalid token
+  // Test fallback for invalid token — should be ~1 hour from now
   const fallbackExpiry = getTokenExpiry("not-a-jwt");
   const now = Date.now();
-  if (fallbackExpiry < now || fallbackExpiry > now + 4000 * 1000) {
-    throw new Error(`Fallback expiry ${fallbackExpiry} unexpected`);
+  const expectedFallback = now + 3600 * 1000;
+  if (Math.abs(fallbackExpiry - expectedFallback) > 5000) {
+    throw new Error(
+      `Fallback expiry off by ${Math.abs(fallbackExpiry - expectedFallback)}ms, expected ~1h from now`
+    );
   }
 
   console.log("[test] Token expiry OK");
@@ -102,6 +119,31 @@ async function testPluginShape() {
 
   if (typeof CursorAuthPlugin !== "function") {
     throw new Error("CursorAuthPlugin is not a function");
+  }
+
+  // Call it and verify the returned hooks structure
+  const fakeInput = {
+    client: { auth: { set: async () => {} } },
+  } as any;
+  const hooks = await CursorAuthPlugin(fakeInput);
+
+  if (!hooks.auth) {
+    throw new Error("Plugin hooks missing 'auth'");
+  }
+  if (hooks.auth.provider !== "cursor") {
+    throw new Error(`Expected provider 'cursor', got '${hooks.auth.provider}'`);
+  }
+  if (typeof hooks.auth.loader !== "function") {
+    throw new Error("Plugin hooks.auth.loader is not a function");
+  }
+  if (!Array.isArray(hooks.auth.methods) || hooks.auth.methods.length === 0) {
+    throw new Error("Plugin hooks.auth.methods missing or empty");
+  }
+  if (hooks.auth.methods[0].type !== "oauth") {
+    throw new Error(`Expected method type 'oauth', got '${hooks.auth.methods[0].type}'`);
+  }
+  if (typeof hooks.auth.methods[0].authorize !== "function") {
+    throw new Error("Plugin auth method missing authorize function");
   }
 
   console.log("[test] Plugin shape OK");
