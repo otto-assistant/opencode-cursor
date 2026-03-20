@@ -150,12 +150,61 @@ async function testPluginShape() {
 }
 
 
+async function testArrayContentParsing() {
+  console.log("[test] Testing array content (plan-mode) parsing...");
+  const port = await startProxy(async () => "test-token");
+
+  // Simulate what the AI SDK sends for plan mode: content as an array of
+  // content parts instead of a plain string. Before the fix, this produced
+  // "[object Object],[object Object]" in the Cursor request.
+  const res = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "test",
+      stream: false,
+      messages: [
+        {
+          role: "system",
+          content: [
+            { type: "text", text: "You are a helpful assistant." },
+            { type: "text", text: "Plan mode is active." },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "lazy-load recharts" },
+            { type: "text", text: "work on a plan" },
+          ],
+        },
+      ],
+    }),
+  });
+
+  // The proxy will fail to reach Cursor (no real token), but we verify it
+  // does NOT reject with "No user message found" — that would mean the array
+  // content was not normalized (empty string after nullish coalescing).
+  if (res.status === 400) {
+    const body = await res.json();
+    if (body.error?.message?.includes("No user message")) {
+      throw new Error(
+        "Array content not normalized — plan mode messages lost",
+      );
+    }
+  }
+
+  stopProxy();
+  console.log("[test] Array content parsing OK");
+}
+
 async function main() {
   try {
     await testProxyStartStop();
     await testAuthParams();
     await testTokenExpiry();
     await testPluginShape();
+    await testArrayContentParsing();
     console.log("\n✓ All smoke tests passed");
     process.exit(0);
   } catch (err) {
