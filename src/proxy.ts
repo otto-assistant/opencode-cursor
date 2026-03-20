@@ -73,7 +73,6 @@ const CURSOR_API_URL = "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
 
-// --- Types ---
 
 interface OpenAIToolCall {
   id: string;
@@ -145,7 +144,6 @@ interface ActiveBridge {
 // with tool results looks up the bridge and sends mcpResult messages.
 const activeBridges = new Map<string, ActiveBridge>();
 
-// --- H2 Bridge IPC ---
 
 /** Length-prefix a message: [4-byte BE length][payload] */
 function lpEncode(data: Uint8Array): Buffer {
@@ -234,7 +232,6 @@ function spawnBridge(accessToken: string): {
   };
 }
 
-// --- Proxy Server ---
 
 let proxyServer: ReturnType<typeof Bun.serve> | undefined;
 let proxyPort: number | undefined;
@@ -300,7 +297,6 @@ export function stopProxy(): void {
   }
 }
 
-// --- Chat Completion Handler ---
 
 function handleChatCompletion(
   body: ChatCompletionRequest,
@@ -349,7 +345,6 @@ function handleChatCompletion(
   return handleStreamingResponse(payload, accessToken, modelId, bridgeKey);
 }
 
-// --- Message Parsing ---
 
 interface ToolResultInfo {
   toolCallId: string;
@@ -363,12 +358,7 @@ interface ParsedMessages {
   toolResults: ToolResultInfo[];
 }
 
-/**
- * Normalize OpenAI message content to a plain string.
- * Content can arrive as a string, null, or an array of content parts
- * (e.g. [{type:"text",text:"..."}]). The array form is used by the
- * AI SDK for multi-part messages such as plan-mode system reminders.
- */
+/** Normalize OpenAI message content to a plain string. */
 function textContent(content: OpenAIMessage["content"]): string {
   if (content == null) return "";
   if (typeof content === "string") return content;
@@ -427,7 +417,6 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   return { systemPrompt, userText: lastUserText, turns: pairs, toolResults };
 }
 
-// --- MCP Tool Definitions ---
 
 /** Convert OpenAI tool definitions to Cursor's MCP tool protobuf format. */
 function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
@@ -466,7 +455,6 @@ function decodeMcpArgsMap(args: Record<string, Uint8Array>): Record<string, unkn
   return decoded;
 }
 
-// --- gRPC Request Building ---
 
 function buildCursorRequest(
   modelId: string,
@@ -563,15 +551,14 @@ function buildCursorRequest(
   };
 }
 
-// --- Connect Protocol Helpers ---
 
 function parseConnectEndStream(data: Uint8Array): Error | null {
   try {
     const payload = JSON.parse(new TextDecoder().decode(data));
     const error = payload?.error;
     if (error) {
-      const code = typeof error.code === "string" ? error.code : "unknown";
-      const message = typeof error.message === "string" ? error.message : "Unknown error";
+      const code = error.code ?? "unknown";
+      const message = error.message ?? "Unknown error";
       return new Error(`Connect error ${code}: ${message}`);
     }
     return null;
@@ -590,7 +577,6 @@ function makeHeartbeatBytes(): Uint8Array {
   return frameConnectMessage(toBinary(AgentClientMessageSchema, heartbeat));
 }
 
-// --- Server Message Processing ---
 
 interface StreamState {
   thinkingActive: boolean;
@@ -623,11 +609,6 @@ function processServerMessage(
   }
 }
 
-/**
- * Handle interaction updates — text and thinking only.
- * MCP tool calls are handled entirely via mcpArgs exec messages,
- * not through interaction update callbacks.
- */
 function handleInteractionUpdate(
   update: any,
   onText: (text: string, isThinking?: boolean) => void,
@@ -867,7 +848,6 @@ function sendExecResult(
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
-// --- Bridge Key ---
 
 /** Derive a stable key to associate a bridge with a conversation. */
 function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
@@ -880,7 +860,6 @@ function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
     .slice(0, 16);
 }
 
-// --- Streaming Handler ---
 
 function handleStreamingResponse(
   payload: CursorRequestPayload,
@@ -1056,7 +1035,6 @@ function handleStreamingResponse(
   });
 }
 
-// --- Tool Result Resume ---
 
 /** Resume a paused bridge by sending MCP results and continuing to stream. */
 function handleToolResultResume(
@@ -1241,12 +1219,11 @@ function handleToolResultResume(
               },
             );
           } catch {
-            // Skip
+            // Skip unparseable messages
           }
         }
       };
 
-      // Re-attach data handler to the existing bridge
       bridge.onData(processChunk);
 
       bridge.onClose(() => {
@@ -1272,7 +1249,6 @@ function handleToolResultResume(
   });
 }
 
-// --- Non-Streaming Handler ---
 
 function handleNonStreamingResponse(
   payload: CursorRequestPayload,

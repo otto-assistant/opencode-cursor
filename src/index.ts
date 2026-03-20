@@ -13,7 +13,7 @@ import {
   refreshCursorToken,
 } from "./auth";
 import { getCursorModels } from "./models";
-import { startProxy, stopProxy } from "./proxy";
+import { startProxy } from "./proxy";
 
 const CURSOR_PROVIDER_ID = "cursor";
 
@@ -32,14 +32,12 @@ export const CursorAuthPlugin: Plugin = async (
         const auth = await getAuth();
         if (!auth || auth.type !== "oauth") return {};
 
-        // Start local proxy if not already running
         const port = await startProxy(async () => {
           const currentAuth = await getAuth();
           if (currentAuth.type !== "oauth") {
             throw new Error("Cursor auth not configured");
           }
 
-          // Refresh token if expired
           if (!currentAuth.access || currentAuth.expires < Date.now()) {
             const refreshed = await refreshCursorToken(currentAuth.refresh);
             await input.client.auth.set({
@@ -57,7 +55,6 @@ export const CursorAuthPlugin: Plugin = async (
           return currentAuth.access;
         });
 
-        // Discover models and inject into provider
         if (provider) {
           if (!provider.models) (provider as any).models = {};
           try {
@@ -116,7 +113,6 @@ export const CursorAuthPlugin: Plugin = async (
             // Model discovery failed — proxy still works with direct model IDs
           }
 
-          // Zero out costs for all Cursor models (included with subscription)
           for (const model of Object.values(provider.models)) {
             model.cost = {
               input: 0,
@@ -133,11 +129,9 @@ export const CursorAuthPlugin: Plugin = async (
             requestInput: RequestInfo | URL,
             init?: RequestInit,
           ) {
-            // Strip any dummy auth headers — proxy handles auth internally
             if (init?.headers) {
               if (init.headers instanceof Headers) {
                 init.headers.delete("authorization");
-                init.headers.delete("Authorization");
               } else if (Array.isArray(init.headers)) {
                 init.headers = init.headers.filter(
                   ([key]) => key.toLowerCase() !== "authorization",

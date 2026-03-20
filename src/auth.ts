@@ -1,7 +1,3 @@
-/**
- * Cursor OAuth authentication.
- * Handles PKCE-based login, polling, and token refresh.
- */
 import { generatePKCE } from "./pkce";
 
 const CURSOR_LOGIN_URL = "https://cursor.com/loginDeepControl";
@@ -58,7 +54,6 @@ export async function pollCursorAuth(
       );
 
       if (response.status === 404) {
-        // User hasn't completed login yet
         consecutiveErrors = 0;
         delay = Math.min(delay * POLL_BACKOFF_MULTIPLIER, POLL_MAX_DELAY);
         continue;
@@ -136,11 +131,9 @@ export function getTokenExpiry(token: string): number {
       typeof decoded === "object" &&
       typeof decoded.exp === "number"
     ) {
-      // 5-minute safety margin before actual expiry
       return decoded.exp * 1000 - 5 * 60 * 1000;
     }
   } catch {
-    // Ignore parsing errors
   }
   return Date.now() + 3600 * 1000;
 }

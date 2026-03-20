@@ -1,7 +1,3 @@
-/**
- * Smoke test: verify the proxy starts, accepts requests, and the
- * plugin exports the correct shape.
- */
 import { startProxy, stopProxy, getProxyPort } from "../src/proxy";
 import { generateCursorAuthParams, getTokenExpiry } from "../src/auth";
 import { CursorAuthPlugin } from "../src/index";
@@ -11,14 +7,13 @@ async function testProxyStartStop() {
   const port = await startProxy(async () => "test-token");
   console.log(`[test] Proxy started on port ${port}`);
 
-  if (typeof port !== "number" || port < 1) {
+  if (port < 1) {
     throw new Error(`Expected a valid port number, got ${port}`);
   }
   if (getProxyPort() !== port) {
     throw new Error("getProxyPort() mismatch");
   }
 
-  // Test that the proxy responds to /v1/models
   const modelsRes = await fetch(`http://localhost:${port}/v1/models`);
   if (!modelsRes.ok) {
     throw new Error(`/v1/models returned ${modelsRes.status}`);
@@ -29,7 +24,6 @@ async function testProxyStartStop() {
   }
   console.log("[test] /v1/models OK");
 
-  // Test that /v1/chat/completions rejects requests with no user message
   const badRes = await fetch(`http://localhost:${port}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -44,7 +38,6 @@ async function testProxyStartStop() {
   }
   console.log("[test] Missing user message validation OK");
 
-  // Test 404 for unknown routes
   const notFoundRes = await fetch(`http://localhost:${port}/unknown`);
   if (notFoundRes.status !== 404) {
     throw new Error(`Expected 404, got ${notFoundRes.status}`);
@@ -87,7 +80,6 @@ async function testAuthParams() {
 async function testTokenExpiry() {
   console.log("[test] Testing token expiry parsing...");
 
-  // Create a fake JWT with exp in the future
   const header = btoa(JSON.stringify({ alg: "HS256", typ: "JWT" }));
   const futureExp = Math.floor(Date.now() / 1000) + 7200; // 2 hours from now
   const payload = btoa(JSON.stringify({ exp: futureExp }));
@@ -117,11 +109,7 @@ async function testTokenExpiry() {
 async function testPluginShape() {
   console.log("[test] Checking plugin export shape...");
 
-  if (typeof CursorAuthPlugin !== "function") {
-    throw new Error("CursorAuthPlugin is not a function");
-  }
 
-  // Call it and verify the returned hooks structure
   const fakeInput = {
     client: { auth: { set: async () => {} } },
   } as any;
@@ -156,7 +144,6 @@ async function testArrayContentParsing() {
 
   // Simulate what the AI SDK sends for plan mode: content as an array of
   // content parts instead of a plain string. Before the fix, this produced
-  // "[object Object],[object Object]" in the Cursor request.
   const res = await fetch(`http://localhost:${port}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -184,7 +171,6 @@ async function testArrayContentParsing() {
 
   // The proxy will fail to reach Cursor (no real token), but we verify it
   // does NOT reject with "No user message found" — that would mean the array
-  // content was not normalized (empty string after nullish coalescing).
   if (res.status === 400) {
     const body = await res.json();
     if (body.error?.message?.includes("No user message")) {

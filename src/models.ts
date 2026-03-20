@@ -21,8 +21,6 @@ const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 64_000;
 
-// --- Zod schemas for safe parsing of gRPC response ---
-
 const CursorModelDetailsSchema = z.object({
   modelId: z.string(),
   displayName: z.string().optional().catch(undefined),
@@ -46,8 +44,6 @@ const CursorDecodedResponseSchema = z.object({
 
 type CursorModelDetails = z.infer<typeof CursorModelDetailsSchema>;
 
-// --- Normalized model type for OpenCode ---
-
 export interface CursorModel {
   id: string;
   name: string;
@@ -55,8 +51,6 @@ export interface CursorModel {
   contextWindow: number;
   maxTokens: number;
 }
-
-// --- Hardcoded fallback models ---
 
 const FALLBACK_MODELS: CursorModel[] = [
   { id: "composer-2", name: "Composer 2", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
@@ -100,17 +94,12 @@ export async function fetchCursorUsableModels(
   }
 }
 
-/**
- * Get cursor models: try dynamic discovery, fall back to hardcoded list.
- */
 export async function getCursorModels(
   apiKey: string,
 ): Promise<CursorModel[]> {
   const discovered = await fetchCursorUsableModels({ apiKey });
   return discovered && discovered.length > 0 ? discovered : FALLBACK_MODELS;
 }
-
-// --- Internal helpers ---
 
 function buildRequestHeaders(
   options: CursorModelDiscoveryOptions,
@@ -125,7 +114,6 @@ function buildRequestHeaders(
     "x-cursor-client-type": "cli",
   };
 }
-
 
 /**
  * HTTP/2 transport via curl (Bun's node:http2 doesn't work with Cursor's API).
@@ -211,7 +199,7 @@ function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
     if ((flags & 0b0000_0001) !== 0) return null;
 
     // End-of-stream flag — skip trailer frames
-    if (!((flags & 0b0000_0010) !== 0)) {
+    if ((flags & 0b0000_0010) === 0) {
       return payload.subarray(offset + 5, frameEnd);
     }
 
