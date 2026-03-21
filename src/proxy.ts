@@ -61,6 +61,7 @@ import {
   WriteShellStdinErrorSchema,
   WriteShellStdinResultSchema,
   type AgentServerMessage,
+  type ConversationStateStructure,
   type ExecServerMessage,
   type KvServerMessage,
   type McpToolDefinition,
@@ -145,6 +146,25 @@ interface ActiveBridge {
 // When tool_calls are returned, the bridge stays alive. The next request
 // with tool results looks up the bridge and sends mcpResult messages.
 const activeBridges = new Map<string, ActiveBridge>();
+
+interface StoredConversation {
+  conversationId: string;
+  checkpoint: Uint8Array | null;
+  blobStore: Map<string, Uint8Array>;
+  lastAccessMs: number;
+}
+
+const conversationStates = new Map<string, StoredConversation>();
+const CONVERSATION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+function evictStaleConversations(): void {
+  const now = Date.now();
+  for (const [key, stored] of conversationStates) {
+    if (now - stored.lastAccessMs > CONVERSATION_TTL_MS) {
+      conversationStates.delete(key);
+    }
+  }
+}
 
 /** Length-prefix a message: [4-byte BE length][payload] */
 function lpEncode(data: Uint8Array): Buffer {
@@ -397,6 +417,7 @@ export function stopProxy(): void {
     active.bridge.end();
   }
   activeBridges.clear();
+  conversationStates.clear();
 }
 
 function handleChatCompletion(
@@ -444,17 +465,33 @@ function handleChatCompletion(
     activeBridges.delete(bridgeKey);
   }
 
+  let stored = conversationStates.get(bridgeKey);
+  if (!stored) {
+    stored = {
+      conversationId: crypto.randomUUID(),
+      checkpoint: null,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    };
+    conversationStates.set(bridgeKey, stored);
+  }
+  stored.lastAccessMs = Date.now();
+  evictStaleConversations();
+
   // Build the request. When tool results are present but the bridge died,
   // we must still include the last user text so Cursor has context.
   const mcpTools = buildMcpToolDefinitions(tools);
   const effectiveUserText = userText || (toolResults.length > 0
     ? toolResults.map((r) => r.content).join("\n")
     : "");
-  const payload = buildCursorRequest(modelId, systemPrompt, effectiveUserText, turns);
+  const payload = buildCursorRequest(
+    modelId, systemPrompt, effectiveUserText, turns,
+    stored.conversationId, stored.checkpoint, stored.blobStore,
+  );
   payload.mcpTools = mcpTools;
 
   if (body.stream === false) {
-    return handleNonStreamingResponse(payload, accessToken, modelId);
+    return handleNonStreamingResponse(payload, accessToken, modelId, bridgeKey);
   }
   return handleStreamingResponse(payload, accessToken, modelId, bridgeKey);
 }
@@ -572,37 +609,11 @@ function buildCursorRequest(
   systemPrompt: string,
   userText: string,
   turns: Array<{ userText: string; assistantText: string }>,
+  conversationId: string,
+  checkpoint: Uint8Array | null,
+  existingBlobStore?: Map<string, Uint8Array>,
 ): CursorRequestPayload {
-  const blobStore = new Map<string, Uint8Array>();
-
-  const turnBytes: Uint8Array[] = [];
-  for (const turn of turns) {
-    const userMsg = create(UserMessageSchema, {
-      text: turn.userText,
-      messageId: crypto.randomUUID(),
-    });
-    const userMsgBytes = toBinary(UserMessageSchema, userMsg);
-
-    const stepBytes: Uint8Array[] = [];
-    if (turn.assistantText) {
-      const step = create(ConversationStepSchema, {
-        message: {
-          case: "assistantMessage",
-          value: create(AssistantMessageSchema, { text: turn.assistantText }),
-        },
-      });
-      stepBytes.push(toBinary(ConversationStepSchema, step));
-    }
-
-    const agentTurn = create(AgentConversationTurnStructureSchema, {
-      userMessage: userMsgBytes,
-      steps: stepBytes,
-    });
-    const turnStructure = create(ConversationTurnStructureSchema, {
-      turn: { case: "agentConversationTurn", value: agentTurn },
-    });
-    turnBytes.push(toBinary(ConversationTurnStructureSchema, turnStructure));
-  }
+  const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
 
   // System prompt → blob store (Cursor requests it back via KV handshake)
   const systemJson = JSON.stringify({ role: "system", content: systemPrompt });
@@ -612,20 +623,54 @@ function buildCursorRequest(
   );
   blobStore.set(Buffer.from(systemBlobId).toString("hex"), systemBytes);
 
-  const conversationState = create(ConversationStateStructureSchema, {
-    rootPromptMessagesJson: [systemBlobId],
-    turns: turnBytes,
-    todos: [],
-    pendingToolCalls: [],
-    previousWorkspaceUris: [],
-    fileStates: {},
-    fileStatesV2: {},
-    summaryArchives: [],
-    turnTimings: [],
-    subagentStates: {},
-    selfSummaryCount: 0,
-    readPaths: [],
-  });
+  let conversationState;
+  if (checkpoint) {
+    conversationState = fromBinary(ConversationStateStructureSchema, checkpoint);
+  } else {
+    const turnBytes: Uint8Array[] = [];
+    for (const turn of turns) {
+      const userMsg = create(UserMessageSchema, {
+        text: turn.userText,
+        messageId: crypto.randomUUID(),
+      });
+      const userMsgBytes = toBinary(UserMessageSchema, userMsg);
+
+      const stepBytes: Uint8Array[] = [];
+      if (turn.assistantText) {
+        const step = create(ConversationStepSchema, {
+          message: {
+            case: "assistantMessage",
+            value: create(AssistantMessageSchema, { text: turn.assistantText }),
+          },
+        });
+        stepBytes.push(toBinary(ConversationStepSchema, step));
+      }
+
+      const agentTurn = create(AgentConversationTurnStructureSchema, {
+        userMessage: userMsgBytes,
+        steps: stepBytes,
+      });
+      const turnStructure = create(ConversationTurnStructureSchema, {
+        turn: { case: "agentConversationTurn", value: agentTurn },
+      });
+      turnBytes.push(toBinary(ConversationTurnStructureSchema, turnStructure));
+    }
+
+    conversationState = create(ConversationStateStructureSchema, {
+      rootPromptMessagesJson: [systemBlobId],
+      turns: turnBytes,
+      todos: [],
+      pendingToolCalls: [],
+      previousWorkspaceUris: [],
+      fileStates: {},
+      fileStatesV2: {},
+      summaryArchives: [],
+      turnTimings: [],
+      subagentStates: {},
+      selfSummaryCount: 0,
+      readPaths: [],
+    });
+  }
 
   const userMessage = create(UserMessageSchema, {
     text: userText,
@@ -648,7 +693,7 @@ function buildCursorRequest(
     conversationState,
     action,
     modelDetails,
-    conversationId: crypto.randomUUID(),
+    conversationId,
   });
 
   const clientMessage = create(AgentClientMessageSchema, {
@@ -727,6 +772,7 @@ function processServerMessage(
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
+  onCheckpoint?: (checkpointBytes: Uint8Array) => void,
 ): void {
   const msgCase = msg.message.case;
 
@@ -740,6 +786,10 @@ function processServerMessage(
       mcpTools,
       sendFrame,
       onMcpExec,
+    );
+  } else if (msgCase === "conversationCheckpointUpdate" && onCheckpoint) {
+    onCheckpoint(
+      toBinary(ConversationStateStructureSchema, msg.message.value as ConversationStateStructure),
     );
   }
 }
@@ -1104,6 +1154,13 @@ function createBridgeStreamResponse(
                 sendDone();
                 closeController();
               },
+              (checkpointBytes) => {
+                const stored = conversationStates.get(bridgeKey);
+                if (stored) {
+                  stored.checkpoint = checkpointBytes;
+                  stored.lastAccessMs = Date.now();
+                }
+              },
             );
           } catch {
             // Skip unparseable messages
@@ -1121,6 +1178,11 @@ function createBridgeStreamResponse(
 
       bridge.onClose((code) => {
         clearInterval(heartbeatTimer);
+        const stored = conversationStates.get(bridgeKey);
+        if (stored) {
+          for (const [k, v] of blobStore) stored.blobStore.set(k, v);
+          stored.lastAccessMs = Date.now();
+        }
         if (!mcpExecReceived) {
           if (state.thinkingActive) {
             sendSSE(makeChunk({ content: "</think>" }));
@@ -1240,10 +1302,11 @@ async function handleNonStreamingResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   modelId: string,
+  bridgeKey: string,
 ): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
-  const fullText = await collectFullResponse(payload, accessToken);
+  const fullText = await collectFullResponse(payload, accessToken, bridgeKey);
 
   return new Response(
     JSON.stringify({
@@ -1271,6 +1334,7 @@ async function handleNonStreamingResponse(
 async function collectFullResponse(
   payload: CursorRequestPayload,
   accessToken: string,
+  bridgeKey: string,
 ): Promise<string> {
   const { promise, resolve } = Promise.withResolvers<string>();
   let fullText = "";
@@ -1298,6 +1362,13 @@ async function collectFullResponse(
           state,
           (text) => { fullText += text; },
           () => {},
+          (checkpointBytes) => {
+            const stored = conversationStates.get(bridgeKey);
+            if (stored) {
+              stored.checkpoint = checkpointBytes;
+              stored.lastAccessMs = Date.now();
+            }
+          },
         );
       } catch {
         // Skip
@@ -1308,6 +1379,11 @@ async function collectFullResponse(
 
   bridge.onClose(() => {
     clearInterval(heartbeatTimer);
+    const stored = conversationStates.get(bridgeKey);
+    if (stored) {
+      for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
+      stored.lastAccessMs = Date.now();
+    }
     resolve(fullText);
   });
 
