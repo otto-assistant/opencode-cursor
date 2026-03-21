@@ -147,7 +147,6 @@ interface ActiveBridge {
 // with tool results looks up the bridge and sends mcpResult messages.
 const activeBridges = new Map<string, ActiveBridge>();
 
-/** Conversation state persisted across turns for multi-turn context. */
 interface StoredConversation {
   conversationId: string;
   checkpoint: Uint8Array | null;
@@ -466,7 +465,6 @@ function handleChatCompletion(
     activeBridges.delete(bridgeKey);
   }
 
-  // Look up or create conversation state for multi-turn context
   let stored = conversationStates.get(bridgeKey);
   if (!stored) {
     stored = {
@@ -615,7 +613,6 @@ function buildCursorRequest(
   checkpoint: Uint8Array | null,
   existingBlobStore?: Map<string, Uint8Array>,
 ): CursorRequestPayload {
-  // Start with blobs accumulated from prior turns
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
 
   // System prompt → blob store (Cursor requests it back via KV handshake)
@@ -628,11 +625,8 @@ function buildCursorRequest(
 
   let conversationState;
   if (checkpoint) {
-    // Use the server's canonical checkpoint from the previous turn.
-    // This preserves full conversation history without client-side reconstruction.
     conversationState = fromBinary(ConversationStateStructureSchema, checkpoint);
   } else {
-    // First turn: build conversation state from OpenAI message turns.
     const turnBytes: Uint8Array[] = [];
     for (const turn of turns) {
       const userMsg = create(UserMessageSchema, {
@@ -1160,7 +1154,6 @@ function createBridgeStreamResponse(
                 sendDone();
                 closeController();
               },
-              // onCheckpoint — server sends canonical conversation state
               (checkpointBytes) => {
                 const stored = conversationStates.get(bridgeKey);
                 if (stored) {
@@ -1185,7 +1178,6 @@ function createBridgeStreamResponse(
 
       bridge.onClose((code) => {
         clearInterval(heartbeatTimer);
-        // Persist accumulated blobs for next turn
         const stored = conversationStates.get(bridgeKey);
         if (stored) {
           for (const [k, v] of blobStore) stored.blobStore.set(k, v);
@@ -1370,7 +1362,6 @@ async function collectFullResponse(
           state,
           (text) => { fullText += text; },
           () => {},
-          // onCheckpoint
           (checkpointBytes) => {
             const stored = conversationStates.get(bridgeKey);
             if (stored) {
@@ -1388,7 +1379,6 @@ async function collectFullResponse(
 
   bridge.onClose(() => {
     clearInterval(heartbeatTimer);
-    // Persist accumulated blobs for next turn
     const stored = conversationStates.get(bridgeKey);
     if (stored) {
       for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
