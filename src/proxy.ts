@@ -68,7 +68,7 @@ import {
 import { createHash } from "node:crypto";
 import { resolve as pathResolve } from "node:path";
 
-const CURSOR_API_URL = "https://api2.cursor.sh";
+const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
 const SSE_HEADERS = {
@@ -114,6 +114,7 @@ interface ChatCompletionRequest {
   tools?: OpenAIToolDef[];
   tool_choice?: unknown;
 }
+
 
 interface CursorRequestPayload {
   requestBytes: Uint8Array;
@@ -166,7 +167,13 @@ function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
  * Spawn the Node H2 bridge and return read/write handles.
  * The bridge uses length-prefixed framing on stdin/stdout.
  */
-function spawnBridge(accessToken: string): {
+interface SpawnBridgeOptions {
+  accessToken: string;
+  rpcPath: string;
+  url?: string;
+}
+
+function spawnBridge(options: SpawnBridgeOptions): {
   proc: ReturnType<typeof Bun.spawn>;
   write: (data: Uint8Array) => void;
   end: () => void;
@@ -182,9 +189,9 @@ function spawnBridge(accessToken: string): {
   });
 
   const config = JSON.stringify({
-    accessToken,
-    url: CURSOR_API_URL,
-    path: "/agent.v1.AgentService/Run",
+    accessToken: options.accessToken,
+    url: options.url ?? CURSOR_API_URL,
+    path: options.rpcPath,
   });
   proc.stdin.write(lpEncode(new TextEncoder().encode(config)));
 
@@ -249,8 +256,73 @@ function spawnBridge(accessToken: string): {
   };
 }
 
+interface CursorUnaryRpcOptions {
+  accessToken: string;
+  rpcPath: string;
+  requestBody: Uint8Array;
+  url?: string;
+  timeoutMs?: number;
+}
+
+export async function callCursorUnaryRpc(
+  options: CursorUnaryRpcOptions,
+ ): Promise<{ body: Uint8Array; exitCode: number; timedOut: boolean }> {
+  const bridge = spawnBridge({
+    accessToken: options.accessToken,
+    rpcPath: options.rpcPath,
+    url: options.url,
+  });
+  const chunks: Buffer[] = [];
+  const { promise, resolve } = Promise.withResolvers<{
+    body: Uint8Array;
+    exitCode: number;
+    timedOut: boolean;
+  }>();
+  let timedOut = false;
+  const timeoutMs = options.timeoutMs ?? 5_000;
+  const timeout = timeoutMs > 0
+    ? setTimeout(() => {
+        timedOut = true;
+        try { bridge.proc.kill(); } catch {}
+      }, timeoutMs)
+    : undefined;
+
+  bridge.onData((chunk) => {
+    chunks.push(Buffer.from(chunk));
+  });
+  bridge.onClose((exitCode) => {
+    if (timeout) clearTimeout(timeout);
+    resolve({
+      body: Buffer.concat(chunks),
+      exitCode,
+      timedOut,
+    });
+  });
+
+  bridge.write(frameConnectMessage(options.requestBody));
+  bridge.end();
+
+  return promise;
+}
+
 let proxyServer: ReturnType<typeof Bun.serve> | undefined;
 let proxyPort: number | undefined;
+let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
+let proxyModels: Array<{ id: string; name: string }> = [];
+
+function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }>): Array<{
+  id: string;
+  object: "model";
+  created: number;
+  owned_by: string;
+}> {
+  return models.map((model) => ({
+    id: model.id,
+    object: "model",
+    created: 0,
+    owned_by: "cursor",
+  }));
+}
 
 export function getProxyPort(): number | undefined {
   return proxyPort;
@@ -258,7 +330,13 @@ export function getProxyPort(): number | undefined {
 
 export async function startProxy(
   getAccessToken: () => Promise<string>,
+  models: ReadonlyArray<{ id: string; name: string }> = [],
 ): Promise<number> {
+  proxyAccessTokenProvider = getAccessToken;
+  proxyModels = models.map((model) => ({
+    id: model.id,
+    name: model.name,
+  }));
   if (proxyServer && proxyPort) return proxyPort;
 
   proxyServer = Bun.serve({
@@ -269,7 +347,10 @@ export async function startProxy(
 
       if (req.method === "GET" && url.pathname === "/v1/models") {
         return new Response(
-          JSON.stringify({ object: "list", data: [] }),
+          JSON.stringify({
+            object: "list",
+            data: buildOpenAIModelList(proxyModels),
+          }),
           { headers: { "Content-Type": "application/json" } },
         );
       }
@@ -277,7 +358,10 @@ export async function startProxy(
       if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
         try {
           const body = (await req.json()) as ChatCompletionRequest;
-          const accessToken = await getAccessToken();
+          if (!proxyAccessTokenProvider) {
+            throw new Error("Cursor proxy access token provider not configured");
+          }
+          const accessToken = await proxyAccessTokenProvider();
           return handleChatCompletion(body, accessToken);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
@@ -304,6 +388,8 @@ export function stopProxy(): void {
     proxyServer.stop();
     proxyServer = undefined;
     proxyPort = undefined;
+    proxyAccessTokenProvider = undefined;
+    proxyModels = [];
   }
   // Clean up any lingering bridges
   for (const active of activeBridges.values()) {
@@ -1064,7 +1150,10 @@ function startBridge(
   accessToken: string,
   requestBytes: Uint8Array,
 ): { bridge: ReturnType<typeof spawnBridge>; heartbeatTimer: NodeJS.Timeout } {
-  const bridge = spawnBridge(accessToken);
+  const bridge = spawnBridge({
+    accessToken,
+    rpcPath: "/agent.v1.AgentService/Run",
+  });
   bridge.write(frameConnectMessage(requestBytes));
   const heartbeatTimer = setInterval(() => bridge.write(makeHeartbeatBytes()), 5_000);
   return { bridge, heartbeatTimer };
