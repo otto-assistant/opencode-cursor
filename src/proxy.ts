@@ -68,6 +68,8 @@ import {
 } from "./proto/agent_pb";
 import { createHash } from "node:crypto";
 import { resolve as pathResolve } from "node:path";
+import { RequestQueue } from "./promise-queue";
+import { Mutex } from "./promise-queue";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -155,7 +157,49 @@ interface StoredConversation {
 }
 
 const conversationStates = new Map<string, StoredConversation>();
-const CONVERSATION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const CONVERSATION_TTL_MS = 30 * 60 * 1000;
+
+// Per-conversation mutexes — prevent concurrent requests from corrupting
+// shared state (blobStore, checkpoints, active bridges).
+const convMutexes = new Map<string, Mutex>();
+
+function getOrCreateMutex(convKey: string): Mutex {
+  let mutex = convMutexes.get(convKey);
+  if (!mutex) {
+    mutex = new Mutex();
+    convMutexes.set(convKey, mutex);
+  }
+  return mutex;
+}
+
+/**
+ * Wrap a Response so we can detect when its body stream is fully consumed.
+ * Returns the wrapped response (identical to the client) and a `done` promise
+ * that resolves when the stream finishes (success, error, or cancellation).
+ */
+function trackResponseCompletion(response: Response): {
+  response: Response;
+  done: Promise<void>;
+} {
+  if (!response.body) {
+    return { response, done: Promise.resolve() };
+  }
+
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const { readable, writable } = new TransformStream();
+
+  // Pipe the original body through; resolve when done (success or error).
+  response.body.pipeTo(writable).then(resolve, resolve);
+
+  return {
+    response: new Response(readable, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    }),
+    done: promise,
+  };
+} // 30 minutes
 
 function evictStaleConversations(): void {
   const now = Date.now();
@@ -381,14 +425,32 @@ export async function startProxy(
       }
 
       if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+        let release: (() => void) | undefined;
         try {
           const body = (await req.json()) as ChatCompletionRequest;
           if (!proxyAccessTokenProvider) {
             throw new Error("Cursor proxy access token provider not configured");
           }
           const accessToken = await proxyAccessTokenProvider();
-          return handleChatCompletion(body, accessToken);
+
+          // Serialize per-conversation requests to prevent race conditions
+          // that cause "Blob not found" errors from concurrent state mutations.
+          const convKey = deriveConversationKey(body.messages);
+          const mutex = getOrCreateMutex(convKey);
+          release = await mutex.acquire();
+
+          const rawResponse = handleChatCompletion(body, accessToken);
+          const resolvedResponse =
+            rawResponse instanceof Promise ? await rawResponse : rawResponse;
+          const { response: trackedResponse, done } =
+            trackResponseCompletion(resolvedResponse);
+
+          // Release the mutex when the stream is fully consumed (or on error).
+          done.finally(() => release?.());
+
+          return trackedResponse;
         } catch (err) {
+          release?.();
           const message = err instanceof Error ? err.message : String(err);
           return new Response(
             JSON.stringify({
@@ -423,12 +485,21 @@ export function stopProxy(): void {
   }
   activeBridges.clear();
   conversationStates.clear();
+  convMutexes.clear();
 }
 
 function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
 ): Response | Promise<Response> {
+  // Wrap synchronous processing and async execution
+  return doHandleChatCompletion(body, accessToken);
+}
+
+async function doHandleChatCompletion(
+  body: ChatCompletionRequest,
+  accessToken: string,
+): Promise<Response> {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
   const tools = body.tools ?? [];
@@ -449,21 +520,25 @@ function handleChatCompletion(
   // convKey: model-independent, for conversation state that survives model switches
   const bridgeKey = deriveBridgeKey(modelId, body.messages);
   const convKey = deriveConversationKey(body.messages);
-  const activeBridge = activeBridges.get(bridgeKey);
 
-  if (activeBridge && toolResults.length > 0) {
-    activeBridges.delete(bridgeKey);
+  const { release } = await conversationQueue.acquire(convKey);
 
-    if (activeBridge.bridge.alive) {
-      // Resume the live bridge with tool results
-      return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey);
+  try {
+    const activeBridge = activeBridges.get(bridgeKey);
+
+    if (activeBridge && toolResults.length > 0) {
+      activeBridges.delete(bridgeKey);
+
+      if (activeBridge.bridge.alive) {
+        // Resume the live bridge with tool results
+        return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, release);
+      }
+
+      // Bridge died (timeout, server disconnect, etc.).
+      // Clean up and fall through to start a fresh bridge.
+      clearInterval(activeBridge.heartbeatTimer);
+      activeBridge.bridge.end();
     }
-
-    // Bridge died (timeout, server disconnect, etc.).
-    // Clean up and fall through to start a fresh bridge.
-    clearInterval(activeBridge.heartbeatTimer);
-    activeBridge.bridge.end();
-  }
 
   // Clean up stale bridge if present
   if (activeBridge && activeBridges.has(bridgeKey)) {
@@ -498,9 +573,21 @@ function handleChatCompletion(
   payload.mcpTools = mcpTools;
 
   if (body.stream === false) {
-    return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
+    try {
+      const res = await handleNonStreamingResponse(payload, accessToken, modelId, convKey);
+      release();
+      return res;
+    } catch (err) {
+      release();
+      throw err;
+    }
   }
-  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey);
+  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, release);
+  
+  } catch (err) {
+    release();
+    throw err;
+  }
 }
 
 interface ToolResultInfo {
@@ -1154,11 +1241,21 @@ function createBridgeStreamResponse(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  release: () => void,
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
   const stream = new ReadableStream({
+    cancel() {
+      // Run if client aborts HTTP stream before completion
+      release();
+      try {
+        clearInterval(heartbeatTimer);
+        bridge.end();
+        activeBridges.delete(bridgeKey);
+      } catch (err) {}
+    },
     start(controller) {
       const encoder = new TextEncoder();
       let closed = false;
@@ -1174,6 +1271,7 @@ function createBridgeStreamResponse(
         if (closed) return;
         closed = true;
         controller.close();
+        release();
       };
 
       const makeChunk = (
@@ -1341,12 +1439,13 @@ function handleStreamingResponse(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  release: () => void,
 ): Response {
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     payload.blobStore, payload.mcpTools,
-    modelId, bridgeKey, convKey,
+    modelId, bridgeKey, convKey, release,
   );
 }
 
@@ -1357,6 +1456,7 @@ function handleToolResultResume(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  release: () => void,
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
 
@@ -1410,7 +1510,7 @@ function handleToolResultResume(
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     blobStore, mcpTools,
-    modelId, bridgeKey, convKey,
+    modelId, bridgeKey, convKey, release,
   );
 }
 
