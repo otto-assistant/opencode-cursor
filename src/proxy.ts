@@ -27,6 +27,9 @@ import {
   ConversationTurnStructureSchema,
   AssistantMessageSchema,
   BackgroundShellSpawnResultSchema,
+  CursorRuleSchema,
+  CursorRuleTypeSchema,
+  CursorRuleTypeGlobalSchema,
   DeleteResultSchema,
   DeleteRejectedSchema,
   DiagnosticsResultSchema,
@@ -40,6 +43,7 @@ import {
   LsRejectedSchema,
   LsResultSchema,
   McpErrorSchema,
+  McpInstructionsSchema,
   McpResultSchema,
   McpSuccessSchema,
   McpTextContentSchema,
@@ -68,7 +72,6 @@ import {
 } from "./proto/agent_pb";
 import { createHash } from "node:crypto";
 import { resolve as pathResolve } from "node:path";
-import { RequestQueue } from "./promise-queue";
 import { Mutex } from "./promise-queue";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
@@ -129,7 +132,10 @@ interface CursorRequestPayload {
 interface PendingExec {
   execId: string;
   execMsgId: number;
+  /** Short external ID (≤64 chars) used in OpenAI API tool_calls[].id. */
   toolCallId: string;
+  /** Original Cursor tool_call_id for sending mcpResult back. */
+  cursorToolCallId: string;
   toolName: string;
   /** Decoded arguments JSON string for SSE tool_calls emission. */
   decodedArgs: string;
@@ -162,6 +168,8 @@ const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 // Per-conversation mutexes — prevent concurrent requests from corrupting
 // shared state (blobStore, checkpoints, active bridges).
 const convMutexes = new Map<string, Mutex>();
+
+const systemBlobCache = new Map<string, { blobId: string; bytes: Uint8Array }>();
 
 function getOrCreateMutex(convKey: string): Mutex {
   let mutex = convMutexes.get(convKey);
@@ -243,6 +251,7 @@ function spawnBridge(options: SpawnBridgeOptions): {
   proc: ReturnType<typeof Bun.spawn>;
   write: (data: Uint8Array) => void;
   end: () => void;
+  kill: () => void;
   onData: (cb: (chunk: Buffer) => void) => void;
   onClose: (cb: (code: number) => void) => void;
   /** True while the bridge subprocess is still running. */
@@ -310,6 +319,9 @@ function spawnBridge(options: SpawnBridgeOptions): {
         proc.stdin.write(lpEncode(new Uint8Array(0)));
         proc.stdin.end();
       } catch {}
+    },
+    kill() {
+      try { proc.kill(); } catch {}
     },
     onData(cb) { cbs.data = cb; },
     onClose(cb) {
@@ -437,18 +449,23 @@ export async function startProxy(
           // that cause "Blob not found" errors from concurrent state mutations.
           const convKey = deriveConversationKey(body.messages);
           const mutex = getOrCreateMutex(convKey);
-          release = await mutex.acquire();
+          const acquired = await mutex.acquire();
+          // Guard against double-release: multiple cleanup paths
+          // (closeController, cancel, onClose) can all fire for the same request.
+          let released = false;
+          release = () => {
+            if (released) return;
+            released = true;
+            acquired();
+          };
 
-          const rawResponse = handleChatCompletion(body, accessToken);
+          // Pass the real release down so stream cleanup paths can unlock the mutex.
+          // We do NOT use done.finally() because the HTTP client (OpenCode) may not
+          // close the connection on abort, leaving pipeTo hanging forever.
+          const rawResponse = handleChatCompletion(body, accessToken, release);
           const resolvedResponse =
             rawResponse instanceof Promise ? await rawResponse : rawResponse;
-          const { response: trackedResponse, done } =
-            trackResponseCompletion(resolvedResponse);
-
-          // Release the mutex when the stream is fully consumed (or on error).
-          done.finally(() => release?.());
-
-          return trackedResponse;
+          return resolvedResponse;
         } catch (err) {
           release?.();
           const message = err instanceof Error ? err.message : String(err);
@@ -481,24 +498,26 @@ export function stopProxy(): void {
   // Clean up any lingering bridges
   for (const active of activeBridges.values()) {
     clearInterval(active.heartbeatTimer);
-    active.bridge.end();
+    active.bridge.kill();
   }
   activeBridges.clear();
   conversationStates.clear();
   convMutexes.clear();
+  systemBlobCache.clear();
 }
 
 function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
+  release: () => void,
 ): Response | Promise<Response> {
-  // Wrap synchronous processing and async execution
-  return doHandleChatCompletion(body, accessToken);
+  return doHandleChatCompletion(body, accessToken, release);
 }
 
 async function doHandleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
+  release: () => void,
 ): Promise<Response> {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
@@ -521,29 +540,28 @@ async function doHandleChatCompletion(
   const bridgeKey = deriveBridgeKey(modelId, body.messages);
   const convKey = deriveConversationKey(body.messages);
 
-  const { release } = await conversationQueue.acquire(convKey);
+  // Mutex is already held by the fetch() handler — no need to acquire here.
 
-  try {
-    const activeBridge = activeBridges.get(bridgeKey);
+  const activeBridge = activeBridges.get(bridgeKey);
 
-    if (activeBridge && toolResults.length > 0) {
-      activeBridges.delete(bridgeKey);
+  if (activeBridge && toolResults.length > 0) {
+    activeBridges.delete(bridgeKey);
 
-      if (activeBridge.bridge.alive) {
-        // Resume the live bridge with tool results
-        return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, release);
-      }
-
-      // Bridge died (timeout, server disconnect, etc.).
-      // Clean up and fall through to start a fresh bridge.
-      clearInterval(activeBridge.heartbeatTimer);
-      activeBridge.bridge.end();
+    if (activeBridge.bridge.alive) {
+      // Resume the live bridge with tool results
+      return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, release);
     }
+
+    // Bridge died (timeout, server disconnect, etc.).
+    // Clean up and fall through to start a fresh bridge.
+    clearInterval(activeBridge.heartbeatTimer);
+    activeBridge.bridge.kill();
+  }
 
   // Clean up stale bridge if present
   if (activeBridge && activeBridges.has(bridgeKey)) {
     clearInterval(activeBridge.heartbeatTimer);
-    activeBridge.bridge.end();
+    activeBridge.bridge.kill();
     activeBridges.delete(bridgeKey);
   }
 
@@ -573,21 +591,9 @@ async function doHandleChatCompletion(
   payload.mcpTools = mcpTools;
 
   if (body.stream === false) {
-    try {
-      const res = await handleNonStreamingResponse(payload, accessToken, modelId, convKey);
-      release();
-      return res;
-    } catch (err) {
-      release();
-      throw err;
-    }
+    return handleNonStreamingResponse(payload, accessToken, modelId, convKey, release);
   }
   return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, release);
-  
-  } catch (err) {
-    release();
-    throw err;
-  }
 }
 
 interface ToolResultInfo {
@@ -709,13 +715,26 @@ function buildCursorRequest(
 ): CursorRequestPayload {
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
 
-  // System prompt → blob store (Cursor requests it back via KV handshake)
-  const systemJson = JSON.stringify({ role: "system", content: systemPrompt });
-  const systemBytes = new TextEncoder().encode(systemJson);
-  const systemBlobId = new Uint8Array(
-    createHash("sha256").update(systemBytes).digest(),
-  );
-  blobStore.set(Buffer.from(systemBlobId).toString("hex"), systemBytes);
+  // System prompt → blob store (cached to avoid recalculation)
+  let blobEntry = systemBlobCache.get(systemPrompt);
+  if (!blobEntry) {
+    const systemJson = JSON.stringify({ role: "system", content: systemPrompt });
+    const systemBytes = new TextEncoder().encode(systemJson);
+    const systemBlobId = new Uint8Array(
+      createHash("sha256").update(systemBytes).digest(),
+    );
+    blobEntry = {
+      blobId: Buffer.from(systemBlobId).toString("hex"),
+      bytes: systemBytes,
+    };
+    systemBlobCache.set(systemPrompt, blobEntry);
+    if (systemBlobCache.size > 10) {
+      const firstKey = systemBlobCache.keys().next().value;
+      if (firstKey !== undefined) systemBlobCache.delete(firstKey);
+    }
+  }
+  blobStore.set(blobEntry.blobId, blobEntry.bytes);
+  const systemBlobId = Buffer.from(blobEntry.blobId, "hex");
 
   let conversationState;
   if (checkpoint) {
@@ -1030,13 +1049,29 @@ function handleExecMessage(
   const execCase = execMsg.message.case;
 
   if (execCase === "requestContextArgs") {
+    const MCP_ONLY_RULE = "CRITICAL: Do NOT use native tools (read, ls, grep, shell, write, delete, fetch, diagnostics, backgroundShellSpawn, writeShellStdin). They are ALL disabled in this environment. Use ONLY the MCP tools provided in the tools list. Every native tool call will be rejected and waste time. Always use MCP tools for all file operations, shell commands, searches, and any other actions.";
+
     const requestContext = create(RequestContextSchema, {
-      rules: [],
+      rules: [
+        create(CursorRuleSchema, {
+          fullPath: ".cursorrules",
+          content: MCP_ONLY_RULE,
+          type: create(CursorRuleTypeSchema, {
+            type: { case: "global", value: create(CursorRuleTypeGlobalSchema, {}) },
+          }),
+          source: 0,
+        }),
+      ],
       repositoryInfo: [],
       tools: mcpTools,
       gitRepos: [],
       projectLayouts: [],
-      mcpInstructions: [],
+      mcpInstructions: [
+        create(McpInstructionsSchema, {
+          serverName: "opencode",
+          instructions: MCP_ONLY_RULE,
+        }),
+      ],
       fileContents: {},
       customSubagents: [],
     });
@@ -1053,10 +1088,15 @@ function handleExecMessage(
   if (execCase === "mcpArgs") {
     const mcpArgs = execMsg.message.value;
     const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
+    const cursorToolCallId = mcpArgs.toolCallId || crypto.randomUUID();
+    // Generate a short external ID (≤64 chars) for OpenAI API compatibility.
+    // Some providers reject tool_call IDs longer than 64 characters.
+    const shortToolCallId = `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
     onMcpExec({
       execId: execMsg.execId,
       execMsgId: execMsg.id,
-      toolCallId: mcpArgs.toolCallId || crypto.randomUUID(),
+      toolCallId: shortToolCallId,
+      cursorToolCallId,
       toolName: mcpArgs.toolName || mcpArgs.name,
       decodedArgs: JSON.stringify(decoded),
     });
@@ -1252,7 +1292,7 @@ function createBridgeStreamResponse(
       release();
       try {
         clearInterval(heartbeatTimer);
-        bridge.end();
+        bridge.kill();
         activeBridges.delete(bridgeKey);
       } catch (err) {}
     },
@@ -1272,6 +1312,13 @@ function createBridgeStreamResponse(
         closed = true;
         controller.close();
         release();
+        // If no tool call pending, the bridge is done — stop heartbeats
+        // so the subprocess can exit (prevents zombie h2-bridge accumulation).
+        if (!mcpExecReceived) {
+          clearInterval(heartbeatTimer);
+          bridge.kill();
+          activeBridges.delete(bridgeKey);
+        }
       };
 
       const makeChunk = (
@@ -1368,6 +1415,10 @@ function createBridgeStreamResponse(
                 const stored = conversationStates.get(convKey);
                 if (stored) {
                   stored.checkpoint = checkpointBytes;
+                  // Sync any blobs Cursor added during this bridge session
+                  // so subsequent requests see them even if the bridge
+                  // dies before onClose fires.
+                  for (const [k, v] of blobStore) stored.blobStore.set(k, v);
                   stored.lastAccessMs = Date.now();
                 }
               },
@@ -1519,28 +1570,32 @@ async function handleNonStreamingResponse(
   accessToken: string,
   modelId: string,
   convKey: string,
+  release: () => void,
 ): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
-  const { text, usage } = await collectFullResponse(payload, accessToken, convKey);
-
-  return new Response(
-    JSON.stringify({
-      id: completionId,
-      object: "chat.completion",
-      created,
-      model: modelId,
-      choices: [
-        {
-          index: 0,
-          message: { role: "assistant", content: text },
-          finish_reason: "stop",
-        },
-      ],
-      usage,
-    }),
-    { headers: { "Content-Type": "application/json" } },
-  );
+  try {
+    const { text, usage } = await collectFullResponse(payload, accessToken, convKey);
+    return new Response(
+      JSON.stringify({
+        id: completionId,
+        object: "chat.completion",
+        created,
+        model: modelId,
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: text },
+            finish_reason: "stop",
+          },
+        ],
+        usage,
+      }),
+      { headers: { "Content-Type": "application/json" } },
+    );
+  } finally {
+    release();
+  }
 }
 
 interface CollectedResponse {
@@ -1589,6 +1644,7 @@ async function collectFullResponse(
             const stored = conversationStates.get(convKey);
             if (stored) {
               stored.checkpoint = checkpointBytes;
+              for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
               stored.lastAccessMs = Date.now();
             }
           },
