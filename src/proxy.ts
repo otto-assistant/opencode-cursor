@@ -111,6 +111,10 @@ interface OpenAIToolDef {
   };
 }
 
+function shouldBlockTool(tool: OpenAIToolDef): boolean {
+  return tool.function.name.trim().toLowerCase() === "task";
+}
+
 interface ChatCompletionRequest {
   model: string;
   messages: OpenAIMessage[];
@@ -521,7 +525,7 @@ async function doHandleChatCompletion(
 ): Promise<Response> {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
-  const tools = body.tools ?? [];
+  const tools = (body.tools ?? []).filter((tool) => !shouldBlockTool(tool));
 
   if (!userText && toolResults.length === 0) {
     return new Response(
