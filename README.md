@@ -1,4 +1,4 @@
-# opencode-cursor-oauth
+# @otto-assistant/opencode-cursor-oauth
 
 [![license: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
 
@@ -41,7 +41,7 @@ Then add this to `~/.config/opencode/opencode.json`:
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "opencode-cursor-oauth"
+    "@otto-assistant/opencode-cursor-oauth"
   ],
   "provider": {
     "cursor": {
@@ -54,7 +54,7 @@ Then add this to `~/.config/opencode/opencode.json`:
 ### Option B: Install from npm (when your own package is published)
 
 ```sh
-npm install -g <your-package-name>
+npm install -g @otto-assistant/opencode-cursor-oauth
 ```
 
 Use the same OpenCode config shown above.
@@ -122,7 +122,7 @@ bun run test
 Usually no. OpenCode can install npm plugins automatically when configured.
 
 ### Is this package published on npm?
-`opencode-cursor-oauth` currently points to the upstream package metadata/maintainer. For this repository, use the local install flow until your own npm package and publish pipeline are configured.
+This repository publishes under `@otto-assistant/opencode-cursor-oauth`. If npm install fails, verify that the latest GitHub release workflow completed successfully.
 
 ### Where is the license?
 This project is released under the MIT license (declared in package metadata).
