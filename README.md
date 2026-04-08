@@ -25,14 +25,10 @@ Designed for real-world agent usage: streaming, tool calls, long conversations, 
 
 ## Installation
 
-### Option A: Install from this repository (recommended for now)
+### Option A: Install from npm (recommended)
 
 ```sh
-git clone https://github.com/otto-assistant/opencode-cursor.git
-cd opencode-cursor
-bun install
-bun run build
-npm install -g .
+npm install -g @otto-assistant/opencode-cursor-oauth
 ```
 
 Then add this to `~/.config/opencode/opencode.json`:
@@ -51,10 +47,14 @@ Then add this to `~/.config/opencode/opencode.json`:
 }
 ```
 
-### Option B: Install from npm (when your own package is published)
+### Option B: Install from repository source
 
 ```sh
-npm install -g @otto-assistant/opencode-cursor-oauth
+git clone https://github.com/otto-assistant/opencode-cursor.git
+cd opencode-cursor
+bun install
+bun run build
+npm install -g .
 ```
 
 Use the same OpenCode config shown above.
