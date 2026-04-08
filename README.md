@@ -1,27 +1,38 @@
 # opencode-cursor-oauth
 
-Production-ready OpenCode plugin that connects to Cursor via OAuth and runs a local OpenAI-compatible proxy with robust MCP tool-calling.
+[![npm version](https://img.shields.io/npm/v/opencode-cursor-oauth.svg)](https://www.npmjs.com/package/opencode-cursor-oauth)
+[![license: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://www.npmjs.com/package/opencode-cursor-oauth)
 
-This fork focuses on reliability under real agent workloads and long, tool-heavy conversations.
+High-quality OpenCode provider plugin that brings Cursor models into OpenCode through OAuth, model discovery, and a local OpenAI-compatible proxy.
 
-## Why this fork (vs upstream)
+Designed for real-world agent usage: streaming, tool calls, long conversations, and robust continuation behavior.
 
-Compared to the original [`ephraimduncan/opencode-cursor`](https://github.com/ephraimduncan/opencode-cursor), this fork adds targeted runtime hardening in the proxy layer:
+## Highlights
 
-- **Per-conversation request mutex** to prevent concurrent state corruption and reduce `Blob not found` failures.
-- **Abort-safe stream cleanup** so locks are released correctly even when clients cancel streaming responses.
-- **Bridge process lifecycle hardening** (`kill` on cleanup paths) to reduce lingering `h2-bridge` subprocesses.
-- **MCP-only execution guidance** in request context so the model avoids disabled native Cursor tools and reaches useful tool execution faster.
-- **Short OpenAI-compatible tool call IDs** (<=64 chars) while preserving original Cursor tool call IDs for continuation.
-- **System prompt blob caching** plus blob-store synchronization to stabilize continuation after bridge interruptions.
+- OAuth login with automatic token refresh
+- Cursor model discovery directly from API
+- OpenAI-compatible `/v1/chat/completions` proxy for OpenCode runtime compatibility
+- Stable streaming with tool-calling continuation
+- MCP-first tool execution flow for practical agent environments
+- Conversation-state handling built for long and tool-heavy sessions
+- Production-ready smoke test coverage
 
-These changes are intentionally narrow: they preserve upstream architecture and behavior while improving operational stability.
+## Why teams use it
 
-## Quick start
+- **Native feel in OpenCode:** Cursor models are exposed as a regular provider flow in OpenCode.
+- **Reliable tool loops:** Tool call handoff and continuation are engineered for iterative agent workflows.
+- **Operationally practical:** Focused on reducing common runtime failure modes around streaming, tool calls, and conversation state.
+- **Simple integration surface:** Works with standard OpenCode plugin configuration and auth flow.
 
-### 1) Install in OpenCode
+## Installation
 
-Add this to `~/.config/opencode/opencode.json`:
+### Option A: Install from npm (recommended)
+
+```sh
+npm install -g opencode-cursor-oauth
+```
+
+Then add this to `~/.config/opencode/opencode.json`:
 
 ```jsonc
 {
@@ -37,57 +48,53 @@ Add this to `~/.config/opencode/opencode.json`:
 }
 ```
 
-The `cursor` provider stub is required because OpenCode drops providers not present in its bundled provider catalog.
+### Option B: Develop locally
 
-OpenCode installs npm plugins automatically at startup, so users typically do not need to clone this repository.
+```sh
+bun install
+bun run build
+npm install -g .
+```
 
-### 2) Authenticate
+Use the same OpenCode config shown above.
+
+## Authentication
 
 ```sh
 opencode auth login --provider cursor
 ```
 
-This opens Cursor OAuth in the browser. Tokens are stored in `~/.local/share/opencode/auth.json` and refreshed automatically.
+This opens Cursor OAuth in your browser. Tokens are stored in `~/.local/share/opencode/auth.json` and refreshed automatically.
 
-### 3) Use
+## Quick usage
 
-Start OpenCode and select any Cursor model. The plugin starts a local OpenAI-compatible proxy on demand and routes requests through Cursor's gRPC API.
-
-## How it works
-
-1. **OAuth (PKCE):** browser-based Cursor authentication.
-2. **Model discovery:** fetches available models via Cursor gRPC.
-3. **Local proxy:** maps `POST /v1/chat/completions` to Cursor protobuf/HTTP2 Connect.
-4. **Tool routing:** rejects native Cursor filesystem/shell tools and exposes MCP tool execution through OpenCode.
-
-HTTP/2 transport is handled by a Node child process (`h2-bridge.mjs`) because Bun's `node:http2` behavior is not consistently reliable against Cursor's API.
+1. Start OpenCode.
+2. Select provider `cursor`.
+3. Choose a Cursor model.
+4. Send prompts as usual; the plugin starts the local proxy on demand.
 
 ## Architecture
 
-```
-OpenCode  -->  /v1/chat/completions  -->  Bun.serve (proxy)
-                                              |
-                                    Node child process (h2-bridge.mjs)
-                                              |
-                                     HTTP/2 Connect stream
-                                              |
-                                    api2.cursor.sh gRPC
-                                      /agent.v1.AgentService/Run
+```text
+OpenCode
+  -> /v1/chat/completions
+  -> Bun.serve proxy
+  -> Node HTTP/2 bridge (h2-bridge.mjs)
+  -> Cursor gRPC API (api2.cursor.sh)
 ```
 
-### Tool call flow
+### Tool-call lifecycle
 
-```
-1. Cursor model receives OpenAI tools via RequestContext (MCP tool defs)
-2. Model may attempt native tools (readArgs, shellArgs, etc.)
-3. Proxy rejects native tools with typed errors
-4. Model falls back to MCP tool call (mcpArgs)
-5. Proxy emits OpenAI tool_calls SSE chunk and pauses H2 stream
-6. OpenCode executes tool and returns tool result in follow-up request
-7. Proxy resumes H2 stream with mcpResult and continues streaming
+```text
+1) Model receives tool definitions via request context
+2) Model emits tool call
+3) Proxy maps tool call into OpenCode-compatible stream events
+4) OpenCode executes tool
+5) Tool result is sent back
+6) Proxy resumes Cursor stream continuation
 ```
 
-## Develop locally
+## Development
 
 ```sh
 bun install
@@ -95,9 +102,30 @@ bun run build
 bun run test
 ```
 
-## Requirements
+## Compatibility
 
-- [OpenCode](https://opencode.ai)
-- [Bun](https://bun.sh)
-- [Node.js](https://nodejs.org) >= 18 (for the HTTP/2 bridge process)
-- Active [Cursor](https://cursor.com) subscription
+- OpenCode plugin runtime
+- Bun runtime
+- Node.js >= 18 (HTTP/2 bridge process)
+- Active Cursor subscription
+
+## Performance and reliability notes
+
+- Conversation state is managed to support continuation across multi-turn tool usage.
+- Streaming and bridge lifecycle handling are designed to minimize stuck sessions.
+- Tool execution path is optimized for MCP-based environments.
+
+## FAQ
+
+### Do I need to clone the repository to use this plugin?
+Usually no. OpenCode can install npm plugins automatically when configured.
+
+### Is this package published on npm?
+Yes. Package name: `opencode-cursor-oauth`.
+
+### Where is the license?
+This project is released under the MIT license (declared in package metadata).
+
+## License
+
+MIT
