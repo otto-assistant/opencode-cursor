@@ -1,7 +1,6 @@
 # opencode-cursor-oauth
 
-[![npm version](https://img.shields.io/npm/v/opencode-cursor-oauth.svg)](https://www.npmjs.com/package/opencode-cursor-oauth)
-[![license: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://www.npmjs.com/package/opencode-cursor-oauth)
+[![license: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
 
 High-quality OpenCode provider plugin that brings Cursor models into OpenCode through OAuth, model discovery, and a local OpenAI-compatible proxy.
 
@@ -26,10 +25,14 @@ Designed for real-world agent usage: streaming, tool calls, long conversations, 
 
 ## Installation
 
-### Option A: Install from npm (recommended)
+### Option A: Install from this repository (recommended for now)
 
 ```sh
-npm install -g opencode-cursor-oauth
+git clone https://github.com/otto-assistant/opencode-cursor.git
+cd opencode-cursor
+bun install
+bun run build
+npm install -g .
 ```
 
 Then add this to `~/.config/opencode/opencode.json`:
@@ -48,12 +51,10 @@ Then add this to `~/.config/opencode/opencode.json`:
 }
 ```
 
-### Option B: Develop locally
+### Option B: Install from npm (when your own package is published)
 
 ```sh
-bun install
-bun run build
-npm install -g .
+npm install -g <your-package-name>
 ```
 
 Use the same OpenCode config shown above.
@@ -121,7 +122,7 @@ bun run test
 Usually no. OpenCode can install npm plugins automatically when configured.
 
 ### Is this package published on npm?
-Yes. Package name: `opencode-cursor-oauth`.
+`opencode-cursor-oauth` currently points to the upstream package metadata/maintainer. For this repository, use the local install flow until your own npm package and publish pipeline are configured.
 
 ### Where is the license?
 This project is released under the MIT license (declared in package metadata).
