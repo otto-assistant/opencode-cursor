@@ -24,11 +24,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ephraimduncan/opencode-cursor.git"
+    "url": "git+https://github.com/otto-assistant/opencode-cursor.git"
   },
-  "homepage": "https://github.com/ephraimduncan/opencode-cursor#readme",
+  "homepage": "https://github.com/otto-assistant/opencode-cursor#readme",
   "bugs": {
-    "url": "https://github.com/ephraimduncan/opencode-cursor/issues"
+    "url": "https://github.com/otto-assistant/opencode-cursor/issues"
   },
   "keywords": [
     "opencode",
