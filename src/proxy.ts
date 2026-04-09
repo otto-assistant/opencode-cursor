@@ -752,6 +752,10 @@ function buildCursorRequest(
       });
       const userMsgBytes = toBinary(UserMessageSchema, userMsg);
 
+      // Store turn user message in blobStore so Cursor can look it up
+      const turnMsgBlobId = Buffer.from(userMsgBytes).toString("hex");
+      blobStore.set(turnMsgBlobId, userMsgBytes);
+
       const stepBytes: Uint8Array[] = [];
       if (turn.assistantText) {
         const step = create(ConversationStepSchema, {
@@ -793,6 +797,13 @@ function buildCursorRequest(
     text: userText,
     messageId: crypto.randomUUID(),
   });
+
+  // Store the user message protobuf in blobStore so Cursor can look it up via getBlob.
+  // Cursor uses the raw protobuf bytes as the blob ID (not a hash).
+  const userMsgBytes = toBinary(UserMessageSchema, userMessage);
+  const userMsgBlobId = Buffer.from(userMsgBytes).toString("hex");
+  blobStore.set(userMsgBlobId, userMsgBytes);
+
   const action = create(ConversationActionSchema, {
     action: {
       case: "userMessageAction",
@@ -830,7 +841,49 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
     const error = payload?.error;
     if (error) {
       const code = error.code ?? "unknown";
-      const message = error.message ?? "Unknown error";
+      // Strip protobuf debug info from message if present
+      let message = error.message ?? "Unknown error";
+      const blobMatch = message.match(/Blob not found: ([\d,]+)/);
+      if (blobMatch) {
+        // Convert the byte list back to see what's being requested
+        const bytes: number[] = blobMatch[1].split(',').map((n: string) => parseInt(n.trim()));
+        // Try to decode the protobuf blob reference
+        let decoded = '';
+        try {
+          let offset = 0;
+          while (offset < bytes.length) {
+            const tag = bytes[offset];
+            const wireType = tag & 0x07;
+            const fieldNum = tag >> 3;
+            offset++;
+            if (wireType === 2) {
+              let len = 0, shift = 0;
+              do {
+                len |= (bytes[offset] & 0x7f) << shift;
+                shift += 7;
+                offset++;
+              } while (bytes[offset-1] & 0x80);
+              const content = bytes.slice(offset, offset+len);
+              // Look for printable ASCII at the end
+              const asciiEnd = content.findIndex((b: number) => b < 32 || b > 126);
+              if (asciiEnd > 0 || content.length > 0) {
+                decoded = Buffer.from(content.slice(0, asciiEnd > 0 ? asciiEnd : content.length)).toString('ascii');
+              }
+              offset += len;
+            } else if (wireType === 0) {
+              let val = 0, shift = 0;
+              do {
+                val |= (bytes[offset] & 0x7f) << shift;
+                shift += 7;
+                offset++;
+              } while (bytes[offset-1] & 0x80);
+            }
+          }
+        } catch {}
+        if (decoded) {
+          message = `Blob not found: "${decoded.slice(0, 50)}..."`;
+        }
+      }
       return new Error(`Connect error ${code}: ${message}`);
     }
     return null;
@@ -1249,14 +1302,27 @@ function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
     .slice(0, 16);
 }
 
-/** Derive a key for conversation state. Model-independent so context survives model switches. */
+/** Derive a key for conversation state. Model-independent so context survives model switches.
+ * 
+ * IMPORTANT: We use conversationId (deterministic UUID) instead of message content
+ * because message content changes when threads are renamed or new sessions start,
+ * causing "Blob not found" errors when old blob references are invalidated.
+ * 
+ * The conversationId is derived from firstUserText for determinism, but we store it
+ * in conversationStates so subsequent requests with any firstUserText can look it up.
+ */
 function deriveConversationKey(messages: OpenAIMessage[]): string {
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  return createHash("sha256")
-    .update(`conv:${firstUserText.slice(0, 200)}`)
-    .digest("hex")
-    .slice(0, 16);
+  // Use deterministic conversationId as the key directly
+  const convId = deterministicConversationId(
+    createHash("sha256")
+      .update(`conv:${firstUserText.slice(0, 200)}`)
+      .digest("hex")
+      .slice(0, 16),
+  );
+  // Return a short key for Map lookup (conversationId minus dashes)
+  return convId.replace(/-/g, "").slice(0, 16);
 }
 
 /** Deterministic UUID derived from convKey so Cursor's server-side conversation
