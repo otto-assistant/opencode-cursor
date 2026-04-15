@@ -123,6 +123,11 @@ interface ChatCompletionRequest {
   max_tokens?: number;
   tools?: OpenAIToolDef[];
   tool_choice?: unknown;
+  user?: string;
+  metadata?: Record<string, unknown>;
+  thread_id?: string;
+  conversation_id?: string;
+  session_id?: string;
 }
 
 
@@ -444,6 +449,8 @@ export async function startProxy(
         let release: (() => void) | undefined;
         try {
           const body = (await req.json()) as ChatCompletionRequest;
+          const msgSummary = body.messages.map((m) => `${m.role}[${(typeof m.content === 'string' ? m.content : Array.isArray(m.content) ? m.content.length + ' parts' : 'null')?.slice(0, 40)}]`).join(', ');
+          console.log(`[proxy] REQUEST model=${body.model} stream=${body.stream} msgs=${body.messages.length} [${msgSummary.slice(0, 120)}]`);
           if (!proxyAccessTokenProvider) {
             throw new Error("Cursor proxy access token provider not configured");
           }
@@ -451,7 +458,7 @@ export async function startProxy(
 
           // Serialize per-conversation requests to prevent race conditions
           // that cause "Blob not found" errors from concurrent state mutations.
-          const convKey = deriveConversationKey(body.messages);
+          const convKey = deriveConversationKey(body);
           const mutex = getOrCreateMutex(convKey);
           const acquired = await mutex.acquire();
           // Guard against double-release: multiple cleanup paths
@@ -541,8 +548,10 @@ async function doHandleChatCompletion(
 
   // bridgeKey: model-specific, for active tool-call bridges
   // convKey: model-independent, for conversation state that survives model switches
-  const bridgeKey = deriveBridgeKey(modelId, body.messages);
-  const convKey = deriveConversationKey(body.messages);
+  const bridgeKey = deriveBridgeKey(modelId, body);
+  const convKey = deriveConversationKey(body);
+  const prevStored = conversationStates.get(convKey);
+  console.log(`[proxy] keys convKey=${convKey} bridgeKey=${bridgeKey} hasStored=${!!prevStored} hasCheckpoint=${!!prevStored?.checkpoint} turns=${turns.length} toolResults=${toolResults.length}`);
 
   // Mutex is already held by the fetch() handler — no need to acquire here.
 
@@ -569,7 +578,15 @@ async function doHandleChatCompletion(
     activeBridges.delete(bridgeKey);
   }
 
-  let stored = conversationStates.get(convKey);
+  let stored: StoredConversation | undefined = conversationStates.get(convKey);
+  // Safety: if existing state has a checkpoint but this request has no conversation
+  // history (no turns, no tool results), it's likely a key collision with a different
+  // conversation type (e.g., title generation vs. regular chat). Reset to avoid
+  // "Blob not found" errors from stale checkpoint references.
+  if (stored?.checkpoint && turns.length === 0 && toolResults.length === 0) {
+    conversationStates.delete(convKey);
+    stored = undefined;
+  }
   if (!stored) {
     stored = {
       conversationId: deterministicConversationId(convKey),
@@ -597,7 +614,19 @@ async function doHandleChatCompletion(
   if (body.stream === false) {
     return handleNonStreamingResponse(payload, accessToken, modelId, convKey, release);
   }
-  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, release);
+  const retryCtx: RetryContext = {
+    stored,
+    accessToken,
+    modelId,
+    systemPrompt,
+    effectiveUserText,
+    turns,
+    mcpTools,
+  };
+  return handleStreamingResponse(
+    payload, accessToken, modelId, bridgeKey, convKey, release,
+    retryCtx,
+  );
 }
 
 interface ToolResultInfo {
@@ -744,42 +773,14 @@ function buildCursorRequest(
   if (checkpoint) {
     conversationState = fromBinary(ConversationStateStructureSchema, checkpoint);
   } else {
-    const turnBytes: Uint8Array[] = [];
-    for (const turn of turns) {
-      const userMsg = create(UserMessageSchema, {
-        text: turn.userText,
-        messageId: crypto.randomUUID(),
-      });
-      const userMsgBytes = toBinary(UserMessageSchema, userMsg);
-
-      // Store turn user message in blobStore so Cursor can look it up
-      const turnMsgBlobId = Buffer.from(userMsgBytes).toString("hex");
-      blobStore.set(turnMsgBlobId, userMsgBytes);
-
-      const stepBytes: Uint8Array[] = [];
-      if (turn.assistantText) {
-        const step = create(ConversationStepSchema, {
-          message: {
-            case: "assistantMessage",
-            value: create(AssistantMessageSchema, { text: turn.assistantText }),
-          },
-        });
-        stepBytes.push(toBinary(ConversationStepSchema, step));
-      }
-
-      const agentTurn = create(AgentConversationTurnStructureSchema, {
-        userMessage: userMsgBytes,
-        steps: stepBytes,
-      });
-      const turnStructure = create(ConversationTurnStructureSchema, {
-        turn: { case: "agentConversationTurn", value: agentTurn },
-      });
-      turnBytes.push(toBinary(ConversationTurnStructureSchema, turnStructure));
-    }
-
+    // IMPORTANT: Do NOT include turns in the ConversationState for fresh conversations.
+    // Cursor's server interprets AgentConversationTurnStructure.user_message as a blob
+    // reference (not inline data). For fresh conversations, these blobs don't exist on
+    // the server yet, causing "Blob not found" errors. The conversation history is
+    // communicated via the action's UserMessage instead — Cursor rebuilds state from that.
     conversationState = create(ConversationStateStructureSchema, {
       rootPromptMessagesJson: [systemBlobId],
-      turns: turnBytes,
+      turns: [],
       todos: [],
       pendingToolCalls: [],
       previousWorkspaceUris: [],
@@ -1081,6 +1082,9 @@ function handleKvMessage(
     const blobId = kvMsg.message.value.blobId;
     const blobIdKey = Buffer.from(blobId).toString("hex");
     const blobData = blobStore.get(blobIdKey);
+    if (!blobData) {
+      console.warn(`[proxy] getBlob MISS: ${blobIdKey.slice(0, 16)}... (store has ${blobStore.size} entries)`);
+    }
     sendKvResponse(
       kvMsg, "getBlobResult",
       create(GetBlobResultSchema, blobData ? { blobData } : {}),
@@ -1292,37 +1296,79 @@ function sendExecResult(
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
+function buildConversationIdentity(body: ChatCompletionRequest): string {
+  const rawIds = [
+    body.conversation_id,
+    body.thread_id,
+    body.session_id,
+    body.user,
+  ];
+  for (const id of rawIds) {
+    if (typeof id === "string" && id.trim().length > 0) {
+      return `id:${id.trim()}`;
+    }
+  }
+
+  const metadata = body.metadata && typeof body.metadata === "object"
+    ? body.metadata
+    : undefined;
+  if (metadata) {
+    const candidateKeys = ["conversation_id", "thread_id", "session_id", "chat_id", "id"];
+    for (const key of candidateKeys) {
+      const value = metadata[key];
+      if (typeof value === "string" && value.trim().length > 0) {
+        return `meta:${key}:${value.trim()}`;
+      }
+    }
+  }
+
+  return "";
+}
+
 /** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
-function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
-  const firstUserMsg = messages.find((m) => m.role === "user");
+function deriveBridgeKey(modelId: string, body: ChatCompletionRequest): string {
+  const identity = buildConversationIdentity(body);
+  const firstUserMsg = body.messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
+  const titleNs = isTitleGenerationRequest(body.messages) ? "title:" : "";
+  const base = identity || `fallback:${titleNs}${firstUserText}`;
   return createHash("sha256")
-    .update(`bridge:${modelId}:${firstUserText.slice(0, 200)}`)
+    .update(`bridge:${modelId}:${base}`)
     .digest("hex")
-    .slice(0, 16);
+    .slice(0, 24);
+}
+
+/** Detect if this is a title generation request by checking for title-gen system prompt. */
+function isTitleGenerationRequest(messages: OpenAIMessage[]): boolean {
+  const systemText = messages
+    .filter((m) => m.role === "system")
+    .map((m) => textContent(m.content))
+    .join(" ");
+  return systemText.toLowerCase().includes("title generator") ||
+         systemText.toLowerCase().includes("generate a short title");
 }
 
 /** Derive a key for conversation state. Model-independent so context survives model switches.
- * 
- * IMPORTANT: We use conversationId (deterministic UUID) instead of message content
- * because message content changes when threads are renamed or new sessions start,
- * causing "Blob not found" errors when old blob references are invalidated.
- * 
- * The conversationId is derived from firstUserText for determinism, but we store it
- * in conversationStates so subsequent requests with any firstUserText can look it up.
+ *
+ * Priority:
+ * 1) Explicit conversation identity passed by caller (conversation/thread/session/user)
+ * 2) Fallback hash from stable message anchors (system + first user text)
  */
-function deriveConversationKey(messages: OpenAIMessage[]): string {
-  const firstUserMsg = messages.find((m) => m.role === "user");
+function deriveConversationKey(body: ChatCompletionRequest): string {
+  const identity = buildConversationIdentity(body);
+  const firstUserMsg = body.messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  // Use deterministic conversationId as the key directly
-  const convId = deterministicConversationId(
-    createHash("sha256")
-      .update(`conv:${firstUserText.slice(0, 200)}`)
-      .digest("hex")
-      .slice(0, 16),
-  );
-  // Return a short key for Map lookup (conversationId minus dashes)
-  return convId.replace(/-/g, "").slice(0, 16);
+  const systemText = body.messages
+    .filter((m) => m.role === "system")
+    .map((m) => textContent(m.content))
+    .join("\n");
+  const titleNs = isTitleGenerationRequest(body.messages) ? "title:" : "";
+  const fallbackSeed = `${titleNs}system:${systemText}\nuser:${firstUserText}`;
+  const seed = identity || `fallback:${fallbackSeed}`;
+  return createHash("sha256")
+    .update(`conv:${seed}`)
+    .digest("hex")
+    .slice(0, 24);
 }
 
 /** Deterministic UUID derived from convKey so Cursor's server-side conversation
@@ -1342,7 +1388,20 @@ function deterministicConversationId(convKey: string): string {
   ].join("-");
 }
 
-/** Create an SSE streaming Response that reads from a live bridge. */
+/** Context for retrying a streaming request after "Blob not found" errors. */
+interface RetryContext {
+  stored: StoredConversation;
+  accessToken: string;
+  modelId: string;
+  systemPrompt: string;
+  effectiveUserText: string;
+  turns: Array<{ userText: string; assistantText: string }>;
+  mcpTools: McpToolDefinition[];
+}
+
+/** Create an SSE streaming Response that reads from a live bridge.
+ *  When retryCtx is provided, automatically retries on "Blob not found" errors
+ *  by clearing the checkpoint and starting a fresh bridge. */
 function createBridgeStreamResponse(
   bridge: ReturnType<typeof spawnBridge>,
   heartbeatTimer: NodeJS.Timeout,
@@ -1352,19 +1411,20 @@ function createBridgeStreamResponse(
   bridgeKey: string,
   convKey: string,
   release: () => void,
+  retryCtx?: RetryContext,
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
+  let outerReleased = false;
+  const safeRelease = () => {
+    if (outerReleased) return;
+    outerReleased = true;
+    release();
+  };
 
   const stream = new ReadableStream({
     cancel() {
-      // Run if client aborts HTTP stream before completion
-      release();
-      try {
-        clearInterval(heartbeatTimer);
-        bridge.kill();
-        activeBridges.delete(bridgeKey);
-      } catch (err) {}
+      safeRelease();
     },
     start(controller) {
       const encoder = new TextEncoder();
@@ -1381,14 +1441,7 @@ function createBridgeStreamResponse(
         if (closed) return;
         closed = true;
         controller.close();
-        release();
-        // If no tool call pending, the bridge is done — stop heartbeats
-        // so the subprocess can exit (prevents zombie h2-bridge accumulation).
-        if (!mcpExecReceived) {
-          clearInterval(heartbeatTimer);
-          bridge.kill();
-          activeBridges.delete(bridgeKey);
-        }
+        safeRelease();
       };
 
       const makeChunk = (
@@ -1402,138 +1455,191 @@ function createBridgeStreamResponse(
         choices: [{ index: 0, delta, finish_reason: finishReason }],
       });
 
-      const makeUsageChunk = () => {
-        const { prompt_tokens, completion_tokens, total_tokens } = computeUsage(state);
-        return {
-          id: completionId,
-          object: "chat.completion.chunk",
-          created,
-          model: modelId,
-          choices: [],
-          usage: { prompt_tokens, completion_tokens, total_tokens },
+      function runAttempt(
+        attemptBridge: ReturnType<typeof spawnBridge>,
+        attemptHeartbeat: NodeJS.Timeout,
+        attemptBlobStore: Map<string, Uint8Array>,
+        attemptMcpTools: McpToolDefinition[],
+        attempt: number,
+      ): void {
+        const state: StreamState = {
+          toolCallIndex: 0,
+          pendingExecs: [],
+          outputTokens: 0,
+          totalTokens: 0,
         };
-      };
+        const tagFilter = createThinkingTagFilter();
+        let mcpExecReceived = false;
+        let anyContentSent = false;
+        let blobNotFound = false;
 
-      const state: StreamState = {
-        toolCallIndex: 0,
-        pendingExecs: [],
-        outputTokens: 0,
-        totalTokens: 0,
-      };
-      const tagFilter = createThinkingTagFilter();
+        const makeUsageChunk = () => {
+          const { prompt_tokens, completion_tokens, total_tokens } = computeUsage(state);
+          return {
+            id: completionId,
+            object: "chat.completion.chunk",
+            created,
+            model: modelId,
+            choices: [],
+            usage: { prompt_tokens, completion_tokens, total_tokens },
+          };
+        };
 
-      let mcpExecReceived = false;
+        const processChunk = createConnectFrameParser(
+          (messageBytes) => {
+            try {
+              const serverMessage = fromBinary(
+                AgentServerMessageSchema,
+                messageBytes,
+              );
+              processServerMessage(
+                serverMessage,
+                attemptBlobStore,
+                attemptMcpTools,
+                (data) => attemptBridge.write(data),
+                state,
+                (text, isThinking) => {
+                  anyContentSent = true;
+                  if (isThinking) {
+                    sendSSE(makeChunk({ reasoning_content: text }));
+                  } else {
+                    const { content, reasoning } = tagFilter.process(text);
+                    if (reasoning) sendSSE(makeChunk({ reasoning_content: reasoning }));
+                    if (content) sendSSE(makeChunk({ content }));
+                  }
+                },
+                // onMcpExec — the model wants to execute a tool.
+                (exec) => {
+                  state.pendingExecs.push(exec);
+                  mcpExecReceived = true;
+                  anyContentSent = true;
 
-      const processChunk = createConnectFrameParser(
-        (messageBytes) => {
-          try {
-            const serverMessage = fromBinary(
-              AgentServerMessageSchema,
-              messageBytes,
-            );
-            processServerMessage(
-              serverMessage,
-              blobStore,
-              mcpTools,
-              (data) => bridge.write(data),
-              state,
-              (text, isThinking) => {
-                if (isThinking) {
-                  sendSSE(makeChunk({ reasoning_content: text }));
-                } else {
-                  const { content, reasoning } = tagFilter.process(text);
-                  if (reasoning) sendSSE(makeChunk({ reasoning_content: reasoning }));
-                  if (content) sendSSE(makeChunk({ content }));
-                }
-              },
-              // onMcpExec — the model wants to execute a tool.
-              (exec) => {
-                state.pendingExecs.push(exec);
-                mcpExecReceived = true;
+                  const flushed = tagFilter.flush();
+                  if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+                  if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
 
-                const flushed = tagFilter.flush();
-                if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-                if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+                  const toolCallIndex = state.toolCallIndex++;
+                  sendSSE(makeChunk({
+                    tool_calls: [{
+                      index: toolCallIndex,
+                      id: exec.toolCallId,
+                      type: "function",
+                      function: {
+                        name: exec.toolName,
+                        arguments: exec.decodedArgs,
+                      },
+                    }],
+                  }));
 
-                const toolCallIndex = state.toolCallIndex++;
-                sendSSE(makeChunk({
-                  tool_calls: [{
-                    index: toolCallIndex,
-                    id: exec.toolCallId,
-                    type: "function",
-                    function: {
-                      name: exec.toolName,
-                      arguments: exec.decodedArgs,
-                    },
-                  }],
-                }));
+                  // Keep the bridge alive for tool result continuation.
+                  activeBridges.set(bridgeKey, {
+                    bridge: attemptBridge,
+                    heartbeatTimer: attemptHeartbeat,
+                    blobStore: attemptBlobStore,
+                    mcpTools: attemptMcpTools,
+                    pendingExecs: state.pendingExecs,
+                  });
 
-                // Keep the bridge alive for tool result continuation.
-                activeBridges.set(bridgeKey, {
-                  bridge,
-                  heartbeatTimer,
-                  blobStore,
-                  mcpTools,
-                  pendingExecs: state.pendingExecs,
-                });
+                  sendSSE(makeChunk({}, "tool_calls"));
+                  sendDone();
+                  closeController();
+                },
+                (checkpointBytes) => {
+                  const stored = conversationStates.get(convKey);
+                  if (stored) {
+                    stored.checkpoint = checkpointBytes;
+                    for (const [k, v] of attemptBlobStore) stored.blobStore.set(k, v);
+                    stored.lastAccessMs = Date.now();
+                  }
+                },
+              );
+            } catch {
+              // Skip unparseable messages
+            }
+          },
+          (endStreamBytes) => {
+            const endError = parseConnectEndStream(endStreamBytes);
+            if (endError) {
+              // Auto-retry on "Blob not found" if no content was emitted yet.
+              // The error arrives within 1-2s, before any SSE events are sent,
+              // so the client never sees the failed attempt.
+              if (
+                !anyContentSent &&
+                endError.message.includes("Blob not found") &&
+                attempt === 0 &&
+                retryCtx
+              ) {
+                blobNotFound = true;
+                return; // swallow error — onClose will retry
+              }
+              anyContentSent = true;
+              sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
+            }
+          },
+        );
 
-                sendSSE(makeChunk({}, "tool_calls"));
-                sendDone();
-                closeController();
-              },
-              (checkpointBytes) => {
-                const stored = conversationStates.get(convKey);
-                if (stored) {
-                  stored.checkpoint = checkpointBytes;
-                  // Sync any blobs Cursor added during this bridge session
-                  // so subsequent requests see them even if the bridge
-                  // dies before onClose fires.
-                  for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-                  stored.lastAccessMs = Date.now();
-                }
-              },
-            );
-          } catch {
-            // Skip unparseable messages
+        attemptBridge.onData(processChunk);
+
+        attemptBridge.onClose((code) => {
+          clearInterval(attemptHeartbeat);
+          const stored = conversationStates.get(convKey);
+          if (stored) {
+            for (const [k, v] of attemptBlobStore) stored.blobStore.set(k, v);
+            stored.lastAccessMs = Date.now();
           }
-        },
-        (endStreamBytes) => {
-          const endError = parseConnectEndStream(endStreamBytes);
-          if (endError) {
-            sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
+
+          // Retry: clear stale checkpoint and start a fresh bridge
+          if (blobNotFound && !anyContentSent && attempt === 0 && retryCtx) {
+            console.warn("[proxy] Blob not found, retrying without checkpoint");
+            if (stored) {
+              stored.checkpoint = null;
+              stored.blobStore.clear();
+            }
+            activeBridges.delete(bridgeKey);
+            attemptBridge.kill();
+
+            const freshPayload = buildCursorRequest(
+              retryCtx.modelId,
+              retryCtx.systemPrompt,
+              retryCtx.effectiveUserText,
+              retryCtx.turns,
+              retryCtx.stored.conversationId,
+              null, // no checkpoint
+              retryCtx.stored.blobStore,
+            );
+            freshPayload.mcpTools = retryCtx.mcpTools;
+            const { bridge: newBridge, heartbeatTimer: newTimer } =
+              startBridge(retryCtx.accessToken, freshPayload.requestBytes);
+            runAttempt(newBridge, newTimer, freshPayload.blobStore, freshPayload.mcpTools, 1);
+            return;
           }
-        },
-      );
 
-      bridge.onData(processChunk);
+          if (!mcpExecReceived) {
+            const flushed = tagFilter.flush();
+            if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+            if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+            sendSSE(makeChunk({}, "stop"));
+            sendSSE(makeUsageChunk());
+            sendDone();
+            closeController();
+            // Clean up bridge so h2-bridge subprocess can exit.
+            clearInterval(attemptHeartbeat);
+            attemptBridge.kill();
+            activeBridges.delete(bridgeKey);
+          } else if (code !== 0) {
+            // Bridge died while tool calls are pending (timeout, crash, etc.).
+            sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
+            sendSSE(makeChunk({}, "stop"));
+            sendSSE(makeUsageChunk());
+            sendDone();
+            closeController();
+            activeBridges.delete(bridgeKey);
+          }
+        });
+      }
 
-      bridge.onClose((code) => {
-        clearInterval(heartbeatTimer);
-        const stored = conversationStates.get(convKey);
-        if (stored) {
-          for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-          stored.lastAccessMs = Date.now();
-        }
-        if (!mcpExecReceived) {
-          const flushed = tagFilter.flush();
-          if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-          if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
-          sendSSE(makeChunk({}, "stop"));
-          sendSSE(makeUsageChunk());
-          sendDone();
-          closeController();
-        } else if (code !== 0) {
-          // Bridge died while tool calls are pending (timeout, crash, etc.).
-          // Close the SSE stream so the client doesn't hang forever.
-          sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
-          sendSSE(makeChunk({}, "stop"));
-          sendSSE(makeUsageChunk());
-          sendDone();
-          closeController();
-          // Remove stale entry so the next request doesn't try to resume it.
-          activeBridges.delete(bridgeKey);
-        }
-      });
+      // Kick off the first attempt
+      runAttempt(bridge, heartbeatTimer, blobStore, mcpTools, 0);
     },
   });
 
@@ -1561,12 +1667,14 @@ function handleStreamingResponse(
   bridgeKey: string,
   convKey: string,
   release: () => void,
+  retryCtx?: RetryContext,
 ): Response {
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     payload.blobStore, payload.mcpTools,
     modelId, bridgeKey, convKey, release,
+    retryCtx,
   );
 }
 
@@ -1723,7 +1831,12 @@ async function collectFullResponse(
         // Skip
       }
     },
-    () => {},
+    (endStreamBytes) => {
+      const endError = parseConnectEndStream(endStreamBytes);
+      if (endError) {
+        fullText += `\n[Error: ${endError.message}]`;
+      }
+    },
   ));
 
   bridge.onClose(() => {
