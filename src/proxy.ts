@@ -602,9 +602,25 @@ async function doHandleChatCompletion(
   // Build the request. When tool results are present but the bridge died,
   // we must still include the last user text so Cursor has context.
   const mcpTools = buildMcpToolDefinitions(tools);
-  const effectiveUserText = userText || (toolResults.length > 0
+  let effectiveUserText = userText || (toolResults.length > 0
     ? toolResults.map((r) => r.content).join("\n")
     : "");
+
+  // For fresh conversations (no checkpoint), embed prior conversation turns
+  // into the user message so the model has context of previous interactions.
+  // When a checkpoint exists, Cursor already has the full conversation state.
+  if (!stored.checkpoint && turns.length > 0) {
+    const historyLines: string[] = [];
+    for (const turn of turns) {
+      if (turn.userText) historyLines.push(`User: ${turn.userText}`);
+      if (turn.assistantText) historyLines.push(`Assistant: ${turn.assistantText}`);
+    }
+    if (historyLines.length > 0) {
+      effectiveUserText = `[Previous conversation]\n${historyLines.join('\n')}\n\n[Current message]\n${effectiveUserText}`;
+      console.log(`[proxy] embedded ${turns.length} prior turns in UserMessage (no checkpoint)`);
+    }
+  }
+
   const payload = buildCursorRequest(
     modelId, systemPrompt, effectiveUserText, turns,
     stored.conversationId, stored.checkpoint, stored.blobStore,
@@ -664,9 +680,25 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     systemPrompt = systemParts.join("\n");
   }
 
-  // Separate tool results from conversation turns
+  // Separate tool results from conversation turns.
+  // OpenAI tool-call pattern interleaves assistant(tool_calls) → tool → assistant(text):
+  //   user → assistant(tool_calls) → tool → assistant(text+tool_calls) → tool → assistant(text) → user
+  // We accumulate ALL assistant text after each user message until the next user message,
+  // so each turn pair captures the full assistant response across tool-call cycles.
   const nonSystem = messages.filter((m) => m.role !== "system");
   let pendingUser = "";
+  let pendingAssistantTexts: string[] = [];
+
+  function flushPair() {
+    if (pendingUser) {
+      pairs.push({
+        userText: pendingUser,
+        assistantText: pendingAssistantTexts.join("\n"),
+      });
+    }
+    pendingUser = "";
+    pendingAssistantTexts = [];
+  }
 
   for (const msg of nonSystem) {
     if (msg.role === "tool") {
@@ -675,20 +707,26 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
         content: textContent(msg.content),
       });
     } else if (msg.role === "user") {
-      if (pendingUser) {
-        pairs.push({ userText: pendingUser, assistantText: "" });
-      }
+      flushPair();
       pendingUser = textContent(msg.content);
     } else if (msg.role === "assistant") {
-      // Skip assistant messages that are just tool_calls with no text
       const text = textContent(msg.content);
-      if (pendingUser) {
-        pairs.push({ userText: pendingUser, assistantText: text });
-        pendingUser = "";
+      if (text) {
+        pendingAssistantTexts.push(text);
       }
     }
   }
 
+  // If accumulated assistant text for pending user, it's a completed turn
+  if (pendingUser && pendingAssistantTexts.length > 0) {
+    pairs.push({
+      userText: pendingUser,
+      assistantText: pendingAssistantTexts.join("\n"),
+    });
+    pendingUser = "";
+  }
+
+  // Determine the current user message to send to Cursor
   let lastUserText = "";
   if (pendingUser) {
     lastUserText = pendingUser;
@@ -1358,12 +1396,12 @@ function deriveConversationKey(body: ChatCompletionRequest): string {
   const identity = buildConversationIdentity(body);
   const firstUserMsg = body.messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  const systemText = body.messages
-    .filter((m) => m.role === "system")
-    .map((m) => textContent(m.content))
-    .join("\n");
   const titleNs = isTitleGenerationRequest(body.messages) ? "title:" : "";
-  const fallbackSeed = `${titleNs}system:${systemText}\nuser:${firstUserText}`;
+  // NOTE: Do NOT include full system prompt in fallback key — OpenCode's system
+  // prompt changes every request (dynamic context, per-turn metadata), which would
+  // cause convKey to rotate and lose the stored conversation checkpoint.
+  // Only firstUserText is used — it's the stable initial user message.
+  const fallbackSeed = `${titleNs}user:${firstUserText}`;
   const seed = identity || `fallback:${fallbackSeed}`;
   return createHash("sha256")
     .update(`conv:${seed}`)
