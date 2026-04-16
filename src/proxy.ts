@@ -546,6 +546,26 @@ async function doHandleChatCompletion(
     );
   }
 
+  // Title-generation requests are stateless one-shot calls — they don't need
+  // conversation state, checkpoints, MCP tools, or mutexes.  Bypass all of
+  // that and stream directly to Cursor.
+  const isTitleGen = isTitleGenerationRequest(body.messages);
+  if (isTitleGen) {
+    console.log(`[proxy] title-gen request model=${modelId} — stateless path`);
+    const payload = buildCursorRequest(modelId, systemPrompt, userText, [], "", null, new Map());
+    payload.mcpTools = [];
+    const { bridge: tBridge, heartbeatTimer: tHb } = startBridge(accessToken, payload.requestBytes);
+    return createBridgeStreamResponse(
+      tBridge, tHb,
+      payload.blobStore,
+      [],
+      modelId,
+      `title:${crypto.randomUUID()}`,
+      `title:${crypto.randomUUID()}`,
+      release,
+    );
+  }
+
   // bridgeKey: model-specific, for active tool-call bridges
   // convKey: model-independent, for conversation state that survives model switches
   const bridgeKey = deriveBridgeKey(modelId, body);
