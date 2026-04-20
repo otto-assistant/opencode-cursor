@@ -157,6 +157,7 @@ interface ActiveBridge {
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
+  lastAccessMs: number;
 }
 
 // Active bridges keyed by a session token (derived from conversation state).
@@ -173,12 +174,34 @@ interface StoredConversation {
 
 const conversationStates = new Map<string, StoredConversation>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
+const MUTEX_TTL_MS = 30 * 60 * 1000;
+const ACTIVE_BRIDGE_TTL_MS = 5 * 60 * 1000;
+const MAX_ACTIVE_BRIDGES = 24;
+const PROXY_IDLE_SHUTDOWN_MS = 10 * 60 * 1000;
+const MAINTENANCE_INTERVAL_MS = 60 * 1000;
 
 // Per-conversation mutexes — prevent concurrent requests from corrupting
 // shared state (blobStore, checkpoints, active bridges).
 const convMutexes = new Map<string, Mutex>();
+const convMutexLastUsedMs = new Map<string, number>();
 
 const systemBlobCache = new Map<string, { blobId: string; bytes: Uint8Array }>();
+
+let activeRequestCount = 0;
+let idleShutdownTimer: ReturnType<typeof setTimeout> | undefined;
+let maintenanceTimer: ReturnType<typeof setInterval> | undefined;
+
+const proxyTelemetry = {
+  capRejects: 0,
+  staleConversationEvictions: 0,
+  staleMutexEvictions: 0,
+  staleBridgeEvictions: 0,
+  forcedBridgeKills: 0,
+  pressureActivations: 0,
+  admissionRejects: 0,
+  maintenanceRuns: 0,
+  lastSnapshotMs: 0,
+};
 
 function getOrCreateMutex(convKey: string): Mutex {
   let mutex = convMutexes.get(convKey);
@@ -186,7 +209,46 @@ function getOrCreateMutex(convKey: string): Mutex {
     mutex = new Mutex();
     convMutexes.set(convKey, mutex);
   }
+  convMutexLastUsedMs.set(convKey, Date.now());
   return mutex;
+}
+
+function deleteActiveBridge(bridgeKey: string): void {
+  if (activeBridges.delete(bridgeKey)) {
+    scheduleIdleShutdown();
+  }
+}
+
+function killActiveBridge(active: ActiveBridge): void {
+  proxyTelemetry.forcedBridgeKills += 1;
+  clearInterval(active.heartbeatTimer);
+  active.bridge.kill();
+}
+
+function isProxyUnderPressure(): boolean {
+  return (
+    activeRequestCount >= PRESSURE_ACTIVE_REQUESTS_THRESHOLD ||
+    activeBridges.size >= PRESSURE_ACTIVE_BRIDGES_THRESHOLD
+  );
+}
+
+function shouldRejectByAdmissionControl(): boolean {
+  return (
+    activeRequestCount > ADMISSION_MAX_ACTIVE_REQUESTS ||
+    activeBridges.size >= ADMISSION_MAX_ACTIVE_BRIDGES
+  );
+}
+
+function setActiveBridge(bridgeKey: string, active: ActiveBridge): boolean {
+  if (activeBridges.size >= MAX_ACTIVE_BRIDGES && !activeBridges.has(bridgeKey)) {
+    proxyTelemetry.capRejects += 1;
+    console.warn(`[proxy] active bridge cap reached (${MAX_ACTIVE_BRIDGES}), rejecting new bridge`);
+    killActiveBridge(active);
+    return false;
+  }
+  active.lastAccessMs = Date.now();
+  activeBridges.set(bridgeKey, active);
+  return true;
 }
 
 /**
@@ -218,13 +280,81 @@ function trackResponseCompletion(response: Response): {
   };
 } // 30 minutes
 
-function evictStaleConversations(): void {
+function evictStaleConversations(): number {
+  let evicted = 0;
   const now = Date.now();
   for (const [key, stored] of conversationStates) {
     if (now - stored.lastAccessMs > CONVERSATION_TTL_MS) {
       conversationStates.delete(key);
+      evicted += 1;
     }
   }
+  return evicted;
+}
+
+function evictStaleMutexes(): number {
+  let evicted = 0;
+  const now = Date.now();
+  for (const [key, mutex] of convMutexes) {
+    const lastUsedMs = convMutexLastUsedMs.get(key) ?? now;
+    if (now - lastUsedMs > MUTEX_TTL_MS && mutex.isIdle()) {
+      convMutexes.delete(key);
+      convMutexLastUsedMs.delete(key);
+      evicted += 1;
+    }
+  }
+  return evicted;
+}
+
+function evictStaleActiveBridges(): number {
+  let evicted = 0;
+  const now = Date.now();
+  for (const [bridgeKey, active] of activeBridges) {
+    if (now - active.lastAccessMs > ACTIVE_BRIDGE_TTL_MS) {
+      killActiveBridge(active);
+      deleteActiveBridge(bridgeKey);
+      evicted += 1;
+    }
+  }
+  return evicted;
+}
+
+function runMaintenanceSweep(): void {
+  const staleConversations = evictStaleConversations();
+  const staleMutexes = evictStaleMutexes();
+  const staleBridges = evictStaleActiveBridges();
+
+  proxyTelemetry.maintenanceRuns += 1;
+  proxyTelemetry.staleConversationEvictions += staleConversations;
+  proxyTelemetry.staleMutexEvictions += staleMutexes;
+  proxyTelemetry.staleBridgeEvictions += staleBridges;
+
+  const now = Date.now();
+  if (staleConversations > 0 || staleMutexes > 0 || staleBridges > 0 || now - proxyTelemetry.lastSnapshotMs > 5 * 60 * 1000) {
+    proxyTelemetry.lastSnapshotMs = now;
+    console.log(
+      `[proxy] health activeReq=${activeRequestCount} activeBridges=${activeBridges.size} conv=${conversationStates.size} mutex=${convMutexes.size} ` +
+      `evict(conv/mutex/bridge)=${proxyTelemetry.staleConversationEvictions}/${proxyTelemetry.staleMutexEvictions}/${proxyTelemetry.staleBridgeEvictions} ` +
+      `capRejects=${proxyTelemetry.capRejects} admissionRejects=${proxyTelemetry.admissionRejects} bridgeKills=${proxyTelemetry.forcedBridgeKills} pressureHits=${proxyTelemetry.pressureActivations}`,
+    );
+  }
+}
+
+function clearIdleShutdownTimer(): void {
+  if (!idleShutdownTimer) return;
+  clearTimeout(idleShutdownTimer);
+  idleShutdownTimer = undefined;
+}
+
+function scheduleIdleShutdown(): void {
+  if (!proxyServer) return;
+  if (activeRequestCount > 0 || activeBridges.size > 0) return;
+  clearIdleShutdownTimer();
+  idleShutdownTimer = setTimeout(() => {
+    if (activeRequestCount > 0 || activeBridges.size > 0) return;
+    console.log("[proxy] idle timeout reached, stopping proxy server");
+    stopProxy();
+  }, PROXY_IDLE_SHUTDOWN_MS);
 }
 
 /** Length-prefix a message: [4-byte BE length][payload] */
@@ -427,71 +557,102 @@ export async function startProxy(
     id: model.id,
     name: model.name,
   }));
+  clearIdleShutdownTimer();
   if (proxyServer && proxyPort) return proxyPort;
 
   proxyServer = Bun.serve({
     port: 0,
     idleTimeout: 255, // max — Cursor responses can take 30s+
     async fetch(req) {
-      const url = new URL(req.url);
+      activeRequestCount += 1;
+      clearIdleShutdownTimer();
+      try {
+        const url = new URL(req.url);
 
-      if (req.method === "GET" && url.pathname === "/v1/models") {
-        return new Response(
-          JSON.stringify({
-            object: "list",
-            data: buildOpenAIModelList(proxyModels),
-          }),
-          { headers: { "Content-Type": "application/json" } },
-        );
-      }
-
-      if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
-        let release: (() => void) | undefined;
-        try {
-          const body = (await req.json()) as ChatCompletionRequest;
-          const msgSummary = body.messages.map((m) => `${m.role}[${(typeof m.content === 'string' ? m.content : Array.isArray(m.content) ? m.content.length + ' parts' : 'null')?.slice(0, 40)}]`).join(', ');
-          console.log(`[proxy] REQUEST model=${body.model} stream=${body.stream} msgs=${body.messages.length} [${msgSummary.slice(0, 120)}]`);
-          if (!proxyAccessTokenProvider) {
-            throw new Error("Cursor proxy access token provider not configured");
-          }
-          const accessToken = await proxyAccessTokenProvider();
-
-          // Serialize per-conversation requests to prevent race conditions
-          // that cause "Blob not found" errors from concurrent state mutations.
-          const convKey = deriveConversationKey(body);
-          const mutex = getOrCreateMutex(convKey);
-          const acquired = await mutex.acquire();
-          // Guard against double-release: multiple cleanup paths
-          // (closeController, cancel, onClose) can all fire for the same request.
-          let released = false;
-          release = () => {
-            if (released) return;
-            released = true;
-            acquired();
-          };
-
-          // Pass the real release down so stream cleanup paths can unlock the mutex.
-          // We do NOT use done.finally() because the HTTP client (OpenCode) may not
-          // close the connection on abort, leaving pipeTo hanging forever.
-          const rawResponse = handleChatCompletion(body, accessToken, release);
-          const resolvedResponse =
-            rawResponse instanceof Promise ? await rawResponse : rawResponse;
-          return resolvedResponse;
-        } catch (err) {
-          release?.();
-          const message = err instanceof Error ? err.message : String(err);
+        if (req.method === "GET" && url.pathname === "/v1/models") {
           return new Response(
             JSON.stringify({
-              error: { message, type: "server_error", code: "internal_error" },
+              object: "list",
+              data: buildOpenAIModelList(proxyModels),
             }),
-            { status: 500, headers: { "Content-Type": "application/json" } },
+            { headers: { "Content-Type": "application/json" } },
           );
         }
-      }
 
-      return new Response("Not Found", { status: 404 });
+        if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+          if (shouldRejectByAdmissionControl()) {
+            proxyTelemetry.admissionRejects += 1;
+            return new Response(
+              JSON.stringify({
+                error: {
+                  message: "Server is saturated, please retry shortly",
+                  type: "server_error",
+                  code: "service_unavailable",
+                },
+              }),
+              {
+                status: 503,
+                headers: {
+                  "Content-Type": "application/json",
+                  "Retry-After": "2",
+                },
+              },
+            );
+          }
+          let release: (() => void) | undefined;
+          try {
+            const body = (await req.json()) as ChatCompletionRequest;
+            const msgSummary = body.messages.map((m) => `${m.role}[${(typeof m.content === 'string' ? m.content : Array.isArray(m.content) ? m.content.length + ' parts' : 'null')?.slice(0, 40)}]`).join(', ');
+            console.log(`[proxy] REQUEST model=${body.model} stream=${body.stream} msgs=${body.messages.length} [${msgSummary.slice(0, 120)}]`);
+            if (!proxyAccessTokenProvider) {
+              throw new Error("Cursor proxy access token provider not configured");
+            }
+            const accessToken = await proxyAccessTokenProvider();
+
+            // Serialize per-conversation requests to prevent race conditions
+            // that cause "Blob not found" errors from concurrent state mutations.
+            const convKey = deriveConversationKey(body);
+            const mutex = getOrCreateMutex(convKey);
+            const acquired = await mutex.acquire();
+            // Guard against double-release: multiple cleanup paths
+            // (closeController, cancel, onClose) can all fire for the same request.
+            let released = false;
+            release = () => {
+              if (released) return;
+              released = true;
+              convMutexLastUsedMs.set(convKey, Date.now());
+              acquired();
+            };
+
+            // Pass the real release down so stream cleanup paths can unlock the mutex.
+            // We do NOT use done.finally() because the HTTP client (OpenCode) may not
+            // close the connection on abort, leaving pipeTo hanging forever.
+            const rawResponse = handleChatCompletion(body, accessToken, release);
+            const resolvedResponse =
+              rawResponse instanceof Promise ? await rawResponse : rawResponse;
+            return resolvedResponse;
+          } catch (err) {
+            release?.();
+            const message = err instanceof Error ? err.message : String(err);
+            return new Response(
+              JSON.stringify({
+                error: { message, type: "server_error", code: "internal_error" },
+              }),
+              { status: 500, headers: { "Content-Type": "application/json" } },
+            );
+          }
+        }
+
+        return new Response("Not Found", { status: 404 });
+      } finally {
+        activeRequestCount = Math.max(0, activeRequestCount - 1);
+        runMaintenanceSweep();
+        scheduleIdleShutdown();
+      }
     },
   });
+
+  maintenanceTimer = setInterval(runMaintenanceSweep, MAINTENANCE_INTERVAL_MS);
 
   proxyPort = proxyServer.port;
   if (!proxyPort) throw new Error("Failed to bind proxy to a port");
@@ -499,6 +660,11 @@ export async function startProxy(
 }
 
 export function stopProxy(): void {
+  clearIdleShutdownTimer();
+  if (maintenanceTimer) {
+    clearInterval(maintenanceTimer);
+    maintenanceTimer = undefined;
+  }
   if (proxyServer) {
     proxyServer.stop();
     proxyServer = undefined;
@@ -508,13 +674,15 @@ export function stopProxy(): void {
   }
   // Clean up any lingering bridges
   for (const active of activeBridges.values()) {
-    clearInterval(active.heartbeatTimer);
-    active.bridge.kill();
+    killActiveBridge(active);
   }
   activeBridges.clear();
   conversationStates.clear();
   convMutexes.clear();
+  convMutexLastUsedMs.clear();
   systemBlobCache.clear();
+  activeRequestCount = 0;
+  proxyTelemetry.lastSnapshotMs = 0;
 }
 
 function handleChatCompletion(
@@ -576,9 +744,12 @@ async function doHandleChatCompletion(
   // Mutex is already held by the fetch() handler — no need to acquire here.
 
   const activeBridge = activeBridges.get(bridgeKey);
+  if (activeBridge) {
+    activeBridge.lastAccessMs = Date.now();
+  }
 
   if (activeBridge && toolResults.length > 0) {
-    activeBridges.delete(bridgeKey);
+    deleteActiveBridge(bridgeKey);
 
     if (activeBridge.bridge.alive) {
       // Resume the live bridge with tool results
@@ -587,15 +758,13 @@ async function doHandleChatCompletion(
 
     // Bridge died (timeout, server disconnect, etc.).
     // Clean up and fall through to start a fresh bridge.
-    clearInterval(activeBridge.heartbeatTimer);
-    activeBridge.bridge.kill();
+    killActiveBridge(activeBridge);
   }
 
   // Clean up stale bridge if present
   if (activeBridge && activeBridges.has(bridgeKey)) {
-    clearInterval(activeBridge.heartbeatTimer);
-    activeBridge.bridge.kill();
-    activeBridges.delete(bridgeKey);
+    killActiveBridge(activeBridge);
+    deleteActiveBridge(bridgeKey);
   }
 
   let stored: StoredConversation | undefined = conversationStates.get(convKey);
@@ -617,7 +786,7 @@ async function doHandleChatCompletion(
     conversationStates.set(convKey, stored);
   }
   stored.lastAccessMs = Date.now();
-  evictStaleConversations();
+  runMaintenanceSweep();
 
   // Build the request. When tool results are present but the bridge died,
   // we must still include the last user text so Cursor has context.
@@ -1457,6 +1626,17 @@ interface RetryContext {
   mcpTools: McpToolDefinition[];
 }
 
+/** Max automatic retries for transient connect errors (e.g. "invalid_argument"). */
+const MAX_CONNECT_RETRIES = 3;
+/** Base delay in ms for connect-error retry backoff (1s, 2s, 4s). */
+const CONNECT_RETRY_BASE_DELAY_MS = 1000;
+const PRESSURE_MAX_CONNECT_RETRIES = 1;
+const PRESSURE_RETRY_DELAY_MULTIPLIER = 3;
+const PRESSURE_ACTIVE_REQUESTS_THRESHOLD = 4;
+const PRESSURE_ACTIVE_BRIDGES_THRESHOLD = Math.max(4, Math.floor(MAX_ACTIVE_BRIDGES * 0.7));
+const ADMISSION_MAX_ACTIVE_REQUESTS = 12;
+const ADMISSION_MAX_ACTIVE_BRIDGES = MAX_ACTIVE_BRIDGES;
+
 /** Create an SSE streaming Response that reads from a live bridge.
  *  When retryCtx is provided, automatically retries on "Blob not found" errors
  *  by clearing the checkpoint and starting a fresh bridge. */
@@ -1470,6 +1650,10 @@ function createBridgeStreamResponse(
   convKey: string,
   release: () => void,
   retryCtx?: RetryContext,
+  /** Access token for connect-error retries (required for auto-retry). */
+  accessToken?: string,
+  /** Original request bytes for connect-error retries. */
+  requestBytes?: Uint8Array,
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1530,6 +1714,13 @@ function createBridgeStreamResponse(
         let mcpExecReceived = false;
         let anyContentSent = false;
         let blobNotFound = false;
+        let connectError = false;
+        const pressureMode = isProxyUnderPressure();
+        if (pressureMode) {
+          proxyTelemetry.pressureActivations += 1;
+        }
+        const maxConnectRetries = pressureMode ? PRESSURE_MAX_CONNECT_RETRIES : MAX_CONNECT_RETRIES;
+        const retryDelayMultiplier = pressureMode ? PRESSURE_RETRY_DELAY_MULTIPLIER : 1;
 
         const makeUsageChunk = () => {
           const { prompt_tokens, completion_tokens, total_tokens } = computeUsage(state);
@@ -1590,13 +1781,21 @@ function createBridgeStreamResponse(
                   }));
 
                   // Keep the bridge alive for tool result continuation.
-                  activeBridges.set(bridgeKey, {
+                  const attached = setActiveBridge(bridgeKey, {
                     bridge: attemptBridge,
                     heartbeatTimer: attemptHeartbeat,
                     blobStore: attemptBlobStore,
                     mcpTools: attemptMcpTools,
                     pendingExecs: state.pendingExecs,
+                    lastAccessMs: Date.now(),
                   });
+                  if (!attached) {
+                    sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
+                    sendSSE(makeChunk({}, "stop"));
+                    sendDone();
+                    closeController();
+                    return;
+                  }
 
                   sendSSE(makeChunk({}, "tool_calls"));
                   sendDone();
@@ -1630,6 +1829,19 @@ function createBridgeStreamResponse(
                 blobNotFound = true;
                 return; // swallow error — onClose will retry
               }
+              // Auto-retry on transient connect errors (e.g. "invalid_argument")
+              // if no content was emitted and we haven't exhausted retries.
+              if (
+                !anyContentSent &&
+                !blobNotFound &&
+                attempt < maxConnectRetries &&
+                accessToken &&
+                requestBytes
+              ) {
+                connectError = true;
+                console.warn(`[proxy] Connect error (attempt ${attempt + 1}/${maxConnectRetries + 1}, pressure=${pressureMode}): ${endError.message}`);
+                return; // swallow error — onClose will retry
+              }
               anyContentSent = true;
               sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
             }
@@ -1653,7 +1865,7 @@ function createBridgeStreamResponse(
               stored.checkpoint = null;
               stored.blobStore.clear();
             }
-            activeBridges.delete(bridgeKey);
+            deleteActiveBridge(bridgeKey);
             attemptBridge.kill();
 
             const freshPayload = buildCursorRequest(
@@ -1672,6 +1884,25 @@ function createBridgeStreamResponse(
             return;
           }
 
+          // Retry on transient connect errors with exponential backoff.
+          // The setTimeout is scoped inside the ReadableStream — if the client
+          // aborts (kimaki abort), the stream closes and safeRelease fires,
+          // so no further retries will execute.
+          if (connectError && !anyContentSent && attempt < maxConnectRetries && accessToken && requestBytes) {
+            deleteActiveBridge(bridgeKey);
+            attemptBridge.kill();
+            const delay = CONNECT_RETRY_BASE_DELAY_MS * retryDelayMultiplier * Math.pow(2, attempt);
+            console.warn(`[proxy] Retrying connect in ${delay}ms (attempt ${attempt + 1}/${maxConnectRetries + 1}, pressure=${pressureMode})`);
+            setTimeout(() => {
+              // If the stream was already closed (client abort), don't retry.
+              if (closed) return;
+              const { bridge: retryBridge, heartbeatTimer: retryTimer } =
+                startBridge(accessToken, requestBytes);
+              runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
+            }, delay);
+            return;
+          }
+
           if (!mcpExecReceived) {
             const flushed = tagFilter.flush();
             if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
@@ -1683,7 +1914,7 @@ function createBridgeStreamResponse(
             // Clean up bridge so h2-bridge subprocess can exit.
             clearInterval(attemptHeartbeat);
             attemptBridge.kill();
-            activeBridges.delete(bridgeKey);
+            deleteActiveBridge(bridgeKey);
           } else if (code !== 0) {
             // Bridge died while tool calls are pending (timeout, crash, etc.).
             sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
@@ -1691,7 +1922,7 @@ function createBridgeStreamResponse(
             sendSSE(makeUsageChunk());
             sendDone();
             closeController();
-            activeBridges.delete(bridgeKey);
+            deleteActiveBridge(bridgeKey);
           }
         });
       }
@@ -1733,6 +1964,8 @@ function handleStreamingResponse(
     payload.blobStore, payload.mcpTools,
     modelId, bridgeKey, convKey, release,
     retryCtx,
+    accessToken,
+    payload.requestBytes,
   );
 }
 
@@ -1746,6 +1979,7 @@ function handleToolResultResume(
   release: () => void,
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
+  active.lastAccessMs = Date.now();
 
   // Send mcpResult for each pending exec that has a matching tool result
   for (const exec of pendingExecs) {
