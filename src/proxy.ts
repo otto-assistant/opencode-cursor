@@ -347,14 +347,11 @@ function clearIdleShutdownTimer(): void {
 }
 
 function scheduleIdleShutdown(): void {
-  if (!proxyServer) return;
-  if (activeRequestCount > 0 || activeBridges.size > 0) return;
-  clearIdleShutdownTimer();
-  idleShutdownTimer = setTimeout(() => {
-    if (activeRequestCount > 0 || activeBridges.size > 0) return;
-    console.log("[proxy] idle timeout reached, stopping proxy server");
-    stopProxy();
-  }, PROXY_IDLE_SHUTDOWN_MS);
+  // Idle shutdown disabled — the proxy must stay alive as long as the opencode
+  // process is running.  Previously, after 10 min idle the proxy would stop()
+  // and the port would become invalid, but opencode's provider config still
+  // referenced the dead port → ConnectionRefused on every subsequent request.
+  // The maintenance sweep + admission control are sufficient for resource mgmt.
 }
 
 /** Length-prefix a message: [4-byte BE length][payload] */
@@ -1664,8 +1661,26 @@ function createBridgeStreamResponse(
     release();
   };
 
+  let currentAttemptBridge: ReturnType<typeof spawnBridge> | undefined = bridge;
+  let currentAttemptHeartbeat: NodeJS.Timeout | undefined = heartbeatTimer;
+
+  const cleanupCurrentAttempt = () => {
+    if (!currentAttemptBridge) return;
+    const active = activeBridges.get(bridgeKey);
+    if (active?.bridge === currentAttemptBridge) {
+      return;
+    }
+    if (currentAttemptHeartbeat) {
+      clearInterval(currentAttemptHeartbeat);
+      currentAttemptHeartbeat = undefined;
+    }
+    currentAttemptBridge.kill();
+    currentAttemptBridge = undefined;
+  };
+
   const stream = new ReadableStream({
     cancel() {
+      cleanupCurrentAttempt();
       safeRelease();
     },
     start(controller) {
@@ -1704,6 +1719,8 @@ function createBridgeStreamResponse(
         attemptMcpTools: McpToolDefinition[],
         attempt: number,
       ): void {
+        currentAttemptBridge = attemptBridge;
+        currentAttemptHeartbeat = attemptHeartbeat;
         const state: StreamState = {
           toolCallIndex: 0,
           pendingExecs: [],
