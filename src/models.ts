@@ -4,7 +4,8 @@
  * when discovery fails.
  */
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { z } from "zod";
+import { tool } from "@opencode-ai/plugin";
+const z = tool.schema;
 import { callCursorUnaryRpc } from "./proxy";
 import {
   GetUsableModelsRequestSchema,
@@ -33,7 +34,14 @@ const CursorModelDetailsSchema = z.object({
   thinkingDetails: z.unknown().optional(),
 });
 
-type CursorModelDetails = z.infer<typeof CursorModelDetailsSchema>;
+interface CursorModelDetails {
+  modelId: string;
+  displayName?: string;
+  displayNameShort?: string;
+  displayModelId?: string;
+  aliases: string[];
+  thinkingDetails?: unknown;
+}
 
 export interface CursorModel {
   id: string;

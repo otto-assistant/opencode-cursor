@@ -13,13 +13,13 @@ import {
   refreshCursorToken,
 } from "./auth";
 import { getCursorModels, type CursorModel } from "./models";
-import { startProxy } from "./proxy";
+import { startProxy, getProxyPort } from "./proxy";
 
 const CURSOR_PROVIDER_ID = "cursor";
 
 /**
  * OpenCode plugin that provides Cursor authentication and model access.
- * Register in opencode.json: { "plugin": ["opencode-cursor-oauth"] }
+ * Register in opencode.json: { "plugin": ["@otto-assistant/opencode-cursor-oauth"] }
  */
 export const CursorAuthPlugin: Plugin = async (
   input: PluginInput,
@@ -50,6 +50,10 @@ export const CursorAuthPlugin: Plugin = async (
 
         const models = await getCursorModels(accessToken);
 
+        // startProxy() is idempotent: if the proxy is already running on the
+        // same port it returns immediately.  If it was stopped (e.g. idle
+        // shutdown before the fix, or a future bug), it binds a new random
+        // port and we update provider.models + baseURL accordingly.
         const port = await startProxy(async () => {
           const currentAuth = await getAuth();
           if (currentAuth.type !== "oauth") {
