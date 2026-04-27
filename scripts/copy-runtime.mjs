@@ -1,7 +1,7 @@
 import { cpSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-const runtimeFiles = ["h2-bridge.mjs"];
+const runtimeFiles = ["h2-bridge.mjs", "h2-bridge-persistent.mjs"];
 
 mkdirSync("dist", { recursive: true });
 
