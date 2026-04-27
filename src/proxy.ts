@@ -73,6 +73,7 @@ import {
 import { createHash } from "node:crypto";
 import { resolve as pathResolve } from "node:path";
 import { Mutex } from "./promise-queue";
+import { BridgePool, type BridgeHandle } from "./bridge-pool";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -152,7 +153,7 @@ interface PendingExec {
 
 /** A bridge kept alive across requests for tool result continuation. */
 interface ActiveBridge {
-  bridge: ReturnType<typeof spawnBridge>;
+  bridge: ReturnType<typeof spawnBridge> | BridgeHandle;
   heartbeatTimer: NodeJS.Timeout;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
@@ -175,10 +176,22 @@ interface StoredConversation {
 const conversationStates = new Map<string, StoredConversation>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 const MUTEX_TTL_MS = 30 * 60 * 1000;
-const ACTIVE_BRIDGE_TTL_MS = 5 * 60 * 1000;
+const ACTIVE_BRIDGE_TTL_MS = Number(process.env.OPENCODE_CURSOR_ACTIVE_BRIDGE_TTL_MS ?? 90 * 1000);
+const ADMISSION_BRIDGE_CULL_IDLE_MS = Number(process.env.OPENCODE_CURSOR_ADMISSION_BRIDGE_CULL_IDLE_MS ?? 30 * 1000);
 const MAX_ACTIVE_BRIDGES = 24;
+const MAX_CONVERSATION_BLOB_BYTES = Number(process.env.OPENCODE_CURSOR_MAX_CONV_BLOB_BYTES ?? 64 * 1024 * 1024);
+const MAX_CONVERSATION_BLOB_ENTRIES = Number(process.env.OPENCODE_CURSOR_MAX_CONV_BLOB_ENTRIES ?? 4096);
+const MAX_LIVE_BRIDGE_BLOB_BYTES = Number(process.env.OPENCODE_CURSOR_MAX_BRIDGE_BLOB_BYTES ?? 128 * 1024 * 1024);
+const MAX_LIVE_BRIDGE_BLOB_ENTRIES = Number(process.env.OPENCODE_CURSOR_MAX_BRIDGE_BLOB_ENTRIES ?? 8192);
+const MAX_TOTAL_CONVERSATION_BLOB_BYTES = Number(process.env.OPENCODE_CURSOR_MAX_TOTAL_CONV_BLOB_BYTES ?? 256 * 1024 * 1024);
 const PROXY_IDLE_SHUTDOWN_MS = 10 * 60 * 1000;
 const MAINTENANCE_INTERVAL_MS = 60 * 1000;
+
+// Bridge pool configuration
+const BRIDGE_POOL_MIN_SIZE = Number(process.env.OPENCODE_CURSOR_BRIDGE_POOL_MIN ?? 2);
+const BRIDGE_POOL_MAX_SIZE = Number(process.env.OPENCODE_CURSOR_BRIDGE_POOL_MAX ?? 4);
+const BRIDGE_POOL_ENABLED = process.env.OPENCODE_CURSOR_BRIDGE_POOL_DISABLED !== "1";
+let bridgePool: BridgePool | undefined;
 
 // Per-conversation mutexes — prevent concurrent requests from corrupting
 // shared state (blobStore, checkpoints, active bridges).
@@ -292,6 +305,61 @@ function evictStaleConversations(): number {
   return evicted;
 }
 
+function estimateBlobStoreBytes(blobStore: Map<string, Uint8Array>): number {
+  let bytes = 0;
+  for (const value of blobStore.values()) {
+    bytes += value.byteLength;
+  }
+  return bytes;
+}
+
+function trimBlobStore(
+  blobStore: Map<string, Uint8Array>,
+  maxBytes: number,
+  maxEntries: number,
+): number {
+  let trimmed = 0;
+  let totalBytes = estimateBlobStoreBytes(blobStore);
+  while (blobStore.size > maxEntries || totalBytes > maxBytes) {
+    const oldestKey = blobStore.keys().next().value;
+    if (!oldestKey) break;
+    const removed = blobStore.get(oldestKey);
+    blobStore.delete(oldestKey);
+    if (removed) totalBytes -= removed.byteLength;
+    trimmed += 1;
+  }
+  return trimmed;
+}
+
+function enforceConversationBlobBudget(stored: StoredConversation): void {
+  const trimmed = trimBlobStore(
+    stored.blobStore,
+    MAX_CONVERSATION_BLOB_BYTES,
+    MAX_CONVERSATION_BLOB_ENTRIES,
+  );
+  if (trimmed > 0) {
+    // Checkpoint can reference evicted blobs; reset to allow safe rebuild.
+    stored.checkpoint = null;
+  }
+}
+
+function enforceGlobalConversationBlobBudget(): void {
+  let totalBytes = 0;
+  for (const stored of conversationStates.values()) {
+    totalBytes += estimateBlobStoreBytes(stored.blobStore);
+  }
+  if (totalBytes <= MAX_TOTAL_CONVERSATION_BLOB_BYTES) return;
+
+  const ordered = [...conversationStates.entries()].sort(
+    (a, b) => a[1].lastAccessMs - b[1].lastAccessMs,
+  );
+  for (const [key, stored] of ordered) {
+    if (totalBytes <= MAX_TOTAL_CONVERSATION_BLOB_BYTES) break;
+    totalBytes -= estimateBlobStoreBytes(stored.blobStore);
+    conversationStates.delete(key);
+  }
+}
+
 function evictStaleMutexes(): number {
   let evicted = 0;
   const now = Date.now();
@@ -319,10 +387,33 @@ function evictStaleActiveBridges(): number {
   return evicted;
 }
 
+function cullOldestIdleBridgesForAdmission(maxBridges: number): number {
+  if (activeBridges.size < maxBridges) return 0;
+  const now = Date.now();
+  const candidates: Array<[string, ActiveBridge]> = [];
+  for (const [key, active] of activeBridges) {
+    if (now - active.lastAccessMs >= ADMISSION_BRIDGE_CULL_IDLE_MS) {
+      candidates.push([key, active]);
+    }
+  }
+  if (candidates.length === 0) return 0;
+
+  candidates.sort((a, b) => a[1].lastAccessMs - b[1].lastAccessMs);
+  let culled = 0;
+  for (const [key, active] of candidates) {
+    if (activeBridges.size < maxBridges) break;
+    killActiveBridge(active);
+    deleteActiveBridge(key);
+    culled += 1;
+  }
+  return culled;
+}
+
 function runMaintenanceSweep(): void {
   const staleConversations = evictStaleConversations();
   const staleMutexes = evictStaleMutexes();
   const staleBridges = evictStaleActiveBridges();
+  enforceGlobalConversationBlobBudget();
 
   proxyTelemetry.maintenanceRuns += 1;
   proxyTelemetry.staleConversationEvictions += staleConversations;
@@ -332,10 +423,12 @@ function runMaintenanceSweep(): void {
   const now = Date.now();
   if (staleConversations > 0 || staleMutexes > 0 || staleBridges > 0 || now - proxyTelemetry.lastSnapshotMs > 5 * 60 * 1000) {
     proxyTelemetry.lastSnapshotMs = now;
+    const poolInfo = bridgePool ? ` pool(idle/active/total)=${bridgePool.stats().idle}/${bridgePool.stats().active}/${bridgePool.stats().total}` : "";
     console.log(
       `[proxy] health activeReq=${activeRequestCount} activeBridges=${activeBridges.size} conv=${conversationStates.size} mutex=${convMutexes.size} ` +
       `evict(conv/mutex/bridge)=${proxyTelemetry.staleConversationEvictions}/${proxyTelemetry.staleMutexEvictions}/${proxyTelemetry.staleBridgeEvictions} ` +
-      `capRejects=${proxyTelemetry.capRejects} admissionRejects=${proxyTelemetry.admissionRejects} bridgeKills=${proxyTelemetry.forcedBridgeKills} pressureHits=${proxyTelemetry.pressureActivations}`,
+      `capRejects=${proxyTelemetry.capRejects} admissionRejects=${proxyTelemetry.admissionRejects} bridgeKills=${proxyTelemetry.forcedBridgeKills} pressureHits=${proxyTelemetry.pressureActivations}` +
+      poolInfo,
     );
   }
 }
@@ -557,6 +650,16 @@ export async function startProxy(
   clearIdleShutdownTimer();
   if (proxyServer && proxyPort) return proxyPort;
 
+  // Initialize bridge pool for connection reuse
+  if (BRIDGE_POOL_ENABLED && !bridgePool) {
+    bridgePool = new BridgePool({
+      minSize: BRIDGE_POOL_MIN_SIZE,
+      maxSize: BRIDGE_POOL_MAX_SIZE,
+    });
+    bridgePool.warmup();
+    console.log(`[proxy] bridge pool started min=${BRIDGE_POOL_MIN_SIZE} max=${BRIDGE_POOL_MAX_SIZE}`);
+  }
+
   proxyServer = Bun.serve({
     port: 0,
     idleTimeout: 255, // max — Cursor responses can take 30s+
@@ -577,6 +680,15 @@ export async function startProxy(
         }
 
         if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+          // Run maintenance before admission checks so stale bridges don't cause
+          // false saturation.
+          runMaintenanceSweep();
+          if (activeBridges.size >= ADMISSION_MAX_ACTIVE_BRIDGES) {
+            const culled = cullOldestIdleBridgesForAdmission(ADMISSION_MAX_ACTIVE_BRIDGES);
+            if (culled > 0) {
+              console.warn(`[proxy] admission preflight culled idle bridges=${culled}`);
+            }
+          }
           if (shouldRejectByAdmissionControl()) {
             proxyTelemetry.admissionRejects += 1;
             return new Response(
@@ -661,6 +773,10 @@ export function stopProxy(): void {
   if (maintenanceTimer) {
     clearInterval(maintenanceTimer);
     maintenanceTimer = undefined;
+  }
+  if (bridgePool) {
+    bridgePool.shutdown();
+    bridgePool = undefined;
   }
   if (proxyServer) {
     proxyServer.stop();
@@ -1317,6 +1433,7 @@ function handleKvMessage(
   } else if (kvCase === "setBlobArgs") {
     const { blobId, blobData } = kvMsg.message.value;
     blobStore.set(Buffer.from(blobId).toString("hex"), blobData);
+    trimBlobStore(blobStore, MAX_LIVE_BRIDGE_BLOB_BYTES, MAX_LIVE_BRIDGE_BLOB_ENTRIES);
     sendKvResponse(
       kvMsg, "setBlobResult",
       create(SetBlobResultSchema, {}),
@@ -1638,7 +1755,7 @@ const ADMISSION_MAX_ACTIVE_BRIDGES = MAX_ACTIVE_BRIDGES;
  *  When retryCtx is provided, automatically retries on "Blob not found" errors
  *  by clearing the checkpoint and starting a fresh bridge. */
 function createBridgeStreamResponse(
-  bridge: ReturnType<typeof spawnBridge>,
+  bridge: ReturnType<typeof spawnBridge> | BridgeHandle,
   heartbeatTimer: NodeJS.Timeout,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
@@ -1661,7 +1778,7 @@ function createBridgeStreamResponse(
     release();
   };
 
-  let currentAttemptBridge: ReturnType<typeof spawnBridge> | undefined = bridge;
+  let currentAttemptBridge: ReturnType<typeof spawnBridge> | BridgeHandle | undefined = bridge;
   let currentAttemptHeartbeat: NodeJS.Timeout | undefined = heartbeatTimer;
 
   const cleanupCurrentAttempt = () => {
@@ -1713,7 +1830,7 @@ function createBridgeStreamResponse(
       });
 
       function runAttempt(
-        attemptBridge: ReturnType<typeof spawnBridge>,
+        attemptBridge: ReturnType<typeof spawnBridge> | BridgeHandle,
         attemptHeartbeat: NodeJS.Timeout,
         attemptBlobStore: Map<string, Uint8Array>,
         attemptMcpTools: McpToolDefinition[],
@@ -1823,6 +1940,7 @@ function createBridgeStreamResponse(
                   if (stored) {
                     stored.checkpoint = checkpointBytes;
                     for (const [k, v] of attemptBlobStore) stored.blobStore.set(k, v);
+                    enforceConversationBlobBudget(stored);
                     stored.lastAccessMs = Date.now();
                   }
                 },
@@ -1872,6 +1990,7 @@ function createBridgeStreamResponse(
           const stored = conversationStates.get(convKey);
           if (stored) {
             for (const [k, v] of attemptBlobStore) stored.blobStore.set(k, v);
+            enforceConversationBlobBudget(stored);
             stored.lastAccessMs = Date.now();
           }
 
@@ -1920,6 +2039,9 @@ function createBridgeStreamResponse(
             return;
           }
 
+          const active = activeBridges.get(bridgeKey);
+          const currentAttemptIsActive = active?.bridge === attemptBridge;
+
           if (!mcpExecReceived) {
             const flushed = tagFilter.flush();
             if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
@@ -1932,14 +2054,20 @@ function createBridgeStreamResponse(
             clearInterval(attemptHeartbeat);
             attemptBridge.kill();
             deleteActiveBridge(bridgeKey);
-          } else if (code !== 0) {
-            // Bridge died while tool calls are pending (timeout, crash, etc.).
-            sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
-            sendSSE(makeChunk({}, "stop"));
-            sendSSE(makeUsageChunk());
-            sendDone();
-            closeController();
-            deleteActiveBridge(bridgeKey);
+          } else {
+            // If a bridge closes while waiting for tool-results continuation,
+            // always detach it from activeBridges to avoid stale saturation.
+            if (currentAttemptIsActive) {
+              deleteActiveBridge(bridgeKey);
+            }
+            if (code !== 0) {
+              // Bridge died while tool calls are pending (timeout, crash, etc.).
+              sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
+              sendSSE(makeChunk({}, "stop"));
+              sendSSE(makeUsageChunk());
+              sendDone();
+              closeController();
+            }
           }
         });
       }
@@ -1956,11 +2084,16 @@ function createBridgeStreamResponse(
 function startBridge(
   accessToken: string,
   requestBytes: Uint8Array,
-): { bridge: ReturnType<typeof spawnBridge>; heartbeatTimer: NodeJS.Timeout } {
-  const bridge = spawnBridge({
-    accessToken,
-    rpcPath: "/agent.v1.AgentService/Run",
-  });
+): { bridge: ReturnType<typeof spawnBridge> | BridgeHandle; heartbeatTimer: NodeJS.Timeout } {
+  const bridge: ReturnType<typeof spawnBridge> | BridgeHandle = bridgePool
+    ? bridgePool.acquire({
+        accessToken,
+        rpcPath: "/agent.v1.AgentService/Run",
+      })
+    : spawnBridge({
+        accessToken,
+        rpcPath: "/agent.v1.AgentService/Run",
+      });
   bridge.write(frameConnectMessage(requestBytes));
   const heartbeatTimer = setInterval(() => bridge.write(makeHeartbeatBytes()), 5_000);
   return { bridge, heartbeatTimer };
@@ -2132,6 +2265,7 @@ async function collectFullResponse(
             if (stored) {
               stored.checkpoint = checkpointBytes;
               for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
+              enforceConversationBlobBudget(stored);
               stored.lastAccessMs = Date.now();
             }
           },
@@ -2153,6 +2287,7 @@ async function collectFullResponse(
     const stored = conversationStates.get(convKey);
     if (stored) {
       for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
+      enforceConversationBlobBudget(stored);
       stored.lastAccessMs = Date.now();
     }
     const flushed = tagFilter.flush();
