@@ -814,6 +814,7 @@ async function doHandleChatCompletion(
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
   const tools = (body.tools ?? []).filter((tool) => !shouldBlockTool(tool));
+  const workspaceRoot = extractWorkspaceRoot(systemPrompt);
 
   if (!userText && toolResults.length === 0) {
     return new Response(
@@ -852,7 +853,7 @@ async function doHandleChatCompletion(
   const bridgeKey = deriveBridgeKey(modelId, body);
   const convKey = deriveConversationKey(body);
   const prevStored = conversationStates.get(convKey);
-  console.log(`[proxy] keys convKey=${convKey} bridgeKey=${bridgeKey} hasStored=${!!prevStored} hasCheckpoint=${!!prevStored?.checkpoint} turns=${turns.length} toolResults=${toolResults.length}`);
+  console.log(`[proxy] keys convKey=${convKey} bridgeKey=${bridgeKey} hasStored=${!!prevStored} hasCheckpoint=${!!prevStored?.checkpoint} turns=${turns.length} toolResults=${toolResults.length} workspace=${workspaceRoot ?? 'none'}`);
 
   // Mutex is already held by the fetch() handler — no need to acquire here.
 
@@ -866,7 +867,7 @@ async function doHandleChatCompletion(
 
     if (activeBridge.bridge.alive) {
       // Resume the live bridge with tool results
-      return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, release);
+      return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, release, workspaceRoot);
     }
 
     // Bridge died (timeout, server disconnect, etc.).
@@ -930,7 +931,7 @@ async function doHandleChatCompletion(
   payload.mcpTools = mcpTools;
 
   if (body.stream === false) {
-    return handleNonStreamingResponse(payload, accessToken, modelId, convKey, release);
+    return handleNonStreamingResponse(payload, accessToken, modelId, convKey, release, workspaceRoot);
   }
   const retryCtx: RetryContext = {
     stored,
@@ -944,6 +945,7 @@ async function doHandleChatCompletion(
   return handleStreamingResponse(
     payload, accessToken, modelId, bridgeKey, convKey, release,
     retryCtx,
+    workspaceRoot,
   );
 }
 
@@ -967,6 +969,18 @@ function textContent(content: OpenAIMessage["content"]): string {
     .filter((p) => p.type === "text" && p.text)
     .map((p) => p.text!)
     .join("\n");
+}
+
+/** Extract the real workspace root from OpenCode's system prompt.
+ *  OpenCode includes "Working directory: /path/to/dir" in its env block. */
+function extractWorkspaceRoot(systemPrompt: string): string | undefined {
+  // Try "Working directory: /path" pattern (OpenCode env block)
+  const wdMatch = systemPrompt.match(/Working directory:\s*(\S+)/i);
+  if (wdMatch?.[1]) return wdMatch[1];
+  // Try "Workspace root folder: /path" pattern
+  const wsMatch = systemPrompt.match(/Workspace root folder:\s*(\S+)/i);
+  if (wsMatch?.[1]) return wsMatch[1];
+  return undefined;
 }
 
 function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
@@ -1348,6 +1362,7 @@ function processServerMessage(
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
+  workspaceRoot?: string,
 ): void {
   const msgCase = msg.message.case;
 
@@ -1361,6 +1376,7 @@ function processServerMessage(
       mcpTools,
       sendFrame,
       onMcpExec,
+      workspaceRoot,
     );
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
@@ -1447,11 +1463,15 @@ function handleExecMessage(
   mcpTools: McpToolDefinition[],
   sendFrame: (data: Uint8Array) => void,
   onMcpExec: (exec: PendingExec) => void,
+  workspaceRoot?: string,
 ): void {
   const execCase = execMsg.message.case;
 
   if (execCase === "requestContextArgs") {
-    const MCP_ONLY_RULE = "CRITICAL: Do NOT use native tools (read, ls, grep, shell, write, delete, fetch, diagnostics, backgroundShellSpawn, writeShellStdin). They are ALL disabled in this environment. Use ONLY the MCP tools provided in the tools list. Every native tool call will be rejected and waste time. Always use MCP tools for all file operations, shell commands, searches, and any other actions.";
+    const workspaceNote = workspaceRoot
+      ? ` The project workspace root is "${workspaceRoot}". NEVER use /workspace/ — it does not exist on this system. All file paths must use the real absolute path starting with "${workspaceRoot}".`
+      : " NEVER use /workspace/ as a path prefix — it does not exist. Use the absolute paths exactly as provided in the system prompt and tool responses.";
+    const MCP_ONLY_RULE = `CRITICAL: Do NOT use native tools (read, ls, grep, shell, write, delete, fetch, diagnostics, backgroundShellSpawn, writeShellStdin). They are ALL disabled in this environment. Use ONLY the MCP tools provided in the tools list. Every native tool call will be rejected and waste time. Always use MCP tools for all file operations, shell commands, searches, and any other actions.${workspaceNote}`;
 
     const requestContext = create(RequestContextSchema, {
       rules: [
@@ -1768,6 +1788,8 @@ function createBridgeStreamResponse(
   accessToken?: string,
   /** Original request bytes for connect-error retries. */
   requestBytes?: Uint8Array,
+  /** Real workspace root path (e.g. /data/projects/foo) to inject into RequestContext. */
+  workspaceRoot?: string,
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1795,26 +1817,42 @@ function createBridgeStreamResponse(
     currentAttemptBridge = undefined;
   };
 
+  // Shared stream-lifecycle flag used by both `cancel()` and async bridge callbacks.
+  // Must live outside `start()` so retries/enqueues stop immediately after client abort.
+  let closed = false;
+
   const stream = new ReadableStream({
     cancel() {
+      closed = true;
       cleanupCurrentAttempt();
       safeRelease();
     },
     start(controller) {
       const encoder = new TextEncoder();
-      let closed = false;
       const sendSSE = (data: object) => {
         if (closed) return;
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+        try {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+        } catch {
+          closed = true;
+        }
       };
       const sendDone = () => {
         if (closed) return;
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        try {
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        } catch {
+          closed = true;
+        }
       };
       const closeController = () => {
         if (closed) return;
         closed = true;
-        controller.close();
+        try {
+          controller.close();
+        } catch {
+          // No-op: already closed/canceled from consumer side.
+        }
         safeRelease();
       };
 
@@ -1944,6 +1982,7 @@ function createBridgeStreamResponse(
                     stored.lastAccessMs = Date.now();
                   }
                 },
+                workspaceRoot,
               );
             } catch {
               // Skip unparseable messages
@@ -2022,7 +2061,7 @@ function createBridgeStreamResponse(
 
           // Retry on transient connect errors with exponential backoff.
           // The setTimeout is scoped inside the ReadableStream — if the client
-          // aborts (kimaki abort), the stream closes and safeRelease fires,
+          // aborts (otto abort), the stream closes and safeRelease fires,
           // so no further retries will execute.
           if (connectError && !anyContentSent && attempt < maxConnectRetries && accessToken && requestBytes) {
             deleteActiveBridge(bridgeKey);
@@ -2108,6 +2147,7 @@ function handleStreamingResponse(
   convKey: string,
   release: () => void,
   retryCtx?: RetryContext,
+  workspaceRoot?: string,
 ): Response {
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
@@ -2117,6 +2157,7 @@ function handleStreamingResponse(
     retryCtx,
     accessToken,
     payload.requestBytes,
+    workspaceRoot,
   );
 }
 
@@ -2128,6 +2169,7 @@ function handleToolResultResume(
   bridgeKey: string,
   convKey: string,
   release: () => void,
+  workspaceRoot?: string,
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
   active.lastAccessMs = Date.now();
@@ -2183,6 +2225,8 @@ function handleToolResultResume(
     bridge, heartbeatTimer,
     blobStore, mcpTools,
     modelId, bridgeKey, convKey, release,
+    undefined, undefined, undefined,
+    workspaceRoot,
   );
 }
 
@@ -2192,11 +2236,12 @@ async function handleNonStreamingResponse(
   modelId: string,
   convKey: string,
   release: () => void,
+  workspaceRoot?: string,
 ): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
   try {
-    const { text, usage } = await collectFullResponse(payload, accessToken, convKey);
+    const { text, usage } = await collectFullResponse(payload, accessToken, convKey, workspaceRoot);
     return new Response(
       JSON.stringify({
         id: completionId,
@@ -2228,6 +2273,7 @@ async function collectFullResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   convKey: string,
+  workspaceRoot?: string,
 ): Promise<CollectedResponse> {
   const { promise, resolve } = Promise.withResolvers<CollectedResponse>();
   let fullText = "";
@@ -2270,6 +2316,7 @@ async function collectFullResponse(
               stored.lastAccessMs = Date.now();
             }
           },
+          workspaceRoot,
         );
       } catch {
         // Skip
