@@ -523,6 +523,219 @@ async function testDiscoveryFallbackAndSuccess(
   console.log("[test] Discovery fallback and success OK");
 }
 
+// ---------------------------------------------------------------------------
+// Persistent bridge session recovery tests
+//
+// These tests directly exercise the BridgePool + h2-bridge-persistent.mjs
+// to verify the session isolation fix without depending on proxy internals
+// like the module-level CURSOR_API_URL constant.
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a plain HTTP/2 server for pool tests.
+ */
+function createPoolTestServer(): Promise<{
+  url: string;
+  streamCount: () => number;
+  setNextStreamReset: () => void;
+  close: () => Promise<void>;
+}> {
+  let streamCountVal = 0;
+  let nextReset = false;
+
+  const server = http2.createServer();
+  server.on("stream", (stream) => {
+    streamCountVal++;
+    if (nextReset) {
+      nextReset = false;
+      // Destroy the entire H2 session to simulate a TCP-level connection
+      // reset — this is what causes "Connection reset by server" in production.
+      // Destroying the session sends GOAWAY to the client and tears down
+      // all active streams.
+      stream.session?.destroy();
+      return;
+    }
+    stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+    stream.end();
+  });
+
+  const ready = new Promise<{ url: string; streamCount: () => number; setNextStreamReset: () => void; close: () => Promise<void> }>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const port = (server.address() as AddressInfo).port;
+      resolve({
+        url: `http://127.0.0.1:${port}`,
+        streamCount: () => streamCountVal,
+        setNextStreamReset: () => { nextReset = true; },
+        close: () => new Promise<void>((res, rej) => server.close((e) => (e ? rej(e) : res()))),
+      });
+    });
+  });
+  return ready;
+}
+
+/**
+ * Send a single request through a pool handle and wait for completion.
+ */
+function poolRequest(
+  pool: InstanceType<typeof import("../src/bridge-pool").BridgePool>,
+  url: string,
+): Promise<{ code: number }> {
+  return new Promise((resolve) => {
+    const handle = pool.acquire({
+      accessToken: "test-token",
+      rpcPath: "/agent.v1.AgentService/Run",
+      url,
+    });
+    handle.onData(() => {});
+    handle.onClose((code) => {
+      resolve({ code });
+    });
+    handle.end();
+  });
+}
+
+/**
+ * Test that the persistent bridge correctly isolates sessions:
+ * 3 sequential requests through the same pool worker succeed.
+ */
+async function testPersistentBridgeSessionIsolation() {
+  console.log("[test] Testing persistent bridge session isolation...");
+
+  const { BridgePool } = await import("../src/bridge-pool");
+  const server = await createPoolTestServer();
+
+  const pool = new BridgePool({ minSize: 1, maxSize: 2 });
+  pool.warmup();
+  await new Promise((r) => setTimeout(r, 200)); // let workers start
+
+  for (let i = 0; i < 3; i++) {
+    const { code } = await poolRequest(pool, server.url);
+    assertEqual(code, 0, `Isolation request ${i} should succeed (code=0)`);
+  }
+
+  const stats = pool.stats();
+  console.log(`[test]   pool stats: ${JSON.stringify(stats)}`);
+  assert(stats.total >= 1, "Pool should have at least 1 worker");
+  assert(server.streamCount() >= 3, `Expected >= 3 streams, got ${server.streamCount()}`);
+
+  pool.shutdown();
+  await server.close();
+  console.log("[test] Persistent bridge session isolation OK");
+}
+
+/**
+ * Test that the pool recovers after the H2 server becomes unreachable
+ * and then comes back — the core regression test for stale handler isolation.
+ *
+ * Before the fix, a session error handler from the old server connection
+ * could corrupt a new connection made after the server restarts.
+ */
+async function testPoolRecoveryAfterServerRestart() {
+  console.log("[test] Testing pool recovery after server restart...");
+
+  const { BridgePool } = await import("../src/bridge-pool");
+
+  // Create two H2 servers on different ports to simulate server restart.
+  let server1Streams = 0;
+  const server1 = http2.createServer();
+  server1.on("stream", (stream) => {
+    server1Streams++;
+    stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+    stream.end();
+  });
+  await new Promise<void>((resolve) => server1.listen(0, "127.0.0.1", resolve));
+  const port1 = (server1.address() as AddressInfo).port;
+  const url1 = `http://127.0.0.1:${port1}`;
+
+  let server2Streams = 0;
+  const server2 = http2.createServer();
+  server2.on("stream", (stream) => {
+    server2Streams++;
+    stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+    stream.end();
+  });
+  await new Promise<void>((resolve) => server2.listen(0, "127.0.0.1", resolve));
+  const port2 = (server2.address() as AddressInfo).port;
+  const url2 = `http://127.0.0.1:${port2}`;
+
+  const pool = new BridgePool({ minSize: 1, maxSize: 2 });
+  pool.warmup();
+  await new Promise((r) => setTimeout(r, 200));
+
+  // 1. Request to server 1 — worker establishes H2 session to server1
+  const r1 = await poolRequest(pool, url1);
+  assertEqual(r1.code, 0, "First request to server1 should succeed");
+  assert(server1Streams >= 1, `Expected server1 streams >= 1, got ${server1Streams}`);
+  console.log(`[test]   server1 request OK (streams: ${server1Streams})`);
+
+  // 2. Request to server 2 — worker creates NEW H2 session to server2
+  //    (different URL, so getOrCreateClient must create a new session)
+  //    With the stale handler fix, the old server1 session's handlers
+  //    won't corrupt the new server2 session.
+  const r2 = await poolRequest(pool, url2);
+  assertEqual(r2.code, 0, "Request to server2 should succeed (session isolation)");
+  assert(server2Streams >= 1, `Expected server2 streams >= 1, got ${server2Streams}`);
+  console.log(`[test]   server2 request OK (streams: ${server2Streams})`);
+
+  // 3. Kill server1 — the worker's old session to server1 should error.
+  //    The session error handler fires, setting h2Client = null.
+  //    With the fix, the handler only nulls h2Client if it still matches
+  //    the old session, NOT if h2Client has been reassigned to server2's session.
+  await new Promise<void>((resolve) => server1.close(() => resolve()));
+  // Give the session error time to propagate
+  await new Promise((r) => setTimeout(r, 200));
+
+  // 4. Request to server 2 MUST still succeed. This is the critical test:
+  //    if the stale handler bug exists, killing server1 would corrupt
+  //    server2's session (because the old handler reads h2Client which
+  //    now points to server2's session and destroys it).
+  const r3 = await poolRequest(pool, url2);
+  assertEqual(r3.code, 0, "Recovery request to server2 MUST succeed — stale handler did not corrupt session");
+  console.log(`[test]   post-server1-kill server2 request OK (server2 streams: ${server2Streams})`);
+
+  // 5. Additional verification: request to server1 URL should recover
+  //    (new session since server1 is down → getOrCreateClient creates new)
+  //    This will fail because server1 is down, but it should not crash the pool.
+  //    Skip this — we can't test connecting to a dead server without hanging.
+
+  pool.shutdown();
+  await new Promise<void>((resolve) => server2.close(() => resolve()));
+  console.log("[test] Pool recovery after server restart OK");
+}
+
+/**
+ * Test that multiple sequential requests through the pool all succeed,
+ * verifying proper release/acquire cycling and H2 session reuse.
+ */
+async function testPoolSequentialRequests() {
+  console.log("[test] Testing pool sequential requests...");
+
+  const { BridgePool } = await import("../src/bridge-pool");
+  const server = await createPoolTestServer();
+
+  const pool = new BridgePool({ minSize: 1, maxSize: 2 });
+  pool.warmup();
+  await new Promise((r) => setTimeout(r, 200));
+
+  const N = 8;
+  for (let i = 0; i < N; i++) {
+    const { code } = await poolRequest(pool, server.url);
+    assertEqual(code, 0, `Sequential request ${i} should succeed`);
+  }
+
+  const totalStreams = server.streamCount();
+  assert(totalStreams >= N, `Expected >= ${N} streams, got ${totalStreams}`);
+  console.log(`[test]   ${N} sequential requests OK (${totalStreams} streams)`);
+
+  pool.shutdown();
+  await server.close();
+  console.log("[test] Pool sequential requests OK");
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -538,6 +751,9 @@ async function main() {
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
+    await testPersistentBridgeSessionIsolation();
+    await testPoolRecoveryAfterServerRestart();
+    await testPoolSequentialRequests();
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {

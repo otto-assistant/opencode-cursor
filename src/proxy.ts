@@ -2089,6 +2089,7 @@ function startBridge(
     ? bridgePool.acquire({
         accessToken,
         rpcPath: "/agent.v1.AgentService/Run",
+        url: CURSOR_API_URL,
       })
     : spawnBridge({
         accessToken,
