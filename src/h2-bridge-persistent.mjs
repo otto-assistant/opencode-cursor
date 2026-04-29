@@ -165,23 +165,35 @@ function getOrCreateClient(url) {
       h2Client.destroy();
     } catch {}
   }
-  h2Client = http2.connect(url);
+  // Capture the new session in a local so event handlers only affect
+  // their own session — stale handlers from a previous session must not
+  // be able to corrupt a newer one (causes "Connection reset by server").
+  const session = http2.connect(url);
+  h2Client = session;
   currentUrl = url;
-  h2Client.on("error", () => {
-    try {
-      h2Client.destroy();
-    } catch {}
-    h2Client = null;
-    currentUrl = null;
+
+  session.on("error", () => {
+    try { session.destroy(); } catch {}
+    if (h2Client === session) {
+      h2Client = null;
+      currentUrl = null;
+    }
   });
-  h2Client.on("goaway", () => {
-    try {
-      h2Client.destroy();
-    } catch {}
-    h2Client = null;
-    currentUrl = null;
+  session.on("goaway", () => {
+    try { session.destroy(); } catch {}
+    if (h2Client === session) {
+      h2Client = null;
+      currentUrl = null;
+    }
   });
-  return h2Client;
+  session.on("close", () => {
+    if (h2Client === session) {
+      h2Client = null;
+      currentUrl = null;
+    }
+  });
+
+  return session;
 }
 
 function handleStreamComplete(success) {
