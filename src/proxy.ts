@@ -1896,6 +1896,7 @@ function createBridgeStreamResponse(
         let anyContentSent = false;
         let blobNotFound = false;
         let connectError = false;
+        let emptyCloseRetry = false;
         let watchdogHandled = false;
         let lastProgressAt = Date.now();
         const markProgress = () => {
@@ -2141,6 +2142,33 @@ function createBridgeStreamResponse(
               runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
             }, delay);
             return;
+          }
+
+          // Guard against silent empty completions: stream closed before any usable
+          // content or tool call reached SSE, but no explicit Connect error surfaced.
+          if (!mcpExecReceived && !anyContentSent && attempt < maxConnectRetries && accessToken && requestBytes) {
+            emptyCloseRetry = true;
+          }
+          if (emptyCloseRetry) {
+            deleteActiveBridge(bridgeKey);
+            attemptBridge.kill();
+            const retryAccessToken = accessToken;
+            const retryRequestBytes = requestBytes;
+            if (!retryAccessToken || !retryRequestBytes) {
+              emptyCloseRetry = false;
+            } else {
+              const delay = Math.max(50, Math.floor((CONNECT_RETRY_BASE_DELAY_MS * retryDelayMultiplier * Math.pow(2, attempt)) / 2));
+              console.warn(
+                `[proxy] Empty stream close; retrying in ${delay}ms (attempt ${attempt + 1}/${maxConnectRetries + 1}, code=${code}, pressure=${pressureMode})`,
+              );
+              setTimeout(() => {
+                if (closed) return;
+                const { bridge: retryBridge, heartbeatTimer: retryTimer } =
+                  startBridge(retryAccessToken, retryRequestBytes);
+                runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
+              }, delay);
+              return;
+            }
           }
 
           const active = activeBridges.get(bridgeKey);
