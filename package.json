@@ -1,6 +1,6 @@
 {
   "name": "@otto-assistant/opencode-cursor-oauth",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "OpenCode plugin that connects Cursor's API to OpenCode via OAuth, model discovery, and a local OpenAI-compatible proxy.",
   "license": "MIT",
   "type": "module",
