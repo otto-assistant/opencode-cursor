@@ -1,17 +1,43 @@
-# opencode-cursor-oauth
+# @otto-assistant/opencode-cursor-oauth
 
-OpenCode plugin that connects to Cursor's API, giving you access to Cursor
-models inside OpenCode with full tool-calling support.
+[![license: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
 
-## Install in OpenCode
+High-quality OpenCode provider plugin that brings Cursor models into OpenCode through OAuth, model discovery, and a local OpenAI-compatible proxy.
 
-Add this to `~/.config/opencode/opencode.json`:
+Designed for real-world agent usage: streaming, tool calls, long conversations, and robust continuation behavior.
+
+## Highlights
+
+- OAuth login with automatic token refresh
+- Cursor model discovery directly from API
+- OpenAI-compatible `/v1/chat/completions` proxy for OpenCode runtime compatibility
+- Stable streaming with tool-calling continuation
+- MCP-first tool execution flow for practical agent environments
+- Conversation-state handling built for long and tool-heavy sessions
+- Production-ready smoke test coverage
+
+## Why teams use it
+
+- **Native feel in OpenCode:** Cursor models are exposed as a regular provider flow in OpenCode.
+- **Reliable tool loops:** Tool call handoff and continuation are engineered for iterative agent workflows.
+- **Operationally practical:** Focused on reducing common runtime failure modes around streaming, tool calls, and conversation state.
+- **Simple integration surface:** Works with standard OpenCode plugin configuration and auth flow.
+
+## Installation
+
+### Option A: Install from npm (recommended)
+
+```sh
+npm install -g @otto-assistant/opencode-cursor-oauth
+```
+
+Then add this to `~/.config/opencode/opencode.json`:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "opencode-cursor-oauth"
+    "@otto-assistant/opencode-cursor-oauth"
   ],
   "provider": {
     "cursor": {
@@ -21,74 +47,86 @@ Add this to `~/.config/opencode/opencode.json`:
 }
 ```
 
-The `cursor` provider stub is required because OpenCode drops providers that do
-not already exist in its bundled provider catalog.
+### Option B: Install from repository source
 
-OpenCode installs npm plugins automatically at startup, so users do not need to
-clone this repository.
+```sh
+git clone https://github.com/otto-assistant/opencode-cursor.git
+cd opencode-cursor
+bun install
+bun run build
+npm install -g .
+```
 
-## Authenticate
+Use the same OpenCode config shown above.
+
+## Authentication
 
 ```sh
 opencode auth login --provider cursor
 ```
 
-This opens Cursor OAuth in the browser. Tokens are stored in
-`~/.local/share/opencode/auth.json` and refreshed automatically.
+This opens Cursor OAuth in your browser. Tokens are stored in `~/.local/share/opencode/auth.json` and refreshed automatically.
 
-## Use
+## Quick usage
 
-Start OpenCode and select any Cursor model. The plugin starts a local
-OpenAI-compatible proxy on demand and routes requests through Cursor's gRPC API.
-
-## How it works
-
-1. OAuth — browser-based login to Cursor via PKCE.
-2. Model discovery — queries Cursor's gRPC API for all available models.
-3. Local proxy — translates `POST /v1/chat/completions` into Cursor's
-   protobuf/HTTP/2 Connect protocol.
-4. Native tool routing — rejects Cursor's built-in filesystem/shell tools and
-   exposes OpenCode's tool surface via Cursor MCP instead.
-
-HTTP/2 transport runs through a Node child process (`h2-bridge.mjs`) because
-Bun's `node:http2` support is not reliable against Cursor's API.
+1. Start OpenCode.
+2. Select provider `cursor`.
+3. Choose a Cursor model.
+4. Send prompts as usual; the plugin starts the local proxy on demand.
 
 ## Architecture
 
-```
-OpenCode  -->  /v1/chat/completions  -->  Bun.serve (proxy)
-                                              |
-                                    Node child process (h2-bridge.mjs)
-                                              |
-                                     HTTP/2 Connect stream
-                                              |
-                                    api2.cursor.sh gRPC
-                                      /agent.v1.AgentService/Run
+```text
+OpenCode
+  -> /v1/chat/completions
+  -> Bun.serve proxy
+  -> Node HTTP/2 bridge (h2-bridge.mjs)
+  -> Cursor gRPC API (api2.cursor.sh)
 ```
 
-### Tool call flow
+### Tool-call lifecycle
 
-```
-1. Cursor model receives OpenAI tools via RequestContext (as MCP tool defs)
-2. Model tries native tools (readArgs, shellArgs, etc.)
-3. Proxy rejects each with typed error (ReadRejected, ShellRejected, etc.)
-4. Model falls back to MCP tool -> mcpArgs exec message
-5. Proxy emits OpenAI tool_calls SSE chunk, pauses H2 stream
-6. OpenCode executes tool, sends result in follow-up request
-7. Proxy resumes H2 stream with mcpResult, streams continuation
+```text
+1) Model receives tool definitions via request context
+2) Model emits tool call
+3) Proxy maps tool call into OpenCode-compatible stream events
+4) OpenCode executes tool
+5) Tool result is sent back
+6) Proxy resumes Cursor stream continuation
 ```
 
-## Develop locally
+## Development
 
 ```sh
 bun install
 bun run build
-bun test/smoke.ts
+bun run test
 ```
 
-## Requirements
+## Compatibility
 
-- [OpenCode](https://opencode.ai)
-- [Bun](https://bun.sh)
-- [Node.js](https://nodejs.org) >= 18 for the HTTP/2 bridge process
-- Active [Cursor](https://cursor.com) subscription
+- OpenCode plugin runtime
+- Bun runtime
+- Node.js >= 18 (HTTP/2 bridge process)
+- Active Cursor subscription
+
+## Performance and reliability notes
+
+- Conversation state is managed to support continuation across multi-turn tool usage.
+- Streaming and bridge lifecycle handling are designed to minimize stuck sessions.
+- Tool execution path is optimized for MCP-based environments.
+
+## FAQ
+
+### Do I need to clone the repository to use this plugin?
+Usually no. OpenCode can install npm plugins automatically when configured.
+
+### Is this package published on npm?
+This repository publishes under `@otto-assistant/opencode-cursor-oauth`. If npm install fails, verify that the latest GitHub release workflow completed successfully.
+
+### Where is the license?
+This project is released under the MIT license (declared in package metadata).
+
+## License
+
+MIT

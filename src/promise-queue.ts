@@ -38,4 +38,9 @@ export class Mutex {
       this.locked = false;
     }
   }
+
+  /** True when no holder and no queued waiters remain. */
+  isIdle(): boolean {
+    return !this.locked && this.queue.length === 0;
+  }
 }
