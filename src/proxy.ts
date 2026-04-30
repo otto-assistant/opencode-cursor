@@ -2043,7 +2043,10 @@ function createBridgeStreamResponse(
         attemptBridge.onData(processChunk);
 
         const stallTimer = setInterval(() => {
-          if (closed || mcpExecReceived || watchdogHandled) return;
+          if (closed || mcpExecReceived || watchdogHandled) {
+            clearInterval(stallTimer);
+            return;
+          }
           if (Date.now() - lastProgressAt < STALL_TIMEOUT_MS) return;
           // In Bun.serve, activeRequestCount often drops to zero as soon as
           // the Response is returned, while stream processing is still active.
