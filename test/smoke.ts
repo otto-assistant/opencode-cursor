@@ -8,6 +8,7 @@ import {
 } from "../src/proto/agent_pb";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
+type RunMode = "immediate-close" | "stall-once-then-close";
 
 interface TestModules {
   startProxy: typeof import("../src/proxy").startProxy;
@@ -29,6 +30,8 @@ interface TestCursorBackend {
   getDiscoveryAuthHeaders: () => string[];
   getDiscoveryRequestBodies: () => Uint8Array[];
   getRefreshAuthHeaders: () => string[];
+  setRunMode: (mode: RunMode) => void;
+  getRunRequestCount: () => number;
   close: () => Promise<void>;
 }
 
@@ -70,6 +73,9 @@ function frameConnectUnaryMessage(payload: Uint8Array): Buffer {
 
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let discoveryMode: DiscoveryMode = "success";
+  let runMode: RunMode = "immediate-close";
+  let runRequestCount = 0;
+  let runStallConsumed = false;
   let discoveredModels: Array<{ id: string; name: string; reasoning?: boolean }> = [
     { id: "composer-2", name: "Composer 2", reasoning: true },
   ];
@@ -109,10 +115,24 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     const path = String(headers[":path"] ?? "");
     const authHeader = String(headers.authorization ?? "");
     if (path === "/agent.v1.AgentService/Run") {
+      runRequestCount++;
       stream.respond({
         ":status": 200,
         "content-type": "application/connect+proto",
       });
+      if (runMode === "stall-once-then-close" && !runStallConsumed) {
+        runStallConsumed = true;
+        // Intentionally keep stream open with no data to simulate a reset/hang.
+        // Auto-close later so the test process can shut down cleanly.
+        setTimeout(() => {
+          try {
+            stream.end();
+          } catch {
+            // ignore
+          }
+        }, 3_000);
+        return;
+      }
       stream.end();
       return;
     }
@@ -193,6 +213,14 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     },
     getRefreshAuthHeaders() {
       return [...refreshAuthHeaders];
+    },
+    setRunMode(mode) {
+      runMode = mode;
+      runStallConsumed = false;
+      runRequestCount = 0;
+    },
+    getRunRequestCount() {
+      return runRequestCount;
     },
     async close() {
       await Promise.all([
@@ -732,6 +760,41 @@ async function testPoolSequentialRequests() {
   console.log("[test] Pool sequential requests OK");
 }
 
+async function testStreamingWatchdogRecoversFromStalledRun(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing streaming watchdog recovery from stalled Run...");
+  modules.stopProxy();
+  backend.setRunMode("stall-once-then-close");
+
+  const port = await modules.startProxy(async () => "test-token");
+  const res = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "composer-2",
+      stream: true,
+      messages: [{ role: "user", content: "hello" }],
+    }),
+  });
+
+  assertEqual(res.status, 200, "Expected streaming request to succeed");
+  const bodyText = await res.text();
+  assert(
+    bodyText.includes("data: [DONE]"),
+    `Expected SSE stream to terminate with [DONE], got: ${bodyText.slice(0, 200)}`,
+  );
+  assert(
+    backend.getRunRequestCount() >= 2,
+    `Expected watchdog retry (>=2 Run attempts), got ${backend.getRunRequestCount()}`,
+  );
+
+  backend.setRunMode("immediate-close");
+  modules.stopProxy();
+  console.log("[test] Streaming watchdog recovery OK");
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -740,6 +803,8 @@ async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
   process.env.CURSOR_REFRESH_URL = backend.refreshUrl;
+  process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS = "1200";
+  process.env.OPENCODE_CURSOR_STALL_TICK_MS = "100";
 
   const modules = await loadModules();
 
@@ -754,6 +819,7 @@ async function main() {
     await testPersistentBridgeSessionIsolation();
     await testPoolRecoveryAfterServerRestart();
     await testPoolSequentialRequests();
+    await testStreamingWatchdogRecoversFromStalledRun(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {

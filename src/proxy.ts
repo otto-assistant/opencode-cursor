@@ -212,6 +212,9 @@ const proxyTelemetry = {
   forcedBridgeKills: 0,
   pressureActivations: 0,
   admissionRejects: 0,
+  stallDetections: 0,
+  stallRecoveryRetries: 0,
+  stallRecoveryFailures: 0,
   maintenanceRuns: 0,
   lastSnapshotMs: 0,
 };
@@ -427,7 +430,8 @@ function runMaintenanceSweep(): void {
     console.log(
       `[proxy] health activeReq=${activeRequestCount} activeBridges=${activeBridges.size} conv=${conversationStates.size} mutex=${convMutexes.size} ` +
       `evict(conv/mutex/bridge)=${proxyTelemetry.staleConversationEvictions}/${proxyTelemetry.staleMutexEvictions}/${proxyTelemetry.staleBridgeEvictions} ` +
-      `capRejects=${proxyTelemetry.capRejects} admissionRejects=${proxyTelemetry.admissionRejects} bridgeKills=${proxyTelemetry.forcedBridgeKills} pressureHits=${proxyTelemetry.pressureActivations}` +
+      `capRejects=${proxyTelemetry.capRejects} admissionRejects=${proxyTelemetry.admissionRejects} bridgeKills=${proxyTelemetry.forcedBridgeKills} pressureHits=${proxyTelemetry.pressureActivations} ` +
+      `stalls=${proxyTelemetry.stallDetections} stallRetries=${proxyTelemetry.stallRecoveryRetries} stallFailures=${proxyTelemetry.stallRecoveryFailures}` +
       poolInfo,
     );
   }
@@ -941,6 +945,7 @@ async function doHandleChatCompletion(
     effectiveUserText,
     turns,
     mcpTools,
+    stallRecoveryUsed: false,
   };
   return handleStreamingResponse(
     payload, accessToken, modelId, bridgeKey, convKey, release,
@@ -1758,6 +1763,8 @@ interface RetryContext {
   effectiveUserText: string;
   turns: Array<{ userText: string; assistantText: string }>;
   mcpTools: McpToolDefinition[];
+  /** One-shot guard for stalled-stream recovery to avoid retry loops. */
+  stallRecoveryUsed: boolean;
 }
 
 /** Max automatic retries for transient connect errors (e.g. "invalid_argument"). */
@@ -1770,6 +1777,8 @@ const PRESSURE_ACTIVE_REQUESTS_THRESHOLD = 4;
 const PRESSURE_ACTIVE_BRIDGES_THRESHOLD = Math.max(4, Math.floor(MAX_ACTIVE_BRIDGES * 0.7));
 const ADMISSION_MAX_ACTIVE_REQUESTS = 12;
 const ADMISSION_MAX_ACTIVE_BRIDGES = MAX_ACTIVE_BRIDGES;
+const STALL_TIMEOUT_MS = Number(process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS ?? 45_000);
+const STALL_TICK_MS = Number(process.env.OPENCODE_CURSOR_STALL_TICK_MS ?? 1_000);
 
 /** Create an SSE streaming Response that reads from a live bridge.
  *  When retryCtx is provided, automatically retries on "Blob not found" errors
@@ -1887,6 +1896,11 @@ function createBridgeStreamResponse(
         let anyContentSent = false;
         let blobNotFound = false;
         let connectError = false;
+        let watchdogHandled = false;
+        let lastProgressAt = Date.now();
+        const markProgress = () => {
+          lastProgressAt = Date.now();
+        };
         const pressureMode = isProxyUnderPressure();
         if (pressureMode) {
           proxyTelemetry.pressureActivations += 1;
@@ -1908,6 +1922,7 @@ function createBridgeStreamResponse(
 
         const processChunk = createConnectFrameParser(
           (messageBytes) => {
+            markProgress();
             try {
               const serverMessage = fromBinary(
                 AgentServerMessageSchema,
@@ -1920,6 +1935,7 @@ function createBridgeStreamResponse(
                 (data) => attemptBridge.write(data),
                 state,
                 (text, isThinking) => {
+                  markProgress();
                   anyContentSent = true;
                   if (isThinking) {
                     sendSSE(makeChunk({ reasoning_content: text }));
@@ -1931,6 +1947,7 @@ function createBridgeStreamResponse(
                 },
                 // onMcpExec — the model wants to execute a tool.
                 (exec) => {
+                  markProgress();
                   state.pendingExecs.push(exec);
                   mcpExecReceived = true;
                   anyContentSent = true;
@@ -1989,6 +2006,7 @@ function createBridgeStreamResponse(
             }
           },
           (endStreamBytes) => {
+            markProgress();
             const endError = parseConnectEndStream(endStreamBytes);
             if (endError) {
               // Auto-retry on "Blob not found" if no content was emitted yet.
@@ -2024,8 +2042,52 @@ function createBridgeStreamResponse(
 
         attemptBridge.onData(processChunk);
 
-        attemptBridge.onClose((code) => {
+        const stallTimer = setInterval(() => {
+          if (closed || mcpExecReceived || watchdogHandled) return;
+          if (Date.now() - lastProgressAt < STALL_TIMEOUT_MS) return;
+          // In Bun.serve, activeRequestCount often drops to zero as soon as
+          // the Response is returned, while stream processing is still active.
+          // A prolonged no-progress window at that point is our stuck-busy signal.
+          if (activeRequestCount !== 0) return;
+
+          watchdogHandled = true;
+          proxyTelemetry.stallDetections += 1;
+          console.warn(
+            `[proxy] stall detected bridgeKey=${bridgeKey} attempt=${attempt} timeoutMs=${STALL_TIMEOUT_MS}`,
+          );
+
+          if (retryCtx && !retryCtx.stallRecoveryUsed && accessToken && requestBytes) {
+            retryCtx.stallRecoveryUsed = true;
+            proxyTelemetry.stallRecoveryRetries += 1;
+            console.warn(`[proxy] forced_recovery_retry_started bridgeKey=${bridgeKey}`);
+
+            deleteActiveBridge(bridgeKey);
+            clearInterval(attemptHeartbeat);
+            attemptBridge.kill();
+
+            const { bridge: retryBridge, heartbeatTimer: retryTimer } =
+              startBridge(accessToken, requestBytes);
+            runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
+            return;
+          }
+
+          proxyTelemetry.stallRecoveryFailures += 1;
+          sendSSE(makeChunk({ content: "\n[Error: stream stalled; recovery failed]" }));
+          sendSSE(makeChunk({}, "stop"));
+          sendSSE(makeUsageChunk());
+          sendDone();
+          closeController();
+          deleteActiveBridge(bridgeKey);
           clearInterval(attemptHeartbeat);
+          attemptBridge.kill();
+        }, STALL_TICK_MS);
+
+        attemptBridge.onClose((code) => {
+          clearInterval(stallTimer);
+          clearInterval(attemptHeartbeat);
+          if (watchdogHandled) {
+            return;
+          }
           const stored = conversationStates.get(convKey);
           if (stored) {
             for (const [k, v] of attemptBlobStore) stored.blobStore.set(k, v);
