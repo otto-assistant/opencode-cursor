@@ -231,9 +231,10 @@ export class BridgePool {
       path: options.rpcPath,
       unary: options.unary ?? false,
     };
+    const handle = this.createHandle(worker);
     workerSendNewRequest(worker, config);
 
-    return this.createHandle(worker);
+    return handle;
   }
 
   /** Shut down the pool, killing all workers. */
@@ -304,8 +305,19 @@ export class BridgePool {
 
   private createHandle(worker: PersistentWorker): BridgeHandle {
     let done = false;
+    /** Exit code recorded when STREAM_DONE/process-death completes before callers attach onClose. */
+    let recordedExitCode = 0;
     const pool = this;
     const isPooled = this.allWorkers.has(worker);
+    /** Buffer OUTPUT_DATA until the caller registers onData (stdout can beat ReadableStream wiring). */
+    const pendingData: Buffer[] = [];
+    let userDataCb: ((chunk: Buffer) => void) | null = null;
+
+    worker.cbs.data = (chunk: Buffer) => {
+      const copy = Buffer.from(chunk);
+      if (userDataCb) userDataCb(copy);
+      else pendingData.push(copy);
+    };
 
     // When stream completes (bridge sends STREAM_DONE), fire onClose and return to pool
     const originalStreamDoneCb = worker.cbs.streamDone;
@@ -314,8 +326,11 @@ export class BridgePool {
     worker.cbs.streamDone = (code: number) => {
       if (done) return;
       done = true;
+      recordedExitCode = code;
       originalStreamDoneCb?.(code);
-      closeCb?.(code);
+      const cbNow = closeCb;
+      closeCb = null;
+      cbNow?.(code);
       if (isPooled) {
         pool.release(worker);
       }
@@ -325,7 +340,10 @@ export class BridgePool {
     const checkDeath = () => {
       if (done || worker.alive) return;
       done = true;
-      closeCb?.(1);
+      recordedExitCode = 1;
+      const cbNow = closeCb;
+      closeCb = null;
+      cbNow?.(1);
       if (isPooled) {
         pool.remove(worker);
       }
@@ -352,11 +370,13 @@ export class BridgePool {
         }
       },
       onData(cb: (chunk: Buffer) => void) {
-        worker.cbs.data = cb;
+        const flushed = pendingData.splice(0, pendingData.length);
+        userDataCb = cb;
+        for (const pending of flushed) cb(pending);
       },
       onClose(cb: (code: number) => void) {
         if (done) {
-          queueMicrotask(() => cb(worker.alive ? 0 : 1));
+          queueMicrotask(() => cb(recordedExitCode));
         } else {
           closeCb = cb;
         }
