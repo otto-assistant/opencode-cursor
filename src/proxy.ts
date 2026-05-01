@@ -668,11 +668,43 @@ export async function startProxy(
     port: 0,
     idleTimeout: 255, // max — Cursor responses can take 30s+
     async fetch(req) {
-      activeRequestCount += 1;
       clearIdleShutdownTimer();
-      try {
-        const url = new URL(req.url);
+      const url = new URL(req.url);
 
+      // Fast-path: admission control BEFORE incrementing activeRequestCount.
+      // Previously, every 503-rejected request incremented the counter, causing
+      // a thundering herd — retries kept the count above the threshold forever.
+      if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+        runMaintenanceSweep();
+        if (activeBridges.size >= ADMISSION_MAX_ACTIVE_BRIDGES) {
+          const culled = cullOldestIdleBridgesForAdmission(ADMISSION_MAX_ACTIVE_BRIDGES);
+          if (culled > 0) {
+            console.warn(`[proxy] admission preflight culled idle bridges=${culled}`);
+          }
+        }
+        if (shouldRejectByAdmissionControl()) {
+          proxyTelemetry.admissionRejects += 1;
+          return new Response(
+            JSON.stringify({
+              error: {
+                message: "Server is saturated, please retry shortly",
+                type: "server_error",
+                code: "service_unavailable",
+              },
+            }),
+            {
+              status: 503,
+              headers: {
+                "Content-Type": "application/json",
+                "Retry-After": "2",
+              },
+            },
+          );
+        }
+      }
+
+      activeRequestCount += 1;
+      try {
         if (req.method === "GET" && url.pathname === "/v1/models") {
           return new Response(
             JSON.stringify({
@@ -684,34 +716,6 @@ export async function startProxy(
         }
 
         if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
-          // Run maintenance before admission checks so stale bridges don't cause
-          // false saturation.
-          runMaintenanceSweep();
-          if (activeBridges.size >= ADMISSION_MAX_ACTIVE_BRIDGES) {
-            const culled = cullOldestIdleBridgesForAdmission(ADMISSION_MAX_ACTIVE_BRIDGES);
-            if (culled > 0) {
-              console.warn(`[proxy] admission preflight culled idle bridges=${culled}`);
-            }
-          }
-          if (shouldRejectByAdmissionControl()) {
-            proxyTelemetry.admissionRejects += 1;
-            return new Response(
-              JSON.stringify({
-                error: {
-                  message: "Server is saturated, please retry shortly",
-                  type: "server_error",
-                  code: "service_unavailable",
-                },
-              }),
-              {
-                status: 503,
-                headers: {
-                  "Content-Type": "application/json",
-                  "Retry-After": "2",
-                },
-              },
-            );
-          }
           let release: (() => void) | undefined;
           try {
             const body = (await req.json()) as ChatCompletionRequest;
