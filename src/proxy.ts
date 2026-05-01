@@ -857,7 +857,10 @@ async function doHandleChatCompletion(
   const bridgeKey = deriveBridgeKey(modelId, body);
   const convKey = deriveConversationKey(body);
   const prevStored = conversationStates.get(convKey);
-  console.log(`[proxy] keys convKey=${convKey} bridgeKey=${bridgeKey} hasStored=${!!prevStored} hasCheckpoint=${!!prevStored?.checkpoint} turns=${turns.length} toolResults=${toolResults.length} workspace=${workspaceRoot ?? 'none'}`);
+  const checkpointSize = prevStored?.checkpoint?.byteLength ?? 0;
+  const blobCount = prevStored?.blobStore?.size ?? 0;
+  const blobBytes = prevStored?.blobStore ? estimateBlobStoreBytes(prevStored.blobStore) : 0;
+  console.log(`[proxy] keys convKey=${convKey} bridgeKey=${bridgeKey} hasStored=${!!prevStored} hasCheckpoint=${!!prevStored?.checkpoint} turns=${turns.length} toolResults=${toolResults.length} checkpointBytes=${checkpointSize} blobs=${blobCount}/${blobBytes} workspace=${workspaceRoot ?? 'none'}`);
 
   // Mutex is already held by the fetch() handler — no need to acquire here.
 
@@ -2146,6 +2149,9 @@ function createBridgeStreamResponse(
 
           // Guard against silent empty completions: stream closed before any usable
           // content or tool call reached SSE, but no explicit Connect error surfaced.
+          // This happens when Cursor silently rejects large conversation states.
+          // Strategy: retry once with the same request, then retry once more with
+          // a cleared checkpoint (fresh conversation state).
           if (!mcpExecReceived && !anyContentSent && attempt < maxConnectRetries && accessToken && requestBytes) {
             emptyCloseRetry = true;
           }
@@ -2158,13 +2164,37 @@ function createBridgeStreamResponse(
               emptyCloseRetry = false;
             } else {
               const delay = Math.max(50, Math.floor((CONNECT_RETRY_BASE_DELAY_MS * retryDelayMultiplier * Math.pow(2, attempt)) / 2));
+
+              // On 2nd+ attempt with empty close, try clearing the checkpoint.
+              // Large checkpoints cause Cursor to silently drop the connection.
+              let effectiveRequestBytes = retryRequestBytes;
+              const isRetryAfterEmpty = attempt >= 1;
+              if (isRetryAfterEmpty && retryCtx && retryCtx.stored.checkpoint) {
+                console.warn(
+                  `[proxy] Empty stream close after retry; clearing checkpoint and rebuilding request (convKey=${convKey})`,
+                );
+                retryCtx.stored.checkpoint = null;
+                retryCtx.stored.blobStore.clear();
+                const freshPayload = buildCursorRequest(
+                  retryCtx.modelId,
+                  retryCtx.systemPrompt,
+                  retryCtx.effectiveUserText,
+                  retryCtx.turns,
+                  retryCtx.stored.conversationId,
+                  null, // no checkpoint
+                  retryCtx.stored.blobStore,
+                );
+                freshPayload.mcpTools = retryCtx.mcpTools;
+                effectiveRequestBytes = freshPayload.requestBytes;
+              }
+
               console.warn(
-                `[proxy] Empty stream close; retrying in ${delay}ms (attempt ${attempt + 1}/${maxConnectRetries + 1}, code=${code}, pressure=${pressureMode})`,
+                `[proxy] Empty stream close; retrying in ${delay}ms (attempt ${attempt + 1}/${maxConnectRetries + 1}, code=${code}, pressure=${pressureMode}, checkpointCleared=${isRetryAfterEmpty && !!retryCtx?.stored})`,
               );
               setTimeout(() => {
                 if (closed) return;
                 const { bridge: retryBridge, heartbeatTimer: retryTimer } =
-                  startBridge(retryAccessToken, retryRequestBytes);
+                  startBridge(retryAccessToken, effectiveRequestBytes);
                 runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
               }, delay);
               return;
@@ -2178,6 +2208,12 @@ function createBridgeStreamResponse(
             const flushed = tagFilter.flush();
             if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
             if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+            // If no content was ever sent, surface an explicit error instead of
+            // a silent empty completion that looks like "instant empty reply" in Discord.
+            if (!anyContentSent) {
+              console.warn(`[proxy] All retries exhausted; sending empty-stream error (bridgeKey=${bridgeKey})`);
+              sendSSE(makeChunk({ content: "\n[Error: Cursor returned empty response. Try sending your message again.]" }));
+            }
             sendSSE(makeChunk({}, "stop"));
             sendSSE(makeUsageChunk());
             sendDone();
