@@ -806,6 +806,144 @@ export function stopProxy(): void {
   proxyTelemetry.lastSnapshotMs = 0;
 }
 
+/** Handle title-gen by calling OpenCode Zen's free API directly.
+ *  Bypasses the Cursor bridge entirely — no auth needed for free models
+ *  like gpt-5-nano. Falls back to Cursor bridge on failure. */
+async function handleTitleGenViaZen(
+  modelId: string,
+  body: ChatCompletionRequest,
+): Promise<Response> {
+  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  try {
+    // Build a minimal OpenAI-compatible request for Zen
+    const zenBody = {
+      model: modelId,
+      stream: true,
+      messages: body.messages.map((m) => ({
+        role: m.role,
+        content: typeof m.content === "string"
+          ? m.content
+          : m.content
+            ?.filter((p) => p.type === "text" && p.text)
+            .map((p) => p.text)
+            .join("\n") ?? "",
+      })),
+    };
+
+    const zenResponse = await fetch("https://opencode.ai/zen/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(zenBody),
+      signal: AbortSignal.timeout(30_000),
+    });
+
+    if (!zenResponse.ok) {
+      console.warn(`[proxy] title-gen Zen returned ${zenResponse.status}, falling back to empty`);
+      return buildEmptyTitleResponse(completionId, created, modelId);
+    }
+
+    // Proxy the SSE stream from Zen, translating chunk format
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        const reader = zenResponse.body?.getReader();
+        if (!reader) {
+          controller.close();
+          return;
+        }
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        (async () => {
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split("\n");
+              buffer = lines.pop() ?? "";
+
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed || !trimmed.startsWith("data: ")) continue;
+                const data = trimmed.slice(6);
+                if (data === "[DONE]") {
+                  controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                  continue;
+                }
+                try {
+                  const chunk = JSON.parse(data);
+                  // Normalize chunk format for OpenCode
+                  const normalized = {
+                    id: completionId,
+                    object: "chat.completion.chunk",
+                    created,
+                    model: modelId,
+                    choices: (chunk.choices ?? []).map(
+                      (c: { index?: number; delta?: { content?: string }; finish_reason?: string }) => ({
+                        index: c.index ?? 0,
+                        delta: c.delta ?? {},
+                        finish_reason: c.finish_reason ?? null,
+                      }),
+                    ),
+                  };
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(normalized)}\n\n`));
+                } catch {
+                  // Skip unparseable chunks
+                }
+              }
+            }
+          } catch (err) {
+            console.warn(`[proxy] title-gen Zen stream error: ${err}`);
+          } finally {
+            reader.cancel().catch(() => {});
+            try { controller.close(); } catch {}
+          }
+        })();
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
+    });
+  } catch (err) {
+    console.warn(`[proxy] title-gen Zen failed: ${err}, returning empty`);
+    return buildEmptyTitleResponse(completionId, created, modelId);
+  }
+}
+
+/** Return a clean empty title response — leaves the thread name unchanged. */
+function buildEmptyTitleResponse(completionId: string, created: number, modelId: string): Response {
+  const stream = new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder();
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+        id: completionId,
+        object: "chat.completion.chunk",
+        created,
+        model: modelId,
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      })}\n\n`));
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  });
+}
+
 function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
@@ -837,23 +975,15 @@ async function doHandleChatCompletion(
   }
 
   // Title-generation requests are stateless one-shot calls — they don't need
-  // conversation state, checkpoints, MCP tools, or mutexes.  Bypass all of
-  // that and stream directly to Cursor.
+  // conversation state, checkpoints, MCP tools, or mutexes.
+  // Route to OpenCode Zen's free gpt-5-nano instead of Cursor to avoid
+  // resource_exhausted errors on premium models.
   const isTitleGen = isTitleGenerationRequest(body.messages);
   if (isTitleGen) {
-    console.log(`[proxy] title-gen request model=${modelId} — stateless path`);
-    const payload = buildCursorRequest(modelId, systemPrompt, userText, [], "", null, new Map());
-    payload.mcpTools = [];
-    const { bridge: tBridge, heartbeatTimer: tHb } = startBridge(accessToken, payload.requestBytes);
-    return createBridgeStreamResponse(
-      tBridge, tHb,
-      payload.blobStore,
-      [],
-      modelId,
-      `title:${crypto.randomUUID()}`,
-      `title:${crypto.randomUUID()}`,
-      release,
-    );
+    const titleModelId = TITLE_GEN_MODEL;
+    console.log(`[proxy] title-gen request model=${modelId} → zen ${titleModelId}`);
+    release();
+    return handleTitleGenViaZen(titleModelId, body);
   }
 
   // bridgeKey: model-specific, for active tool-call bridges
@@ -1784,8 +1914,12 @@ const PRESSURE_ACTIVE_REQUESTS_THRESHOLD = 4;
 const PRESSURE_ACTIVE_BRIDGES_THRESHOLD = Math.max(4, Math.floor(MAX_ACTIVE_BRIDGES * 0.7));
 const ADMISSION_MAX_ACTIVE_REQUESTS = 12;
 const ADMISSION_MAX_ACTIVE_BRIDGES = MAX_ACTIVE_BRIDGES;
-const STALL_TIMEOUT_MS = Number(process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS ?? 45_000);
+const STALL_TIMEOUT_MS = Number(process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS ?? 90_000);
 const STALL_TICK_MS = Number(process.env.OPENCODE_CURSOR_STALL_TICK_MS ?? 1_000);
+/** Override model for title-gen requests. Defaults to gpt-5-nano (free on
+ *  OpenCode Zen — https://opencode.ai/zen/v1) to avoid resource_exhausted
+ *  errors on premium Cursor models. */
+const TITLE_GEN_MODEL = process.env.OPENCODE_CURSOR_TITLE_GEN_MODEL ?? "gpt-5-nano";
 
 /** Create an SSE streaming Response that reads from a live bridge.
  *  When retryCtx is provided, automatically retries on "Blob not found" errors
@@ -1899,6 +2033,10 @@ function createBridgeStreamResponse(
           totalTokens: 0,
         };
         const tagFilter = createThinkingTagFilter();
+        // Title-gen requests use convKey starting with "title:".
+        // Suppress error-as-content for these to prevent error messages
+        // from becoming Discord thread titles.
+        const isTitleGenStream = convKey.startsWith("title:");
         let mcpExecReceived = false;
         let anyContentSent = false;
         let blobNotFound = false;
@@ -1987,7 +2125,9 @@ function createBridgeStreamResponse(
                     lastAccessMs: Date.now(),
                   });
                   if (!attached) {
-                    sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
+                    if (!isTitleGenStream) {
+                      sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
+                    }
                     sendSSE(makeChunk({}, "stop"));
                     sendDone();
                     closeController();
@@ -2043,7 +2183,12 @@ function createBridgeStreamResponse(
                 return; // swallow error — onClose will retry
               }
               anyContentSent = true;
-              sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
+              // For title-gen requests, suppress error-as-content to prevent
+              // error messages (e.g. "Connect error resource_exhausted") from
+              // becoming the Discord thread title. An empty response is better.
+              if (!isTitleGenStream) {
+                sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
+              }
             }
           },
         );
@@ -2082,8 +2227,18 @@ function createBridgeStreamResponse(
             return;
           }
 
+          // Diagnostic: log why recovery was skipped
+          console.warn(
+            `[proxy] stall recovery skipped bridgeKey=${bridgeKey} retryCtx=${!!retryCtx} stallRecoveryUsed=${retryCtx?.stallRecoveryUsed} accessToken=${!!accessToken} requestBytes=${!!requestBytes}`,
+          );
           proxyTelemetry.stallRecoveryFailures += 1;
-          sendSSE(makeChunk({ content: "\n[Error: stream stalled; recovery failed]" }));
+          // Send a clean stop so the client can auto-retry without showing
+          // a scary error.  The "[Error: ...]" prefix is recognized by
+          // OpenCode as a non-fatal proxy message and surfaced to the user.
+          // Suppress for title-gen to avoid polluting Discord thread names.
+          if (!isTitleGenStream) {
+            sendSSE(makeChunk({ content: "\n[Error: stream stalled; retrying...]" }));
+          }
           sendSSE(makeChunk({}, "stop"));
           sendSSE(makeUsageChunk());
           sendDone();
@@ -2214,7 +2369,8 @@ function createBridgeStreamResponse(
             if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
             // If no content was ever sent, surface an explicit error instead of
             // a silent empty completion that looks like "instant empty reply" in Discord.
-            if (!anyContentSent) {
+            // Suppress for title-gen to avoid polluting Discord thread names.
+            if (!anyContentSent && !isTitleGenStream) {
               console.warn(`[proxy] All retries exhausted; sending empty-stream error (bridgeKey=${bridgeKey})`);
               sendSSE(makeChunk({ content: "\n[Error: Cursor returned empty response. Try sending your message again.]" }));
             }
@@ -2234,7 +2390,10 @@ function createBridgeStreamResponse(
             }
             if (code !== 0) {
               // Bridge died while tool calls are pending (timeout, crash, etc.).
-              sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
+              // Suppress for title-gen to avoid polluting Discord thread names.
+              if (!isTitleGenStream) {
+                sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
+              }
               sendSSE(makeChunk({}, "stop"));
               sendSSE(makeUsageChunk());
               sendDone();
