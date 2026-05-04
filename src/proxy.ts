@@ -1988,10 +1988,16 @@ function createBridgeStreamResponse(
   // Shared stream-lifecycle flag used by both `cancel()` and async bridge callbacks.
   // Must live outside `start()` so retries/enqueues stop immediately after client abort.
   let closed = false;
+  /** Stall recovery schedules a backoff before restarting the bridge; abort must clear it. */
+  let stallRecoveryBackoffTimer: ReturnType<typeof setTimeout> | undefined;
 
   const stream = new ReadableStream({
     cancel() {
       closed = true;
+      if (stallRecoveryBackoffTimer !== undefined) {
+        clearTimeout(stallRecoveryBackoffTimer);
+        stallRecoveryBackoffTimer = undefined;
+      }
       cleanupCurrentAttempt();
       safeRelease();
     },
@@ -2262,8 +2268,11 @@ function createBridgeStreamResponse(
             clearInterval(stallTimer);
             clearInterval(attemptHeartbeat);
             attemptBridge.kill();
+            currentAttemptBridge = undefined;
+            currentAttemptHeartbeat = undefined;
 
-            setTimeout(() => {
+            stallRecoveryBackoffTimer = setTimeout(() => {
+              stallRecoveryBackoffTimer = undefined;
               if (closed) return;
               const { bridge: retryBridge, heartbeatTimer: retryTimer } =
                 startBridge(accessToken, requestBytes);
