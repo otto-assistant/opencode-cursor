@@ -159,6 +159,11 @@ interface ActiveBridge {
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
   lastAccessMs: number;
+  /** Present when this bridge was opened from a chat completion that has retry context. */
+  resumeRetryCtx?: RetryContext;
+  accessToken?: string;
+  /** Initial Run frame bytes — used to restart the gRPC stream on stall recovery. */
+  requestBytes?: Uint8Array;
 }
 
 // Active bridges keyed by a session token (derived from conversation state).
@@ -1082,7 +1087,7 @@ async function doHandleChatCompletion(
     effectiveUserText,
     turns,
     mcpTools,
-    stallRecoveryUsed: false,
+    stallRecoveryCount: 0,
   };
   return handleStreamingResponse(
     payload, accessToken, modelId, bridgeKey, convKey, release,
@@ -1900,8 +1905,8 @@ interface RetryContext {
   effectiveUserText: string;
   turns: Array<{ userText: string; assistantText: string }>;
   mcpTools: McpToolDefinition[];
-  /** One-shot guard for stalled-stream recovery to avoid retry loops. */
-  stallRecoveryUsed: boolean;
+  /** Consecutive internal stall recoveries without forward progress (reset on progress). */
+  stallRecoveryCount: number;
 }
 
 /** Max automatic retries for transient connect errors (e.g. "invalid_argument"). */
@@ -1916,6 +1921,16 @@ const ADMISSION_MAX_ACTIVE_REQUESTS = 12;
 const ADMISSION_MAX_ACTIVE_BRIDGES = MAX_ACTIVE_BRIDGES;
 const STALL_TIMEOUT_MS = Number(process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS ?? 90_000);
 const STALL_TICK_MS = Number(process.env.OPENCODE_CURSOR_STALL_TICK_MS ?? 1_000);
+/** Max internal Run-stream restarts per stall episode (resets after forward progress). */
+const MAX_STALL_RECOVERIES = Number(process.env.OPENCODE_CURSOR_MAX_STALL_RECOVERIES ?? 3);
+/** Base delay before restarting the Run stream after a stall (exponential backoff). */
+const STALL_RECOVERY_BASE_DELAY_MS = Number(
+  process.env.OPENCODE_CURSOR_STALL_RECOVERY_BASE_DELAY_MS ?? 1_000,
+);
+/** Stall threshold while waiting for model output after MCP tool results (HTTP resume). */
+const STALL_TIMEOUT_POST_TOOL_MS = Number(
+  process.env.OPENCODE_CURSOR_STALL_TIMEOUT_POST_TOOL_MS ?? STALL_TIMEOUT_MS,
+);
 /** Override model for title-gen requests. Defaults to gpt-5-nano (free on
  *  OpenCode Zen — https://opencode.ai/zen/v1) to avoid resource_exhausted
  *  errors on premium Cursor models. */
@@ -1940,7 +1955,10 @@ function createBridgeStreamResponse(
   requestBytes?: Uint8Array,
   /** Real workspace root path (e.g. /data/projects/foo) to inject into RequestContext. */
   workspaceRoot?: string,
+  /** Override no-progress threshold for this stream (e.g. post-tool resume). */
+  stallTimeoutMs?: number,
 ): Response {
+  const resolvedStallTimeoutMs = stallTimeoutMs ?? STALL_TIMEOUT_MS;
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
   let outerReleased = false;
@@ -2054,6 +2072,10 @@ function createBridgeStreamResponse(
         const maxConnectRetries = pressureMode ? PRESSURE_MAX_CONNECT_RETRIES : MAX_CONNECT_RETRIES;
         const retryDelayMultiplier = pressureMode ? PRESSURE_RETRY_DELAY_MULTIPLIER : 1;
 
+        const resetStallRecovery = () => {
+          if (retryCtx) retryCtx.stallRecoveryCount = 0;
+        };
+
         const makeUsageChunk = () => {
           const { prompt_tokens, completion_tokens, total_tokens } = computeUsage(state);
           return {
@@ -2083,6 +2105,7 @@ function createBridgeStreamResponse(
                 (text, isThinking) => {
                   markProgress();
                   anyContentSent = true;
+                  resetStallRecovery();
                   if (isThinking) {
                     sendSSE(makeChunk({ reasoning_content: text }));
                   } else {
@@ -2097,6 +2120,7 @@ function createBridgeStreamResponse(
                   state.pendingExecs.push(exec);
                   mcpExecReceived = true;
                   anyContentSent = true;
+                  resetStallRecovery();
 
                   const flushed = tagFilter.flush();
                   if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
@@ -2123,6 +2147,13 @@ function createBridgeStreamResponse(
                     mcpTools: attemptMcpTools,
                     pendingExecs: state.pendingExecs,
                     lastAccessMs: Date.now(),
+                    ...(retryCtx && accessToken && requestBytes
+                      ? {
+                        resumeRetryCtx: retryCtx,
+                        accessToken,
+                        requestBytes,
+                      }
+                      : {}),
                   });
                   if (!attached) {
                     if (!isTitleGenStream) {
@@ -2145,6 +2176,7 @@ function createBridgeStreamResponse(
                     for (const [k, v] of attemptBlobStore) stored.blobStore.set(k, v);
                     enforceConversationBlobBudget(stored);
                     stored.lastAccessMs = Date.now();
+                    resetStallRecovery();
                   }
                 },
                 workspaceRoot,
@@ -2200,7 +2232,7 @@ function createBridgeStreamResponse(
             clearInterval(stallTimer);
             return;
           }
-          if (Date.now() - lastProgressAt < STALL_TIMEOUT_MS) return;
+          if (Date.now() - lastProgressAt < resolvedStallTimeoutMs) return;
           // In Bun.serve, activeRequestCount often drops to zero as soon as
           // the Response is returned, while stream processing is still active.
           // A prolonged no-progress window at that point is our stuck-busy signal.
@@ -2209,27 +2241,40 @@ function createBridgeStreamResponse(
           watchdogHandled = true;
           proxyTelemetry.stallDetections += 1;
           console.warn(
-            `[proxy] stall detected bridgeKey=${bridgeKey} attempt=${attempt} timeoutMs=${STALL_TIMEOUT_MS}`,
+            `[proxy] stall detected bridgeKey=${bridgeKey} attempt=${attempt} timeoutMs=${resolvedStallTimeoutMs}`,
           );
 
-          if (retryCtx && !retryCtx.stallRecoveryUsed && accessToken && requestBytes) {
-            retryCtx.stallRecoveryUsed = true;
+          if (
+            retryCtx &&
+            accessToken &&
+            requestBytes &&
+            retryCtx.stallRecoveryCount < MAX_STALL_RECOVERIES
+          ) {
+            retryCtx.stallRecoveryCount += 1;
             proxyTelemetry.stallRecoveryRetries += 1;
-            console.warn(`[proxy] forced_recovery_retry_started bridgeKey=${bridgeKey}`);
+            const n = retryCtx.stallRecoveryCount;
+            const delay = STALL_RECOVERY_BASE_DELAY_MS * Math.pow(2, n - 1);
+            console.warn(
+              `[proxy] forced_recovery_retry_started bridgeKey=${bridgeKey} stallRecoveryAttempt=${n}/${MAX_STALL_RECOVERIES} delayMs=${delay}`,
+            );
 
             deleteActiveBridge(bridgeKey);
+            clearInterval(stallTimer);
             clearInterval(attemptHeartbeat);
             attemptBridge.kill();
 
-            const { bridge: retryBridge, heartbeatTimer: retryTimer } =
-              startBridge(accessToken, requestBytes);
-            runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
+            setTimeout(() => {
+              if (closed) return;
+              const { bridge: retryBridge, heartbeatTimer: retryTimer } =
+                startBridge(accessToken, requestBytes);
+              runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
+            }, delay);
             return;
           }
 
           // Diagnostic: log why recovery was skipped
           console.warn(
-            `[proxy] stall recovery skipped bridgeKey=${bridgeKey} retryCtx=${!!retryCtx} stallRecoveryUsed=${retryCtx?.stallRecoveryUsed} accessToken=${!!accessToken} requestBytes=${!!requestBytes}`,
+            `[proxy] stall recovery skipped bridgeKey=${bridgeKey} retryCtx=${!!retryCtx} stallRecoveryCount=${retryCtx?.stallRecoveryCount ?? "n/a"} max=${MAX_STALL_RECOVERIES} accessToken=${!!accessToken} requestBytes=${!!requestBytes}`,
           );
           proxyTelemetry.stallRecoveryFailures += 1;
           // Send a clean stop so the client can auto-retry without showing
@@ -2517,8 +2562,11 @@ function handleToolResultResume(
     bridge, heartbeatTimer,
     blobStore, mcpTools,
     modelId, bridgeKey, convKey, release,
-    undefined, undefined, undefined,
+    active.resumeRetryCtx,
+    active.accessToken,
+    active.requestBytes,
     workspaceRoot,
+    STALL_TIMEOUT_POST_TOOL_MS,
   );
 }
 
