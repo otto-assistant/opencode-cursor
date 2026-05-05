@@ -1919,8 +1919,10 @@ const PRESSURE_ACTIVE_REQUESTS_THRESHOLD = 4;
 const PRESSURE_ACTIVE_BRIDGES_THRESHOLD = Math.max(4, Math.floor(MAX_ACTIVE_BRIDGES * 0.7));
 const ADMISSION_MAX_ACTIVE_REQUESTS = 12;
 const ADMISSION_MAX_ACTIVE_BRIDGES = MAX_ACTIVE_BRIDGES;
-const STALL_TIMEOUT_MS = Number(process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS ?? 90_000);
+const STALL_TIMEOUT_MS = Number(process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS ?? 45_000);
 const STALL_TICK_MS = Number(process.env.OPENCODE_CURSOR_STALL_TICK_MS ?? 1_000);
+/** Emit a user-visible "still processing" marker before we treat stream as stalled. */
+const STALL_WAIT_NOTICE_MS = Number(process.env.OPENCODE_CURSOR_STALL_WAIT_NOTICE_MS ?? 20_000);
 /** Max internal Run-stream restarts per stall episode (resets after forward progress). */
 const MAX_STALL_RECOVERIES = Number(process.env.OPENCODE_CURSOR_MAX_STALL_RECOVERIES ?? 3);
 /** Base delay before restarting the Run stream after a stall (exponential backoff). */
@@ -2067,9 +2069,11 @@ function createBridgeStreamResponse(
         let connectError = false;
         let emptyCloseRetry = false;
         let watchdogHandled = false;
+        let stallNoticeSent = false;
         let lastProgressAt = Date.now();
         const markProgress = () => {
           lastProgressAt = Date.now();
+          stallNoticeSent = false;
         };
         const pressureMode = isProxyUnderPressure();
         if (pressureMode) {
@@ -2238,7 +2242,17 @@ function createBridgeStreamResponse(
             clearInterval(stallTimer);
             return;
           }
-          if (Date.now() - lastProgressAt < resolvedStallTimeoutMs) return;
+          const noProgressMs = Date.now() - lastProgressAt;
+          if (
+            !stallNoticeSent &&
+            !isTitleGenStream &&
+            noProgressMs >= STALL_WAIT_NOTICE_MS &&
+            noProgressMs < resolvedStallTimeoutMs
+          ) {
+            stallNoticeSent = true;
+            sendSSE(makeChunk({ content: "\n[Info: Cursor is still processing; waiting for response...]" }));
+          }
+          if (noProgressMs < resolvedStallTimeoutMs) return;
           // In Bun.serve, activeRequestCount often drops to zero as soon as
           // the Response is returned, while stream processing is still active.
           // A prolonged no-progress window at that point is our stuck-busy signal.
