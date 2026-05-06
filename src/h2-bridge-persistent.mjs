@@ -22,8 +22,7 @@
  */
 import http2 from "node:http2";
 import crypto from "node:crypto";
-
-const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
+import { CURSOR_CLIENT_VERSION } from "./client-version.js";
 
 // --- Message types ---
 const IN_NEW_REQUEST = 0x00;
