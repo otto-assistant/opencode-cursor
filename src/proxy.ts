@@ -193,7 +193,7 @@ const PROXY_IDLE_SHUTDOWN_MS = 10 * 60 * 1000;
 const MAINTENANCE_INTERVAL_MS = 60 * 1000;
 
 // Bridge pool configuration
-const BRIDGE_POOL_MIN_SIZE = Number(process.env.OPENCODE_CURSOR_BRIDGE_POOL_MIN ?? 2);
+const BRIDGE_POOL_MIN_SIZE = Number(process.env.OPENCODE_CURSOR_BRIDGE_POOL_MIN ?? 1);
 const BRIDGE_POOL_MAX_SIZE = Number(process.env.OPENCODE_CURSOR_BRIDGE_POOL_MAX ?? 4);
 const BRIDGE_POOL_ENABLED = process.env.OPENCODE_CURSOR_BRIDGE_POOL_DISABLED !== "1";
 let bridgePool: BridgePool | undefined;
@@ -725,7 +725,8 @@ export async function startProxy(
           try {
             const body = (await req.json()) as ChatCompletionRequest;
             const msgSummary = body.messages.map((m) => `${m.role}[${(typeof m.content === 'string' ? m.content : Array.isArray(m.content) ? m.content.length + ' parts' : 'null')?.slice(0, 40)}]`).join(', ');
-            console.log(`[proxy] REQUEST model=${body.model} stream=${body.stream} msgs=${body.messages.length} [${msgSummary.slice(0, 120)}]`);
+            const identityMeta = resolveConversationIdentity(body);
+            console.log(`[proxy] REQUEST model=${body.model} stream=${body.stream} msgs=${body.messages.length} convSource=${identityMeta.source} [${msgSummary.slice(0, 120)}]`);
             if (!proxyAccessTokenProvider) {
               throw new Error("Cursor proxy access token provider not configured");
             }
@@ -735,13 +736,23 @@ export async function startProxy(
             // that cause "Blob not found" errors from concurrent state mutations.
             const convKey = deriveConversationKey(body);
             const mutex = getOrCreateMutex(convKey);
+            const lockWaitStart = Date.now();
             const acquired = await mutex.acquire();
+            const lockAcquiredAt = Date.now();
+            const lockWaitMs = lockAcquiredAt - lockWaitStart;
+            if (lockWaitMs >= 250) {
+              console.warn(`[proxy] mutex wait convKey=${convKey} source=${identityMeta.source} waitMs=${lockWaitMs}`);
+            }
             // Guard against double-release: multiple cleanup paths
             // (closeController, cancel, onClose) can all fire for the same request.
             let released = false;
             release = () => {
               if (released) return;
               released = true;
+              const lockHoldMs = Date.now() - lockAcquiredAt;
+              if (lockHoldMs >= 250) {
+                console.log(`[proxy] mutex hold convKey=${convKey} source=${identityMeta.source} holdMs=${lockHoldMs}`);
+              }
               convMutexLastUsedMs.set(convKey, Date.now());
               acquired();
             };
@@ -1804,16 +1815,20 @@ function sendExecResult(
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
-function buildConversationIdentity(body: ChatCompletionRequest): string {
-  const rawIds = [
-    body.conversation_id,
-    body.thread_id,
-    body.session_id,
-    body.user,
+interface ConversationIdentity {
+  identity: string;
+  source: string;
+}
+
+function resolveConversationIdentity(body: ChatCompletionRequest): ConversationIdentity {
+  const directIds: Array<[string, string | undefined]> = [
+    ["conversation_id", body.conversation_id],
+    ["thread_id", body.thread_id],
+    ["session_id", body.session_id],
   ];
-  for (const id of rawIds) {
-    if (typeof id === "string" && id.trim().length > 0) {
-      return `id:${id.trim()}`;
+  for (const [source, value] of directIds) {
+    if (typeof value === "string" && value.trim().length > 0) {
+      return { identity: `id:${value.trim()}`, source };
     }
   }
 
@@ -1821,21 +1836,29 @@ function buildConversationIdentity(body: ChatCompletionRequest): string {
     ? body.metadata
     : undefined;
   if (metadata) {
-    const candidateKeys = ["conversation_id", "thread_id", "session_id", "chat_id", "id"];
+    const candidateKeys = [
+      "conversation_id",
+      "thread_id",
+      "session_id",
+      "chat_id",
+      "discord_thread_id",
+      "discord_channel_id",
+      "id",
+    ];
     for (const key of candidateKeys) {
       const value = metadata[key];
       if (typeof value === "string" && value.trim().length > 0) {
-        return `meta:${key}:${value.trim()}`;
+        return { identity: `meta:${key}:${value.trim()}`, source: `metadata:${key}` };
       }
     }
   }
 
-  return "";
+  return { identity: "", source: "fallback" };
 }
 
 /** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
 function deriveBridgeKey(modelId: string, body: ChatCompletionRequest): string {
-  const identity = buildConversationIdentity(body);
+  const identity = resolveConversationIdentity(body).identity;
   const firstUserMsg = body.messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   const titleNs = isTitleGenerationRequest(body.messages) ? "title:" : "";
@@ -1863,7 +1886,7 @@ function isTitleGenerationRequest(messages: OpenAIMessage[]): boolean {
  * 2) Fallback hash from stable message anchors (system + first user text)
  */
 function deriveConversationKey(body: ChatCompletionRequest): string {
-  const identity = buildConversationIdentity(body);
+  const identity = resolveConversationIdentity(body).identity;
   const firstUserMsg = body.messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   const titleNs = isTitleGenerationRequest(body.messages) ? "title:" : "";
@@ -1919,10 +1942,8 @@ const PRESSURE_ACTIVE_REQUESTS_THRESHOLD = 4;
 const PRESSURE_ACTIVE_BRIDGES_THRESHOLD = Math.max(4, Math.floor(MAX_ACTIVE_BRIDGES * 0.7));
 const ADMISSION_MAX_ACTIVE_REQUESTS = 12;
 const ADMISSION_MAX_ACTIVE_BRIDGES = MAX_ACTIVE_BRIDGES;
-const STALL_TIMEOUT_MS = Number(process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS ?? 45_000);
+const STALL_TIMEOUT_MS = Number(process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS ?? 300_000);
 const STALL_TICK_MS = Number(process.env.OPENCODE_CURSOR_STALL_TICK_MS ?? 1_000);
-/** Emit a user-visible "still processing" marker before we treat stream as stalled. */
-const STALL_WAIT_NOTICE_MS = Number(process.env.OPENCODE_CURSOR_STALL_WAIT_NOTICE_MS ?? 20_000);
 /** Max internal Run-stream restarts per stall episode (resets after forward progress). */
 const MAX_STALL_RECOVERIES = Number(process.env.OPENCODE_CURSOR_MAX_STALL_RECOVERIES ?? 3);
 /** Base delay before restarting the Run stream after a stall (exponential backoff). */
@@ -2069,11 +2090,9 @@ function createBridgeStreamResponse(
         let connectError = false;
         let emptyCloseRetry = false;
         let watchdogHandled = false;
-        let stallNoticeSent = false;
         let lastProgressAt = Date.now();
         const markProgress = () => {
           lastProgressAt = Date.now();
-          stallNoticeSent = false;
         };
         const pressureMode = isProxyUnderPressure();
         if (pressureMode) {
@@ -2243,15 +2262,6 @@ function createBridgeStreamResponse(
             return;
           }
           const noProgressMs = Date.now() - lastProgressAt;
-          if (
-            !stallNoticeSent &&
-            !isTitleGenStream &&
-            noProgressMs >= STALL_WAIT_NOTICE_MS &&
-            noProgressMs < resolvedStallTimeoutMs
-          ) {
-            stallNoticeSent = true;
-            sendSSE(makeChunk({ content: "\n[Info: Cursor is still processing; waiting for response...]" }));
-          }
           if (noProgressMs < resolvedStallTimeoutMs) return;
           // In Bun.serve, activeRequestCount often drops to zero as soon as
           // the Response is returned, while stream processing is still active.
