@@ -747,7 +747,7 @@ export async function startProxy(
                     message: "Invalid chat completion request body",
                     type: "invalid_request_error",
                     code: "invalid_request",
-                    details: parsedBody.error.issues.map((issue) => ({
+                    details: parsedBody.error.issues.map((issue: any) => ({
                       path: issue.path.join("."),
                       message: issue.message,
                     })),

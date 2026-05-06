@@ -1,1 +1,2 @@
-export { CURSOR_CLIENT_VERSION } from "./client-version.js";
+export const CURSOR_CLIENT_VERSION =
+  process.env.CURSOR_CLIENT_VERSION || "cli-2026.01.09-231024f";
