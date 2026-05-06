@@ -74,6 +74,7 @@ import { createHash } from "node:crypto";
 import { resolve as pathResolve } from "node:path";
 import { Mutex } from "./promise-queue";
 import { BridgePool, type BridgeHandle } from "./bridge-pool";
+import { ChatCompletionRequestSchema } from "./schemas";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -723,7 +724,39 @@ export async function startProxy(
         if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
           let release: (() => void) | undefined;
           try {
-            const body = (await req.json()) as ChatCompletionRequest;
+            let requestBody: unknown;
+            try {
+              requestBody = await req.json();
+            } catch {
+              return new Response(
+                JSON.stringify({
+                  error: {
+                    message: "Invalid JSON in request body",
+                    type: "invalid_request_error",
+                    code: "invalid_json",
+                  },
+                }),
+                { status: 400, headers: { "Content-Type": "application/json" } },
+              );
+            }
+            const parsedBody = ChatCompletionRequestSchema.safeParse(requestBody);
+            if (!parsedBody.success) {
+              return new Response(
+                JSON.stringify({
+                  error: {
+                    message: "Invalid chat completion request body",
+                    type: "invalid_request_error",
+                    code: "invalid_request",
+                    details: parsedBody.error.issues.map((issue) => ({
+                      path: issue.path.join("."),
+                      message: issue.message,
+                    })),
+                  },
+                }),
+                { status: 400, headers: { "Content-Type": "application/json" } },
+              );
+            }
+            const body: ChatCompletionRequest = parsedBody.data;
             const msgSummary = body.messages.map((m) => `${m.role}[${(typeof m.content === 'string' ? m.content : Array.isArray(m.content) ? m.content.length + ' parts' : 'null')?.slice(0, 40)}]`).join(', ');
             const identityMeta = resolveConversationIdentity(body);
             console.log(`[proxy] REQUEST model=${body.model} stream=${body.stream} msgs=${body.messages.length} convSource=${identityMeta.source} [${msgSummary.slice(0, 120)}]`);
