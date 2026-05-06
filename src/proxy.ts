@@ -1856,13 +1856,54 @@ function resolveConversationIdentity(body: ChatCompletionRequest): ConversationI
   return { identity: "", source: "fallback" };
 }
 
+/**
+ * Build a stable fallback seed when callers don't provide conversation/thread IDs.
+ * Uses only early, conversation-shaping anchors so the key stays stable across turns,
+ * while reducing collisions between unrelated sessions that share a generic opener.
+ */
+function buildFallbackConversationSeed(body: ChatCompletionRequest): string {
+  const anchors: string[] = [];
+  const normalizedUser = typeof body.user === "string" ? body.user.trim() : "";
+  if (normalizedUser) {
+    anchors.push(`user:${normalizedUser}`);
+  }
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    const toolNames = body.tools
+      .map((tool) => tool.function?.name?.trim())
+      .filter((name): name is string => typeof name === "string" && name.length > 0)
+      .slice(0, 8)
+      .join(",");
+    if (toolNames) {
+      anchors.push(`tools:${toolNames}`);
+    }
+  }
+
+  const nonSystemMessages = body.messages.filter((message) => message.role !== "system");
+  const earlyAnchors = nonSystemMessages.slice(0, 4);
+  for (const message of earlyAnchors) {
+    const content = textContent(message.content).trim().slice(0, 240);
+    if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      const toolCallNames = message.tool_calls
+        .map((call) => call.function?.name?.trim())
+        .filter((name): name is string => typeof name === "string" && name.length > 0)
+        .join(",");
+      anchors.push(`assistant_tools:${toolCallNames}`);
+    }
+    const toolCallId = typeof message.tool_call_id === "string" ? message.tool_call_id.trim() : "";
+    if (toolCallId) {
+      anchors.push(`tool_call_id:${toolCallId}`);
+    }
+    anchors.push(`${message.role}:${content}`);
+  }
+  return anchors.join("|");
+}
+
 /** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
 function deriveBridgeKey(modelId: string, body: ChatCompletionRequest): string {
   const identity = resolveConversationIdentity(body).identity;
-  const firstUserMsg = body.messages.find((m) => m.role === "user");
-  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   const titleNs = isTitleGenerationRequest(body.messages) ? "title:" : "";
-  const base = identity || `fallback:${titleNs}${firstUserText}`;
+  const fallbackSeed = buildFallbackConversationSeed(body);
+  const base = identity || `fallback:${titleNs}${fallbackSeed}`;
   return createHash("sha256")
     .update(`bridge:${modelId}:${base}`)
     .digest("hex")
@@ -1883,18 +1924,15 @@ function isTitleGenerationRequest(messages: OpenAIMessage[]): boolean {
  *
  * Priority:
  * 1) Explicit conversation identity passed by caller (conversation/thread/session/user)
- * 2) Fallback hash from stable message anchors (system + first user text)
+ * 2) Fallback hash from stable message anchors (first non-system turns + user/tools)
  */
 function deriveConversationKey(body: ChatCompletionRequest): string {
   const identity = resolveConversationIdentity(body).identity;
-  const firstUserMsg = body.messages.find((m) => m.role === "user");
-  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   const titleNs = isTitleGenerationRequest(body.messages) ? "title:" : "";
   // NOTE: Do NOT include full system prompt in fallback key — OpenCode's system
   // prompt changes every request (dynamic context, per-turn metadata), which would
   // cause convKey to rotate and lose the stored conversation checkpoint.
-  // Only firstUserText is used — it's the stable initial user message.
-  const fallbackSeed = `${titleNs}user:${firstUserText}`;
+  const fallbackSeed = `${titleNs}${buildFallbackConversationSeed(body)}`;
   const seed = identity || `fallback:${fallbackSeed}`;
   return createHash("sha256")
     .update(`conv:${seed}`)

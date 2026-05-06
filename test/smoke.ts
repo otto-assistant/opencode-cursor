@@ -831,6 +831,58 @@ async function testConversationKeyingAvoidsUserWideSerialization(
   console.log("[test] Conversation keying behavior OK");
 }
 
+async function testConversationFallbackKeyingUsesHistoryAnchors(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing fallback conversation keying with shared openers...");
+  modules.stopProxy();
+  backend.setRunDelayMs(300);
+  backend.setRunMode("delayed-close");
+
+  const port = await modules.startProxy(async () => "test-token");
+
+  const post = (messages: Array<{ role: string; content: string }>) =>
+    fetch(`http://localhost:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "composer-2",
+        stream: false,
+        user: "discord-user-1",
+        messages,
+      }),
+      signal: AbortSignal.timeout(8_000),
+    });
+
+  try {
+    const concurrentStart = Date.now();
+    const [resA, resB] = await Promise.all([
+      post([
+        { role: "user", content: "shared opener" },
+        { role: "assistant", content: "context A" },
+        { role: "user", content: "followup A" },
+      ]),
+      post([
+        { role: "user", content: "shared opener" },
+        { role: "assistant", content: "context B" },
+        { role: "user", content: "followup B" },
+      ]),
+    ]);
+    const concurrentMs = Date.now() - concurrentStart;
+    assertEqual(resA.status, 200, "Expected 200 for fallback request A");
+    assertEqual(resB.status, 200, "Expected 200 for fallback request B");
+    assert(
+      concurrentMs < 750,
+      `Expected divergent history anchors to avoid fallback serialization (elapsed=${concurrentMs}ms)`,
+    );
+  } finally {
+    backend.setRunMode("immediate-close");
+    modules.stopProxy();
+  }
+  console.log("[test] Fallback conversation keying behavior OK");
+}
+
 async function testStreamingWatchdogRecoversFromStalledRun(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -891,6 +943,7 @@ async function main() {
     await testPoolRecoveryAfterServerRestart();
     await testPoolSequentialRequests();
     await testConversationKeyingAvoidsUserWideSerialization(modules, backend);
+    await testConversationFallbackKeyingUsesHistoryAnchors(modules, backend);
     await testStreamingWatchdogRecoversFromStalledRun(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;

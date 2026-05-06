@@ -121,22 +121,29 @@ export async function refreshCursorToken(
  * Falls back to 1 hour from now if token can't be parsed.
  */
 export function getTokenExpiry(token: string): number {
+  // Decode JWT payload without relying on browser-specific atob.
+  // Use Buffer-based base64 decoding compatible with Bun/Node.
   try {
     const parts = token.split(".");
     if (parts.length !== 3 || !parts[1]) {
       return Date.now() + 3600 * 1000;
     }
-    const decoded = JSON.parse(
-      atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")),
-    );
+
+    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    // Pad to a multiple of 4 characters for base64 decoding
+    const pad = (4 - (b64.length % 4)) % 4;
+    const padded = b64 + "=".repeat(pad);
+    const decodedJson = Buffer.from(padded, "base64").toString("utf8");
+    const decoded = JSON.parse(decodedJson);
     if (
       decoded &&
       typeof decoded === "object" &&
-      typeof decoded.exp === "number"
+      typeof (decoded as any).exp === "number"
     ) {
-      return decoded.exp * 1000 - 5 * 60 * 1000;
+      return (decoded as any).exp * 1000 - 5 * 60 * 1000;
     }
   } catch {
   }
+  // Fallback: assume token expiry is 1 hour from now
   return Date.now() + 3600 * 1000;
 }
