@@ -1853,7 +1853,7 @@ interface ConversationIdentity {
   source: string;
 }
 
-function resolveConversationIdentity(body: ChatCompletionRequest): ConversationIdentity {
+export function resolveConversationIdentity(body: ChatCompletionRequest): ConversationIdentity {
   const directIds: Array<[string, string | undefined]> = [
     ["conversation_id", body.conversation_id],
     ["thread_id", body.thread_id],
@@ -1944,7 +1944,7 @@ function deriveBridgeKey(modelId: string, body: ChatCompletionRequest): string {
 }
 
 /** Detect if this is a title generation request by checking for title-gen system prompt. */
-function isTitleGenerationRequest(messages: OpenAIMessage[]): boolean {
+export function isTitleGenerationRequest(messages: OpenAIMessage[]): boolean {
   const systemText = messages
     .filter((m) => m.role === "system")
     .map((m) => textContent(m.content))
@@ -1959,7 +1959,7 @@ function isTitleGenerationRequest(messages: OpenAIMessage[]): boolean {
  * 1) Explicit conversation identity passed by caller (conversation/thread/session/user)
  * 2) Fallback hash from stable message anchors (first non-system turns + user/tools)
  */
-function deriveConversationKey(body: ChatCompletionRequest): string {
+export function deriveConversationKey(body: ChatCompletionRequest): string {
   const identity = resolveConversationIdentity(body).identity;
   const titleNs = isTitleGenerationRequest(body.messages) ? "title:" : "";
   // NOTE: Do NOT include full system prompt in fallback key — OpenCode's system

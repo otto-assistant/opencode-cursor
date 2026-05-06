@@ -218,7 +218,7 @@ function normalizeCursorModels(
   return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
 
-function normalizeSingleModel(model: unknown): CursorModel | null {
+export function normalizeSingleModel(model: unknown): CursorModel | null {
   const parsed = CursorModelDetailsSchema.safeParse(model);
   if (!parsed.success) return null;
 
@@ -236,7 +236,7 @@ function normalizeSingleModel(model: unknown): CursorModel | null {
   };
 }
 
-function pickDisplayName(model: CursorModelDetails, fallbackId: string): string {
+export function pickDisplayName(model: CursorModelDetails, fallbackId: string): string {
   const candidates = [
     model.displayName,
     model.displayNameShort,
