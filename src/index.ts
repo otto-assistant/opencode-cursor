@@ -278,9 +278,9 @@ const MODEL_COST_PATTERNS: Array<{ match: (id: string) => boolean; cost: ModelCo
   { match: (id) => /kimi/i.test(id),                 cost: MODEL_COST_TABLE["kimi-k2.5"]! },
 ];
 
-const DEFAULT_COST: ModelCost = { input: 3, output: 15, cache: { read: 0.3, write: 0 } };
+export const DEFAULT_COST: ModelCost = { input: 3, output: 15, cache: { read: 0.3, write: 0 } };
 
-function estimateModelCost(modelId: string): ModelCost {
+export function estimateModelCost(modelId: string): ModelCost {
   const normalized = modelId.toLowerCase();
   const exact = MODEL_COST_TABLE[normalized];
   if (exact) return exact;
