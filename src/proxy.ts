@@ -776,6 +776,16 @@ export async function startProxy(
 
   maintenanceTimer = setInterval(runMaintenanceSweep, MAINTENANCE_INTERVAL_MS);
 
+  // Kick off background discovery of Zen free model for title-gen.
+  // First title-gen request will await the result if not yet ready.
+  discoverZenFreeModel().then((model) => {
+    if (model) {
+      console.log(`[proxy] title-gen ready: using ${model}`);
+    } else {
+      console.warn(`[proxy] title-gen: no free model discovered at startup`);
+    }
+  }).catch(() => {});
+
   proxyPort = proxyServer.port;
   if (!proxyPort) throw new Error("Failed to bind proxy to a port");
   return proxyPort;
@@ -783,6 +793,8 @@ export async function startProxy(
 
 export function stopProxy(): void {
   clearIdleShutdownTimer();
+  resolvedTitleGenModel = undefined;
+  lastDiscoveryMs = 0;
   if (maintenanceTimer) {
     clearInterval(maintenanceTimer);
     maintenanceTimer = undefined;
@@ -812,8 +824,8 @@ export function stopProxy(): void {
 }
 
 /** Handle title-gen by calling OpenCode Zen's free API directly.
- *  Bypasses the Cursor bridge entirely — no auth needed for free models
- *  like gpt-5-nano. Falls back to Cursor bridge on failure. */
+ *  Bypasses the Cursor bridge entirely. Uses auto-discovered free model
+ *  (or explicit override via OPENCODE_CURSOR_TITLE_GEN_MODEL). */
 async function handleTitleGenViaZen(
   modelId: string,
   body: ChatCompletionRequest,
@@ -881,18 +893,23 @@ async function handleTitleGenViaZen(
                 }
                 try {
                   const chunk = JSON.parse(data);
-                  // Normalize chunk format for OpenCode
+                  // Normalize chunk format for OpenCode.
+                  // Strip reasoning/reasoning_details from delta to prevent
+                  // reasoning tokens from leaking into Discord thread titles.
                   const normalized = {
                     id: completionId,
                     object: "chat.completion.chunk",
                     created,
                     model: modelId,
                     choices: (chunk.choices ?? []).map(
-                      (c: { index?: number; delta?: { content?: string }; finish_reason?: string }) => ({
-                        index: c.index ?? 0,
-                        delta: c.delta ?? {},
-                        finish_reason: c.finish_reason ?? null,
-                      }),
+                      (c: { index?: number; delta?: Record<string, unknown>; finish_reason?: string }) => {
+                        const { reasoning, reasoning_details, ...cleanDelta } = c.delta ?? {};
+                        return {
+                          index: c.index ?? 0,
+                          delta: cleanDelta,
+                          finish_reason: c.finish_reason ?? null,
+                        };
+                      },
                     ),
                   };
                   controller.enqueue(encoder.encode(`data: ${JSON.stringify(normalized)}\n\n`));
@@ -981,11 +998,11 @@ async function doHandleChatCompletion(
 
   // Title-generation requests are stateless one-shot calls — they don't need
   // conversation state, checkpoints, MCP tools, or mutexes.
-  // Route to OpenCode Zen's free gpt-5-nano instead of Cursor to avoid
-  // resource_exhausted errors on premium models.
+  // Route to OpenCode Zen auto-discovered free model instead of Cursor to
+  // avoid resource_exhausted errors on premium models.
   const isTitleGen = isTitleGenerationRequest(body.messages);
   if (isTitleGen) {
-    const titleModelId = TITLE_GEN_MODEL;
+    const titleModelId = await resolveTitleGenModel();
     console.log(`[proxy] title-gen request model=${modelId} → zen ${titleModelId}`);
     release();
     return handleTitleGenViaZen(titleModelId, body);
@@ -1933,10 +1950,149 @@ const STALL_RECOVERY_BASE_DELAY_MS = Number(
 const STALL_TIMEOUT_POST_TOOL_MS = Number(
   process.env.OPENCODE_CURSOR_STALL_TIMEOUT_POST_TOOL_MS ?? STALL_TIMEOUT_MS,
 );
-/** Override model for title-gen requests. Defaults to gpt-5-nano (free on
- *  OpenCode Zen — https://opencode.ai/zen/v1) to avoid resource_exhausted
- *  errors on premium Cursor models. */
-const TITLE_GEN_MODEL = process.env.OPENCODE_CURSOR_TITLE_GEN_MODEL ?? "gpt-5-nano";
+/** Override model for title-gen requests. When set, skips auto-discovery
+ *  and uses this model directly. When unset (default), the proxy discovers
+ *  a working free model from OpenCode Zen at startup. */
+const TITLE_GEN_MODEL_OVERRIDE = process.env.OPENCODE_CURSOR_TITLE_GEN_MODEL ?? "";
+
+const ZEN_BASE_URL = process.env.OPENCODE_ZEN_BASE_URL ?? "https://opencode.ai/zen/v1";
+
+/** Cached result of free-model discovery. Undefined = not yet discovered. */
+let resolvedTitleGenModel: string | undefined;
+/** Timestamp (ms) of the last successful discovery. */
+let lastDiscoveryMs = 0;
+/** Re-discover after this many milliseconds (8 hours). */
+const DISCOVERY_TTL_MS = 8 * 60 * 60 * 1000;
+/** Minimum pause between discovery attempts to avoid hammering on repeated failures. */
+const DISCOVERY_COOLDOWN_MS = 60_000;
+let lastDiscoveryAttemptMs = 0;
+
+/** Models known to be fast and good at title-gen. Probed first to speed up
+ *  discovery. This list is purely advisory — if none respond, the full scan
+ *  tests every model on Zen. */
+const ZEN_FAST_TRACK_MODELS = [
+  "minimax-m2.5-free",
+  "nemotron-3-super-free",
+  "big-pickle",
+];
+
+/** Probe a single Zen model with a tiny completion request (no auth).
+ *  Returns the model ID if it responds with HTTP 200 and non-empty content,
+ *  or undefined if it fails (401, timeout, error, etc.). */
+async function probeZenModel(modelId: string): Promise<string | undefined> {
+  try {
+    const start = Date.now();
+    const resp = await fetch(`${ZEN_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: modelId,
+        stream: false,
+        messages: [
+          { role: "system", content: "Reply with exactly: ok" },
+          { role: "user", content: "test" },
+        ],
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!resp.ok) return undefined;
+    const json = await resp.json() as { choices?: Array<{ message?: { content?: string } }> };
+    const content = json.choices?.[0]?.message?.content?.trim();
+    const ms = Date.now() - start;
+    if (!content) return undefined;
+    console.log(`[proxy] title-gen probe: ✅ ${modelId} responded (${ms}ms)`);
+    return modelId;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Probe a list of model IDs concurrently. Returns the first model ID that
+ *  responds successfully, or undefined if all fail. */
+async function raceProbeModels(modelIds: string[]): Promise<string | undefined> {
+  if (modelIds.length === 0) return undefined;
+  const results = await Promise.all(
+    modelIds.map((id) => probeZenModel(id)),
+  );
+  return results.find((r) => r !== undefined);
+}
+
+/** Discover a working free model from Zen by probing all available models
+ *  without authentication. The first model that responds with valid content
+ *  is selected — no naming convention heuristics.
+ *
+ *  Strategy:
+ *  1. Fast-track: probe known-good models first (quick, 1-3 requests).
+ *  2. Full scan: fetch /v1/models, probe ALL models concurrently.
+ *
+ *  Returns undefined if nothing works. */
+async function discoverZenFreeModel(): Promise<string | undefined> {
+  const now = Date.now();
+  if (now - lastDiscoveryAttemptMs < DISCOVERY_COOLDOWN_MS && resolvedTitleGenModel) {
+    return resolvedTitleGenModel;
+  }
+  lastDiscoveryAttemptMs = now;
+
+  // Phase 1: Fast-track — probe known good models
+  console.log(`[proxy] title-gen discovery: fast-track probing ${ZEN_FAST_TRACK_MODELS.join(", ")}`);
+  const fastResult = await raceProbeModels(ZEN_FAST_TRACK_MODELS);
+  if (fastResult) {
+    resolvedTitleGenModel = fastResult;
+    lastDiscoveryMs = Date.now();
+    return fastResult;
+  }
+
+  // Phase 2: Full scan — fetch model list, probe everything
+  try {
+    console.log(`[proxy] title-gen discovery: fast-track failed, scanning all models`);
+    const resp = await fetch(`${ZEN_BASE_URL}/models`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!resp.ok) {
+      console.warn(`[proxy] title-gen discovery: /models returned ${resp.status}`);
+      return resolvedTitleGenModel;
+    }
+    const json = await resp.json() as { data?: Array<{ id: string }> };
+    const allModels = (json.data ?? []).map((m) => m.id);
+
+    // Skip models already tried in fast-track
+    const remaining = allModels.filter((id) => !ZEN_FAST_TRACK_MODELS.includes(id));
+    console.log(`[proxy] title-gen discovery: probing ${remaining.length} remaining models (parallel)`);
+
+    const scanResult = await raceProbeModels(remaining);
+    if (scanResult) {
+      resolvedTitleGenModel = scanResult;
+      lastDiscoveryMs = Date.now();
+      return scanResult;
+    }
+
+    console.warn(`[proxy] title-gen discovery: all ${allModels.length} models failed probe`);
+    return resolvedTitleGenModel;
+  } catch (err) {
+    console.warn(`[proxy] title-gen discovery error: ${err}`);
+    return resolvedTitleGenModel;
+  }
+}
+
+/** Get the title-gen model to use. Resolves from override, cached discovery,
+ *  or triggers a fresh discovery if the cache is stale. */
+async function resolveTitleGenModel(): Promise<string> {
+  // Explicit override always wins
+  if (TITLE_GEN_MODEL_OVERRIDE) return TITLE_GEN_MODEL_OVERRIDE;
+
+  // Use cached model if still fresh
+  if (resolvedTitleGenModel && Date.now() - lastDiscoveryMs < DISCOVERY_TTL_MS) {
+    return resolvedTitleGenModel;
+  }
+
+  // Discover (or re-discover)
+  const discovered = await discoverZenFreeModel();
+  if (discovered) return discovered;
+
+  // Last resort: fall back to gpt-5-nano (will likely 401 but better than crashing)
+  console.warn(`[proxy] title-gen: no free model discovered, falling back to gpt-5-nano`);
+  return "gpt-5-nano";
+}
 
 /** Create an SSE streaming Response that reads from a live bridge.
  *  When retryCtx is provided, automatically retries on "Blob not found" errors
