@@ -74,7 +74,6 @@ import { createHash } from "node:crypto";
 import { resolve as pathResolve } from "node:path";
 import { Mutex } from "./promise-queue";
 import { BridgePool, type BridgeHandle } from "./bridge-pool";
-import { ChatCompletionRequestSchema } from "./schemas";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -194,7 +193,7 @@ const PROXY_IDLE_SHUTDOWN_MS = 10 * 60 * 1000;
 const MAINTENANCE_INTERVAL_MS = 60 * 1000;
 
 // Bridge pool configuration
-const BRIDGE_POOL_MIN_SIZE = Number(process.env.OPENCODE_CURSOR_BRIDGE_POOL_MIN ?? 1);
+const BRIDGE_POOL_MIN_SIZE = Number(process.env.OPENCODE_CURSOR_BRIDGE_POOL_MIN ?? 2);
 const BRIDGE_POOL_MAX_SIZE = Number(process.env.OPENCODE_CURSOR_BRIDGE_POOL_MAX ?? 4);
 const BRIDGE_POOL_ENABLED = process.env.OPENCODE_CURSOR_BRIDGE_POOL_DISABLED !== "1";
 let bridgePool: BridgePool | undefined;
@@ -724,42 +723,9 @@ export async function startProxy(
         if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
           let release: (() => void) | undefined;
           try {
-            let requestBody: unknown;
-            try {
-              requestBody = await req.json();
-            } catch {
-              return new Response(
-                JSON.stringify({
-                  error: {
-                    message: "Invalid JSON in request body",
-                    type: "invalid_request_error",
-                    code: "invalid_json",
-                  },
-                }),
-                { status: 400, headers: { "Content-Type": "application/json" } },
-              );
-            }
-            const parsedBody = ChatCompletionRequestSchema.safeParse(requestBody);
-            if (!parsedBody.success) {
-              return new Response(
-                JSON.stringify({
-                  error: {
-                    message: "Invalid chat completion request body",
-                    type: "invalid_request_error",
-                    code: "invalid_request",
-                    details: parsedBody.error.issues.map((issue: any) => ({
-                      path: issue.path.join("."),
-                      message: issue.message,
-                    })),
-                  },
-                }),
-                { status: 400, headers: { "Content-Type": "application/json" } },
-              );
-            }
-            const body: ChatCompletionRequest = parsedBody.data;
+            const body = (await req.json()) as ChatCompletionRequest;
             const msgSummary = body.messages.map((m) => `${m.role}[${(typeof m.content === 'string' ? m.content : Array.isArray(m.content) ? m.content.length + ' parts' : 'null')?.slice(0, 40)}]`).join(', ');
-            const identityMeta = resolveConversationIdentity(body);
-            console.log(`[proxy] REQUEST model=${body.model} stream=${body.stream} msgs=${body.messages.length} convSource=${identityMeta.source} [${msgSummary.slice(0, 120)}]`);
+            console.log(`[proxy] REQUEST model=${body.model} stream=${body.stream} msgs=${body.messages.length} [${msgSummary.slice(0, 120)}]`);
             if (!proxyAccessTokenProvider) {
               throw new Error("Cursor proxy access token provider not configured");
             }
@@ -769,23 +735,13 @@ export async function startProxy(
             // that cause "Blob not found" errors from concurrent state mutations.
             const convKey = deriveConversationKey(body);
             const mutex = getOrCreateMutex(convKey);
-            const lockWaitStart = Date.now();
             const acquired = await mutex.acquire();
-            const lockAcquiredAt = Date.now();
-            const lockWaitMs = lockAcquiredAt - lockWaitStart;
-            if (lockWaitMs >= 250) {
-              console.warn(`[proxy] mutex wait convKey=${convKey} source=${identityMeta.source} waitMs=${lockWaitMs}`);
-            }
             // Guard against double-release: multiple cleanup paths
             // (closeController, cancel, onClose) can all fire for the same request.
             let released = false;
             release = () => {
               if (released) return;
               released = true;
-              const lockHoldMs = Date.now() - lockAcquiredAt;
-              if (lockHoldMs >= 250) {
-                console.log(`[proxy] mutex hold convKey=${convKey} source=${identityMeta.source} holdMs=${lockHoldMs}`);
-              }
               convMutexLastUsedMs.set(convKey, Date.now());
               acquired();
             };
@@ -1865,20 +1821,16 @@ function sendExecResult(
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
-interface ConversationIdentity {
-  identity: string;
-  source: string;
-}
-
-export function resolveConversationIdentity(body: ChatCompletionRequest): ConversationIdentity {
-  const directIds: Array<[string, string | undefined]> = [
-    ["conversation_id", body.conversation_id],
-    ["thread_id", body.thread_id],
-    ["session_id", body.session_id],
+function buildConversationIdentity(body: ChatCompletionRequest): string {
+  const rawIds = [
+    body.conversation_id,
+    body.thread_id,
+    body.session_id,
+    body.user,
   ];
-  for (const [source, value] of directIds) {
-    if (typeof value === "string" && value.trim().length > 0) {
-      return { identity: `id:${value.trim()}`, source };
+  for (const id of rawIds) {
+    if (typeof id === "string" && id.trim().length > 0) {
+      return `id:${id.trim()}`;
     }
   }
 
@@ -1886,74 +1838,25 @@ export function resolveConversationIdentity(body: ChatCompletionRequest): Conver
     ? body.metadata
     : undefined;
   if (metadata) {
-    const candidateKeys = [
-      "conversation_id",
-      "thread_id",
-      "session_id",
-      "chat_id",
-      "discord_thread_id",
-      "discord_channel_id",
-      "id",
-    ];
+    const candidateKeys = ["conversation_id", "thread_id", "session_id", "chat_id", "id"];
     for (const key of candidateKeys) {
       const value = metadata[key];
       if (typeof value === "string" && value.trim().length > 0) {
-        return { identity: `meta:${key}:${value.trim()}`, source: `metadata:${key}` };
+        return `meta:${key}:${value.trim()}`;
       }
     }
   }
 
-  return { identity: "", source: "fallback" };
-}
-
-/**
- * Build a stable fallback seed when callers don't provide conversation/thread IDs.
- * Uses only early, conversation-shaping anchors so the key stays stable across turns,
- * while reducing collisions between unrelated sessions that share a generic opener.
- */
-function buildFallbackConversationSeed(body: ChatCompletionRequest): string {
-  const anchors: string[] = [];
-  const normalizedUser = typeof body.user === "string" ? body.user.trim() : "";
-  if (normalizedUser) {
-    anchors.push(`user:${normalizedUser}`);
-  }
-  if (Array.isArray(body.tools) && body.tools.length > 0) {
-    const toolNames = body.tools
-      .map((tool) => tool.function?.name?.trim())
-      .filter((name): name is string => typeof name === "string" && name.length > 0)
-      .slice(0, 8)
-      .join(",");
-    if (toolNames) {
-      anchors.push(`tools:${toolNames}`);
-    }
-  }
-
-  const nonSystemMessages = body.messages.filter((message) => message.role !== "system");
-  const earlyAnchors = nonSystemMessages.slice(0, 4);
-  for (const message of earlyAnchors) {
-    const content = textContent(message.content).trim().slice(0, 240);
-    if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-      const toolCallNames = message.tool_calls
-        .map((call) => call.function?.name?.trim())
-        .filter((name): name is string => typeof name === "string" && name.length > 0)
-        .join(",");
-      anchors.push(`assistant_tools:${toolCallNames}`);
-    }
-    const toolCallId = typeof message.tool_call_id === "string" ? message.tool_call_id.trim() : "";
-    if (toolCallId) {
-      anchors.push(`tool_call_id:${toolCallId}`);
-    }
-    anchors.push(`${message.role}:${content}`);
-  }
-  return anchors.join("|");
+  return "";
 }
 
 /** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
 function deriveBridgeKey(modelId: string, body: ChatCompletionRequest): string {
-  const identity = resolveConversationIdentity(body).identity;
+  const identity = buildConversationIdentity(body);
+  const firstUserMsg = body.messages.find((m) => m.role === "user");
+  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   const titleNs = isTitleGenerationRequest(body.messages) ? "title:" : "";
-  const fallbackSeed = buildFallbackConversationSeed(body);
-  const base = identity || `fallback:${titleNs}${fallbackSeed}`;
+  const base = identity || `fallback:${titleNs}${firstUserText}`;
   return createHash("sha256")
     .update(`bridge:${modelId}:${base}`)
     .digest("hex")
@@ -1961,7 +1864,7 @@ function deriveBridgeKey(modelId: string, body: ChatCompletionRequest): string {
 }
 
 /** Detect if this is a title generation request by checking for title-gen system prompt. */
-export function isTitleGenerationRequest(messages: OpenAIMessage[]): boolean {
+function isTitleGenerationRequest(messages: OpenAIMessage[]): boolean {
   const systemText = messages
     .filter((m) => m.role === "system")
     .map((m) => textContent(m.content))
@@ -1974,15 +1877,18 @@ export function isTitleGenerationRequest(messages: OpenAIMessage[]): boolean {
  *
  * Priority:
  * 1) Explicit conversation identity passed by caller (conversation/thread/session/user)
- * 2) Fallback hash from stable message anchors (first non-system turns + user/tools)
+ * 2) Fallback hash from stable message anchors (system + first user text)
  */
-export function deriveConversationKey(body: ChatCompletionRequest): string {
-  const identity = resolveConversationIdentity(body).identity;
+function deriveConversationKey(body: ChatCompletionRequest): string {
+  const identity = buildConversationIdentity(body);
+  const firstUserMsg = body.messages.find((m) => m.role === "user");
+  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   const titleNs = isTitleGenerationRequest(body.messages) ? "title:" : "";
   // NOTE: Do NOT include full system prompt in fallback key — OpenCode's system
   // prompt changes every request (dynamic context, per-turn metadata), which would
   // cause convKey to rotate and lose the stored conversation checkpoint.
-  const fallbackSeed = `${titleNs}${buildFallbackConversationSeed(body)}`;
+  // Only firstUserText is used — it's the stable initial user message.
+  const fallbackSeed = `${titleNs}user:${firstUserText}`;
   const seed = identity || `fallback:${fallbackSeed}`;
   return createHash("sha256")
     .update(`conv:${seed}`)
@@ -2030,8 +1936,10 @@ const PRESSURE_ACTIVE_REQUESTS_THRESHOLD = 4;
 const PRESSURE_ACTIVE_BRIDGES_THRESHOLD = Math.max(4, Math.floor(MAX_ACTIVE_BRIDGES * 0.7));
 const ADMISSION_MAX_ACTIVE_REQUESTS = 12;
 const ADMISSION_MAX_ACTIVE_BRIDGES = MAX_ACTIVE_BRIDGES;
-const STALL_TIMEOUT_MS = Number(process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS ?? 300_000);
+const STALL_TIMEOUT_MS = Number(process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS ?? 45_000);
 const STALL_TICK_MS = Number(process.env.OPENCODE_CURSOR_STALL_TICK_MS ?? 1_000);
+/** Emit a user-visible "still processing" marker before we treat stream as stalled. */
+const STALL_WAIT_NOTICE_MS = Number(process.env.OPENCODE_CURSOR_STALL_WAIT_NOTICE_MS ?? 20_000);
 /** Max internal Run-stream restarts per stall episode (resets after forward progress). */
 const MAX_STALL_RECOVERIES = Number(process.env.OPENCODE_CURSOR_MAX_STALL_RECOVERIES ?? 3);
 /** Base delay before restarting the Run stream after a stall (exponential backoff). */
@@ -2103,9 +2011,6 @@ async function probeZenModel(modelId: string): Promise<string | undefined> {
  *  responds successfully, or undefined if all fail. */
 async function raceProbeModels(modelIds: string[]): Promise<string | undefined> {
   if (modelIds.length === 0) return undefined;
-
-  // Use Promise.race with a wrapper that resolves to the first success.
-  // Failed probes return undefined so they don't win the race.
   const results = await Promise.all(
     modelIds.map((id) => probeZenModel(id)),
   );
@@ -2320,9 +2225,11 @@ function createBridgeStreamResponse(
         let connectError = false;
         let emptyCloseRetry = false;
         let watchdogHandled = false;
+        let stallNoticeSent = false;
         let lastProgressAt = Date.now();
         const markProgress = () => {
           lastProgressAt = Date.now();
+          stallNoticeSent = false;
         };
         const pressureMode = isProxyUnderPressure();
         if (pressureMode) {
@@ -2492,6 +2399,15 @@ function createBridgeStreamResponse(
             return;
           }
           const noProgressMs = Date.now() - lastProgressAt;
+          if (
+            !stallNoticeSent &&
+            !isTitleGenStream &&
+            noProgressMs >= STALL_WAIT_NOTICE_MS &&
+            noProgressMs < resolvedStallTimeoutMs
+          ) {
+            stallNoticeSent = true;
+            sendSSE(makeChunk({ content: "\n[Info: Cursor is still processing; waiting for response...]" }));
+          }
           if (noProgressMs < resolvedStallTimeoutMs) return;
           // In Bun.serve, activeRequestCount often drops to zero as soon as
           // the Response is returned, while stream processing is still active.

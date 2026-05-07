@@ -16,7 +16,6 @@ const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 64_000;
-const MODEL_CACHE_TTL_MS = 30 * 60 * 1000;
 
 const CursorModelDetailsSchema = z.object({
   modelId: z.string(),
@@ -99,65 +98,19 @@ async function fetchCursorUsableModels(
 }
 
 let cachedModels: CursorModel[] | null = null;
-let cachedModelsTimestamp: number | null = null;
 
 export async function getCursorModels(
   apiKey: string,
 ): Promise<CursorModel[]> {
-  if (
-    cachedModels &&
-    cachedModelsTimestamp !== null &&
-    Date.now() - cachedModelsTimestamp < MODEL_CACHE_TTL_MS
-  ) {
-    return cachedModels;
-  }
+  if (cachedModels) return cachedModels;
   const discovered = await fetchCursorUsableModels(apiKey);
   cachedModels = discovered && discovered.length > 0 ? discovered : FALLBACK_MODELS;
-  cachedModelsTimestamp = Date.now();
   return cachedModels;
 }
 
 /** @internal Test-only. */
 export function clearModelCache(): void {
   cachedModels = null;
-  cachedModelsTimestamp = null;
-}
-
-interface ModelLimit {
-  contextWindow: number;
-  maxTokens: number;
-}
-
-const MODEL_LIMIT_TABLE: Record<string, ModelLimit> = {
-  // Claude
-  "claude-default": { contextWindow: 200_000, maxTokens: 64_000 },
-  "claude-opus": { contextWindow: 200_000, maxTokens: 128_000 },
-  // GPT
-  "gpt-5.2": { contextWindow: 400_000, maxTokens: 128_000 },
-  "gpt-5.3": { contextWindow: 400_000, maxTokens: 128_000 },
-  // Gemini
-  "gemini-3.1-pro": { contextWindow: 1_000_000, maxTokens: 64_000 },
-  // Grok
-  "grok-default": { contextWindow: 128_000, maxTokens: 64_000 },
-};
-
-const MODEL_LIMIT_PATTERNS: Array<{ match: (id: string) => boolean; limit: ModelLimit }> = [
-  { match: (id) => /claude.*opus/i.test(id), limit: MODEL_LIMIT_TABLE["claude-opus"]! },
-  { match: (id) => /claude/i.test(id), limit: MODEL_LIMIT_TABLE["claude-default"]! },
-  { match: (id) => /gpt-5\.3/i.test(id), limit: MODEL_LIMIT_TABLE["gpt-5.3"]! },
-  { match: (id) => /gpt-5\.2/i.test(id), limit: MODEL_LIMIT_TABLE["gpt-5.2"]! },
-  { match: (id) => /gemini.*3\.1.*pro/i.test(id), limit: MODEL_LIMIT_TABLE["gemini-3.1-pro"]! },
-  { match: (id) => /grok/i.test(id), limit: MODEL_LIMIT_TABLE["grok-default"]! },
-];
-
-function getModelLimits(modelId: string): ModelLimit {
-  const normalized = modelId.toLowerCase();
-  return (
-    MODEL_LIMIT_PATTERNS.find((pattern) => pattern.match(normalized))?.limit ?? {
-      contextWindow: DEFAULT_CONTEXT_WINDOW,
-      maxTokens: DEFAULT_MAX_TOKENS,
-    }
-  );
 }
 
 function decodeGetUsableModelsResponse(payload: Uint8Array): {
@@ -218,7 +171,7 @@ function normalizeCursorModels(
   return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
 
-export function normalizeSingleModel(model: unknown): CursorModel | null {
+function normalizeSingleModel(model: unknown): CursorModel | null {
   const parsed = CursorModelDetailsSchema.safeParse(model);
   if (!parsed.success) return null;
 
@@ -226,17 +179,16 @@ export function normalizeSingleModel(model: unknown): CursorModel | null {
   const id = details.modelId.trim();
   if (!id) return null;
 
-  const limits = getModelLimits(id);
   return {
     id,
     name: pickDisplayName(details, id),
     reasoning: Boolean(details.thinkingDetails),
-    contextWindow: limits.contextWindow,
-    maxTokens: limits.maxTokens,
+    contextWindow: DEFAULT_CONTEXT_WINDOW,
+    maxTokens: DEFAULT_MAX_TOKENS,
   };
 }
 
-export function pickDisplayName(model: CursorModelDetails, fallbackId: string): string {
+function pickDisplayName(model: CursorModelDetails, fallbackId: string): string {
   const candidates = [
     model.displayName,
     model.displayNameShort,

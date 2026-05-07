@@ -11,14 +11,6 @@ const POLL_BASE_DELAY = 1000;
 const POLL_MAX_DELAY = 10_000;
 const POLL_BACKOFF_MULTIPLIER = 1.2;
 
-function isAbortError(error: unknown): boolean {
-  return (
-    error instanceof DOMException && error.name === "AbortError"
-  ) || (
-    error instanceof Error && error.name === "AbortError"
-  );
-}
-
 export interface CursorAuthParams {
   verifier: string;
   challenge: string;
@@ -61,7 +53,6 @@ export async function pollCursorAuth(
     try {
       const response = await fetch(
         `${CURSOR_POLL_URL}?uuid=${uuid}&verifier=${verifier}`,
-        { signal: AbortSignal.timeout(10_000) },
       );
 
       if (response.status === 404) {
@@ -82,14 +73,7 @@ export async function pollCursorAuth(
       }
 
       throw new Error(`Poll failed: ${response.status}`);
-    } catch (error) {
-      if (isAbortError(error)) {
-        consecutiveErrors++;
-        if (consecutiveErrors >= 3) {
-          throw new Error("Cursor auth polling request timed out");
-        }
-        continue;
-      }
+    } catch {
       consecutiveErrors++;
       if (consecutiveErrors >= 3) {
         throw new Error(
@@ -105,26 +89,18 @@ export async function pollCursorAuth(
 export async function refreshCursorToken(
   refreshToken: string,
 ): Promise<CursorCredentials> {
-  let response: Response;
-  try {
-    response = await fetch(CURSOR_REFRESH_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${refreshToken}`,
-        "Content-Type": "application/json",
-      },
-      body: "{}",
-      signal: AbortSignal.timeout(15_000),
-    });
-  } catch (error) {
-    if (isAbortError(error)) {
-      throw new Error("Cursor token refresh request timed out");
-    }
-    throw error;
-  }
+  const response = await fetch(CURSOR_REFRESH_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${refreshToken}`,
+      "Content-Type": "application/json",
+    },
+    body: "{}",
+  });
 
   if (!response.ok) {
-    throw new Error(`Cursor token refresh failed: status ${response.status}`);
+    const error = await response.text();
+    throw new Error(`Cursor token refresh failed: ${error}`);
   }
 
   const data = (await response.json()) as {
@@ -145,29 +121,22 @@ export async function refreshCursorToken(
  * Falls back to 1 hour from now if token can't be parsed.
  */
 export function getTokenExpiry(token: string): number {
-  // Decode JWT payload without relying on browser-specific atob.
-  // Use Buffer-based base64 decoding compatible with Bun/Node.
   try {
     const parts = token.split(".");
     if (parts.length !== 3 || !parts[1]) {
       return Date.now() + 3600 * 1000;
     }
-
-    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    // Pad to a multiple of 4 characters for base64 decoding
-    const pad = (4 - (b64.length % 4)) % 4;
-    const padded = b64 + "=".repeat(pad);
-    const decodedJson = Buffer.from(padded, "base64").toString("utf8");
-    const decoded = JSON.parse(decodedJson);
+    const decoded = JSON.parse(
+      atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")),
+    );
     if (
       decoded &&
       typeof decoded === "object" &&
-      typeof (decoded as any).exp === "number"
+      typeof decoded.exp === "number"
     ) {
-      return (decoded as any).exp * 1000 - 5 * 60 * 1000;
+      return decoded.exp * 1000 - 5 * 60 * 1000;
     }
   } catch {
   }
-  // Fallback: assume token expiry is 1 hour from now
   return Date.now() + 3600 * 1000;
 }

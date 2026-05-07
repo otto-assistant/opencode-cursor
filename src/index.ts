@@ -17,57 +17,6 @@ import { startProxy, getProxyPort } from "./proxy";
 
 const CURSOR_PROVIDER_ID = "cursor";
 
-interface CursorProviderModel {
-  id: string;
-  providerID: string;
-  api: {
-    id: string;
-    url: string;
-    npm: string;
-  };
-  name: string;
-  capabilities: {
-    temperature: boolean;
-    reasoning: boolean;
-    attachment: boolean;
-    toolcall: boolean;
-    input: {
-      text: boolean;
-      audio: boolean;
-      image: boolean;
-      video: boolean;
-      pdf: boolean;
-    };
-    output: {
-      text: boolean;
-      audio: boolean;
-      image: boolean;
-      video: boolean;
-      pdf: boolean;
-    };
-    interleaved: boolean;
-  };
-  cost: ModelCost;
-  limit: {
-    context: number;
-    output: number;
-  };
-  status: "active";
-  options: Record<string, never>;
-  headers: Record<string, never>;
-  release_date: string;
-  variants: Record<string, never>;
-}
-
-type CursorProviderModels = Record<string, CursorProviderModel>;
-type EmptyAuthLoaderResult = Record<string, never>;
-
-interface CursorAuthLoaderResult {
-  baseURL: string;
-  apiKey: string;
-  fetch(requestInput: RequestInfo | URL, init?: RequestInit): Promise<Response>;
-}
-
 /**
  * OpenCode plugin that provides Cursor authentication and model access.
  * Register in opencode.json: { "plugin": ["@otto-assistant/opencode-cursor-oauth"] }
@@ -79,7 +28,7 @@ export const CursorAuthPlugin: Plugin = async (
     auth: {
       provider: CURSOR_PROVIDER_ID,
 
-      async loader(getAuth, provider): Promise<CursorAuthLoaderResult | EmptyAuthLoaderResult> {
+      async loader(getAuth, provider) {
         const auth = await getAuth();
         if (!auth || auth.type !== "oauth") return {};
 
@@ -129,7 +78,6 @@ export const CursorAuthPlugin: Plugin = async (
         }, models);
 
         if (provider) {
-          // TODO: replace `any` once plugin API exposes a typed `models` field.
           (provider as any).models = buildCursorProviderModels(models, port);
         }
 
@@ -199,7 +147,7 @@ export const CursorAuthPlugin: Plugin = async (
 function buildCursorProviderModels(
   models: CursorModel[],
   port: number,
-): CursorProviderModels {
+): Record<string, any> {
   return Object.fromEntries(
     models.map((model) => [
       model.id,
@@ -330,9 +278,9 @@ const MODEL_COST_PATTERNS: Array<{ match: (id: string) => boolean; cost: ModelCo
   { match: (id) => /kimi/i.test(id),                 cost: MODEL_COST_TABLE["kimi-k2.5"]! },
 ];
 
-export const DEFAULT_COST: ModelCost = { input: 3, output: 15, cache: { read: 0.3, write: 0 } };
+const DEFAULT_COST: ModelCost = { input: 3, output: 15, cache: { read: 0.3, write: 0 } };
 
-export function estimateModelCost(modelId: string): ModelCost {
+function estimateModelCost(modelId: string): ModelCost {
   const normalized = modelId.toLowerCase();
   const exact = MODEL_COST_TABLE[normalized];
   if (exact) return exact;

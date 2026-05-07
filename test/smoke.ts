@@ -8,7 +8,7 @@ import {
 } from "../src/proto/agent_pb";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
-type RunMode = "immediate-close" | "stall-once-then-close" | "delayed-close";
+type RunMode = "immediate-close" | "stall-once-then-close";
 
 interface TestModules {
   startProxy: typeof import("../src/proxy").startProxy;
@@ -31,7 +31,6 @@ interface TestCursorBackend {
   getDiscoveryRequestBodies: () => Uint8Array[];
   getRefreshAuthHeaders: () => string[];
   setRunMode: (mode: RunMode) => void;
-  setRunDelayMs: (delayMs: number) => void;
   getRunRequestCount: () => number;
   close: () => Promise<void>;
 }
@@ -77,7 +76,6 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let runMode: RunMode = "immediate-close";
   let runRequestCount = 0;
   let runStallConsumed = false;
-  let runDelayMs = 450;
   let discoveredModels: Array<{ id: string; name: string; reasoning?: boolean }> = [
     { id: "composer-2", name: "Composer 2", reasoning: true },
   ];
@@ -133,16 +131,6 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
             // ignore
           }
         }, 3_000);
-        return;
-      }
-      if (runMode === "delayed-close") {
-        setTimeout(() => {
-          try {
-            stream.end();
-          } catch {
-            // ignore
-          }
-        }, runDelayMs);
         return;
       }
       stream.end();
@@ -230,9 +218,6 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       runMode = mode;
       runStallConsumed = false;
       runRequestCount = 0;
-    },
-    setRunDelayMs(delayMs) {
-      runDelayMs = delayMs;
     },
     getRunRequestCount() {
       return runRequestCount;
@@ -775,114 +760,6 @@ async function testPoolSequentialRequests() {
   console.log("[test] Pool sequential requests OK");
 }
 
-async function testConversationKeyingAvoidsUserWideSerialization(
-  modules: TestModules,
-  backend: TestCursorBackend,
-) {
-  console.log("[test] Testing conversation keying across thread identities...");
-  modules.stopProxy();
-  backend.setRunDelayMs(300);
-  backend.setRunMode("delayed-close");
-
-  const port = await modules.startProxy(async () => "test-token");
-
-  const post = (threadId: string, text: string) =>
-    fetch(`http://localhost:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "composer-2",
-        stream: false,
-        user: "discord-user-1",
-        thread_id: threadId,
-        messages: [{ role: "user", content: text }],
-      }),
-      signal: AbortSignal.timeout(8_000),
-    });
-
-  try {
-    const concurrentStart = Date.now();
-    const [resA, resB] = await Promise.all([
-      post("thread-a", "hello A"),
-      post("thread-b", "hello B"),
-    ]);
-    const concurrentMs = Date.now() - concurrentStart;
-    assertEqual(resA.status, 200, "Expected 200 for thread-a request");
-    assertEqual(resB.status, 200, "Expected 200 for thread-b request");
-    assert(
-      concurrentMs < 750,
-      `Expected different thread IDs to avoid serialization (elapsed=${concurrentMs}ms)`,
-    );
-
-    const seqStart = Date.now();
-    const resC = await post("thread-shared", "hello C");
-    const resD = await post("thread-shared", "hello D");
-    const seqMs = Date.now() - seqStart;
-    assertEqual(resC.status, 200, "Expected 200 for shared-thread request C");
-    assertEqual(resD.status, 200, "Expected 200 for shared-thread request D");
-    assert(
-      seqMs >= 500,
-      `Expected shared-thread requests to take at least two delayed runs (elapsed=${seqMs}ms)`,
-    );
-  } finally {
-    backend.setRunMode("immediate-close");
-    modules.stopProxy();
-  }
-  console.log("[test] Conversation keying behavior OK");
-}
-
-async function testConversationFallbackKeyingUsesHistoryAnchors(
-  modules: TestModules,
-  backend: TestCursorBackend,
-) {
-  console.log("[test] Testing fallback conversation keying with shared openers...");
-  modules.stopProxy();
-  backend.setRunDelayMs(300);
-  backend.setRunMode("delayed-close");
-
-  const port = await modules.startProxy(async () => "test-token");
-
-  const post = (messages: Array<{ role: string; content: string }>) =>
-    fetch(`http://localhost:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "composer-2",
-        stream: false,
-        user: "discord-user-1",
-        messages,
-      }),
-      signal: AbortSignal.timeout(8_000),
-    });
-
-  try {
-    const concurrentStart = Date.now();
-    const [resA, resB] = await Promise.all([
-      post([
-        { role: "user", content: "shared opener" },
-        { role: "assistant", content: "context A" },
-        { role: "user", content: "followup A" },
-      ]),
-      post([
-        { role: "user", content: "shared opener" },
-        { role: "assistant", content: "context B" },
-        { role: "user", content: "followup B" },
-      ]),
-    ]);
-    const concurrentMs = Date.now() - concurrentStart;
-    assertEqual(resA.status, 200, "Expected 200 for fallback request A");
-    assertEqual(resB.status, 200, "Expected 200 for fallback request B");
-    assert(
-      concurrentMs < 750,
-      `Expected divergent history anchors to avoid fallback serialization (elapsed=${concurrentMs}ms)`,
-    );
-  } finally {
-    backend.setRunMode("immediate-close");
-    modules.stopProxy();
-  }
-  console.log("[test] Fallback conversation keying behavior OK");
-}
-
 async function testStreamingWatchdogRecoversFromStalledRun(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -942,8 +819,6 @@ async function main() {
     await testPersistentBridgeSessionIsolation();
     await testPoolRecoveryAfterServerRestart();
     await testPoolSequentialRequests();
-    await testConversationKeyingAvoidsUserWideSerialization(modules, backend);
-    await testConversationFallbackKeyingUsesHistoryAnchors(modules, backend);
     await testStreamingWatchdogRecoversFromStalledRun(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
