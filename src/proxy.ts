@@ -179,6 +179,8 @@ interface StoredConversation {
 }
 
 const conversationStates = new Map<string, StoredConversation>();
+/** Last emission time of the user-visible stall wait notice per convKey (tool resumes use new HTTP streams). */
+const lastStallWaitNoticeMsByConv = new Map<string, number>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 const MUTEX_TTL_MS = 30 * 60 * 1000;
 const ACTIVE_BRIDGE_TTL_MS = Number(process.env.OPENCODE_CURSOR_ACTIVE_BRIDGE_TTL_MS ?? 90 * 1000);
@@ -307,6 +309,7 @@ function evictStaleConversations(): number {
   for (const [key, stored] of conversationStates) {
     if (now - stored.lastAccessMs > CONVERSATION_TTL_MS) {
       conversationStates.delete(key);
+      lastStallWaitNoticeMsByConv.delete(key);
       evicted += 1;
     }
   }
@@ -365,6 +368,7 @@ function enforceGlobalConversationBlobBudget(): void {
     if (totalBytes <= MAX_TOTAL_CONVERSATION_BLOB_BYTES) break;
     totalBytes -= estimateBlobStoreBytes(stored.blobStore);
     conversationStates.delete(key);
+    lastStallWaitNoticeMsByConv.delete(key);
   }
 }
 
@@ -816,6 +820,7 @@ export function stopProxy(): void {
   }
   activeBridges.clear();
   conversationStates.clear();
+  lastStallWaitNoticeMsByConv.clear();
   convMutexes.clear();
   convMutexLastUsedMs.clear();
   systemBlobCache.clear();
@@ -1051,6 +1056,7 @@ async function doHandleChatCompletion(
   // "Blob not found" errors from stale checkpoint references.
   if (stored?.checkpoint && turns.length === 0 && toolResults.length === 0) {
     conversationStates.delete(convKey);
+    lastStallWaitNoticeMsByConv.delete(convKey);
     stored = undefined;
   }
   if (!stored) {
@@ -1940,6 +1946,10 @@ const STALL_TIMEOUT_MS = Number(process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS ?? 
 const STALL_TICK_MS = Number(process.env.OPENCODE_CURSOR_STALL_TICK_MS ?? 1_000);
 /** Emit a user-visible "still processing" marker before we treat stream as stalled. */
 const STALL_WAIT_NOTICE_MS = Number(process.env.OPENCODE_CURSOR_STALL_WAIT_NOTICE_MS ?? 20_000);
+/** Minimum gap between those notices for the same conversation across back-to-back tool/MCP resumes. */
+const STALL_WAIT_NOTICE_CONV_INTERVAL_MS = Number(
+  process.env.OPENCODE_CURSOR_STALL_WAIT_NOTICE_CONV_INTERVAL_MS ?? 120_000,
+);
 /** Max internal Run-stream restarts per stall episode (resets after forward progress). */
 const MAX_STALL_RECOVERIES = Number(process.env.OPENCODE_CURSOR_MAX_STALL_RECOVERIES ?? 3);
 /** Base delay before restarting the Run stream after a stall (exponential backoff). */
@@ -2146,6 +2156,8 @@ function createBridgeStreamResponse(
   // Shared stream-lifecycle flag used by both `cancel()` and async bridge callbacks.
   // Must live outside `start()` so retries/enqueues stop immediately after client abort.
   let closed = false;
+  /** At most one user-visible stall wait notice per streaming HTTP response (including internal stall recoveries). */
+  let stallWaitUserNoticeEmittedThisResponse = false;
   /** Stall recovery schedules a backoff before restarting the bridge; abort must clear it. */
   let stallRecoveryBackoffTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -2225,11 +2237,9 @@ function createBridgeStreamResponse(
         let connectError = false;
         let emptyCloseRetry = false;
         let watchdogHandled = false;
-        let stallNoticeSent = false;
         let lastProgressAt = Date.now();
         const markProgress = () => {
           lastProgressAt = Date.now();
-          stallNoticeSent = false;
         };
         const pressureMode = isProxyUnderPressure();
         if (pressureMode) {
@@ -2400,13 +2410,18 @@ function createBridgeStreamResponse(
           }
           const noProgressMs = Date.now() - lastProgressAt;
           if (
-            !stallNoticeSent &&
+            !stallWaitUserNoticeEmittedThisResponse &&
             !isTitleGenStream &&
             noProgressMs >= STALL_WAIT_NOTICE_MS &&
             noProgressMs < resolvedStallTimeoutMs
           ) {
-            stallNoticeSent = true;
-            sendSSE(makeChunk({ content: "\n[Info: Cursor is still processing; waiting for response...]" }));
+            stallWaitUserNoticeEmittedThisResponse = true;
+            const nowMs = Date.now();
+            const lastMs = lastStallWaitNoticeMsByConv.get(convKey) ?? 0;
+            if (nowMs - lastMs >= STALL_WAIT_NOTICE_CONV_INTERVAL_MS) {
+              lastStallWaitNoticeMsByConv.set(convKey, nowMs);
+              sendSSE(makeChunk({ content: "\n[Info: Cursor is still processing; waiting for response...]" }));
+            }
           }
           if (noProgressMs < resolvedStallTimeoutMs) return;
           // In Bun.serve, activeRequestCount often drops to zero as soon as
