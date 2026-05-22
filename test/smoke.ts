@@ -30,6 +30,12 @@ interface TestCursorBackend {
   getDiscoveryAuthHeaders: () => string[];
   getDiscoveryRequestBodies: () => Uint8Array[];
   getRefreshAuthHeaders: () => string[];
+  /**
+   * Override the value the refresh server places in `refreshToken` of a
+   * successful (200) response. Pass `null` to omit the field entirely.
+   * `undefined` (the default) restores the canonical `"valid-refresh"` echo.
+   */
+  setRefreshResponseRefreshToken: (value: string | null | undefined) => void;
   setRunMode: (mode: RunMode) => void;
   getRunRequestCount: () => number;
   close: () => Promise<void>;
@@ -83,6 +89,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   const discoveryRequestBodies: Uint8Array[] = [];
   const refreshAuthHeaders: string[] = [];
 
+  let refreshResponseRefreshTokenOverride: string | null | undefined = undefined;
   const refreshServer = http.createServer((req, res) => {
     if (req.method !== "POST" || req.url !== "/auth/exchange_user_api_key") {
       res.writeHead(404);
@@ -99,13 +106,16 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       return;
     }
 
+    const body: Record<string, string> = {
+      accessToken: makeJwt(Math.floor(Date.now() / 1000) + 3600),
+    };
+    if (refreshResponseRefreshTokenOverride === undefined) {
+      body.refreshToken = "valid-refresh";
+    } else if (refreshResponseRefreshTokenOverride !== null) {
+      body.refreshToken = refreshResponseRefreshTokenOverride;
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        accessToken: makeJwt(Math.floor(Date.now() / 1000) + 3600),
-        refreshToken: "valid-refresh",
-      }),
-    );
+    res.end(JSON.stringify(body));
   });
   await new Promise<void>((resolve) => refreshServer.listen(0, "127.0.0.1", resolve));
   const refreshPort = (refreshServer.address() as AddressInfo).port;
@@ -213,6 +223,9 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     },
     getRefreshAuthHeaders() {
       return [...refreshAuthHeaders];
+    },
+    setRefreshResponseRefreshToken(value) {
+      refreshResponseRefreshTokenOverride = value;
     },
     setRunMode(mode) {
       runMode = mode;
@@ -483,6 +496,166 @@ async function testExpiredTokenRefreshBeforeDiscovery(
 
   modules.stopProxy();
   console.log("[test] Refresh-before-discovery OK");
+}
+
+async function testRefreshFailureKeepsProviderListable(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing refresh-failure does not break loader...");
+  modules.clearModelCache();
+  backend.resetObservations();
+
+  // Refresh server returns 401 for any token != "valid-refresh".
+  const authState = {
+    type: "oauth" as const,
+    access: "expired-access",
+    refresh: "totally-revoked",
+    expires: Date.now() - 10_000,
+  };
+  const writes: Array<unknown> = [];
+  const hooks = await modules.CursorAuthPlugin({
+    client: {
+      auth: {
+        set: async ({ body }: any) => {
+          writes.push(body);
+        },
+      },
+    },
+  } as any);
+  const provider = { models: { stale: { id: "stale" } } } as any;
+
+  let threw: unknown = null;
+  let result: unknown;
+  try {
+    result = await hooks.auth!.loader(async () => authState, provider);
+  } catch (err) {
+    threw = err;
+  }
+
+  assert(
+    threw === null,
+    `Loader must not throw on refresh failure; got: ${String(threw)}`,
+  );
+  assertEqual(
+    JSON.stringify(result),
+    "{}",
+    "Loader should return empty config on refresh failure",
+  );
+  assertEqual(
+    writes.length,
+    0,
+    "Loader must not persist new auth on refresh failure",
+  );
+  assertEqual(
+    backend.getRefreshAuthHeaders().length,
+    1,
+    "Refresh endpoint should have been called exactly once",
+  );
+
+  modules.stopProxy();
+  console.log("[test] Refresh-failure-non-throw OK");
+}
+
+async function testRefreshPreservesOriginalWhenResponseRefreshIsNotJwt(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log(
+    "[test] Testing refresh keeps original refresh when response refreshToken is not a JWT...",
+  );
+  modules.clearModelCache();
+  backend.resetObservations();
+  backend.setDiscoveryMode("success");
+  backend.setDiscoveredModels([
+    { id: "fresh-model", name: "Fresh Model", reasoning: true },
+  ]);
+  // Cursor sometimes echoes an API-key string as `refreshToken`. The plugin
+  // must NOT adopt it — doing so clobbers the long-lived OAuth JWT and
+  // permanently breaks subsequent refreshes.
+  backend.setRefreshResponseRefreshToken("key_some_short_lived_api_key");
+
+  let authState = {
+    type: "oauth" as const,
+    access: "expired-access",
+    refresh: "valid-refresh",
+    expires: Date.now() - 10_000,
+  };
+  const writes: Array<{ access: string; refresh: string; expires: number }> = [];
+  const hooks = await modules.CursorAuthPlugin({
+    client: {
+      auth: {
+        set: async ({ body }: any) => {
+          writes.push(body);
+          authState = body;
+        },
+      },
+    },
+  } as any);
+  const provider = { models: {} as Record<string, unknown> } as any;
+
+  await hooks.auth!.loader(async () => authState, provider);
+
+  assertEqual(writes.length, 1, "Expected refreshed auth to be persisted once");
+  assertEqual(
+    writes[0]!.refresh,
+    "valid-refresh",
+    "Original refresh JWT must be preserved when response refreshToken is not a JWT",
+  );
+
+  // Reset for downstream tests.
+  backend.setRefreshResponseRefreshToken(undefined);
+  modules.stopProxy();
+  console.log("[test] Non-JWT refresh preservation OK");
+}
+
+async function testRefreshRotatesWhenResponseRefreshIsJwt(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log(
+    "[test] Testing refresh rotates refresh token when response gives a new JWT...",
+  );
+  modules.clearModelCache();
+  backend.resetObservations();
+  backend.setDiscoveryMode("success");
+  backend.setDiscoveredModels([
+    { id: "fresh-model", name: "Fresh Model", reasoning: true },
+  ]);
+  const newRefreshJwt = makeJwt(Math.floor(Date.now() / 1000) + 30 * 86_400);
+  backend.setRefreshResponseRefreshToken(newRefreshJwt);
+
+  let authState = {
+    type: "oauth" as const,
+    access: "expired-access",
+    refresh: "valid-refresh",
+    expires: Date.now() - 10_000,
+  };
+  const writes: Array<{ access: string; refresh: string; expires: number }> = [];
+  const hooks = await modules.CursorAuthPlugin({
+    client: {
+      auth: {
+        set: async ({ body }: any) => {
+          writes.push(body);
+          authState = body;
+        },
+      },
+    },
+  } as any);
+  const provider = { models: {} as Record<string, unknown> } as any;
+
+  await hooks.auth!.loader(async () => authState, provider);
+
+  assertEqual(writes.length, 1, "Expected refreshed auth to be persisted once");
+  assertEqual(
+    writes[0]!.refresh,
+    newRefreshJwt,
+    "A JWT-shaped refresh token in the response must be adopted",
+  );
+
+  backend.setRefreshResponseRefreshToken(undefined);
+  modules.stopProxy();
+  console.log("[test] JWT refresh rotation OK");
 }
 
 async function testDiscoveryFallbackAndSuccess(
@@ -815,6 +988,9 @@ async function main() {
     await testPluginShape(modules);
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
+    await testRefreshFailureKeepsProviderListable(modules, backend);
+    await testRefreshPreservesOriginalWhenResponseRefreshIsNotJwt(modules, backend);
+    await testRefreshRotatesWhenResponseRefreshIsJwt(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     await testPersistentBridgeSessionIsolation();
     await testPoolRecoveryAfterServerRestart();

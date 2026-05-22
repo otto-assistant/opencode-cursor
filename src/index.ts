@@ -11,6 +11,7 @@ import {
   getTokenExpiry,
   pollCursorAuth,
   refreshCursorToken,
+  RefreshTokenInvalidError,
 } from "./auth";
 import { getCursorModels, type CursorModel } from "./models";
 import { startProxy, getProxyPort } from "./proxy";
@@ -32,20 +33,34 @@ export const CursorAuthPlugin: Plugin = async (
         const auth = await getAuth();
         if (!auth || auth.type !== "oauth") return {};
 
-        // Ensure we have a valid access token, refreshing if expired
+        // Ensure we have a valid access token, refreshing if expired.
+        // Refresh failures must NOT throw out of the loader, or OpenCode's
+        // provider.list() fails entirely and every Discord /model and /login
+        // call surfaces "Failed to fetch providers". Return {} so the Cursor
+        // provider remains visible-but-unauthenticated and the user can
+        // re-run /login cursor to start the OAuth flow.
         let accessToken = auth.access;
         if (!accessToken || auth.expires < Date.now()) {
-          const refreshed = await refreshCursorToken(auth.refresh);
-          await input.client.auth.set({
-            path: { id: CURSOR_PROVIDER_ID },
-            body: {
-              type: "oauth",
-              refresh: refreshed.refresh,
-              access: refreshed.access,
-              expires: refreshed.expires,
-            },
-          });
-          accessToken = refreshed.access;
+          try {
+            const refreshed = await refreshCursorToken(auth.refresh);
+            await input.client.auth.set({
+              path: { id: CURSOR_PROVIDER_ID },
+              body: {
+                type: "oauth",
+                refresh: refreshed.refresh,
+                access: refreshed.access,
+                expires: refreshed.expires,
+              },
+            });
+            accessToken = refreshed.access;
+          } catch (err) {
+            const permanent = err instanceof RefreshTokenInvalidError;
+            const summary = err instanceof Error ? err.message : String(err);
+            console.error(
+              `[opencode-cursor] Cursor token refresh ${permanent ? "rejected (re-login required)" : "failed (transient)"}: ${summary}`,
+            );
+            return {};
+          }
         }
 
         const models = await getCursorModels(accessToken);

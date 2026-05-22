@@ -86,6 +86,31 @@ export async function pollCursorAuth(
   throw new Error("Cursor authentication polling timeout");
 }
 
+/**
+ * RefreshTokenInvalidError — Cursor refused the refresh token (4xx).
+ * The stored credential is unusable; re-login is required.
+ * Thrown so callers can distinguish permanent failures from transient ones
+ * (5xx, network errors) and stop retrying / mark the provider unauthenticated.
+ */
+export class RefreshTokenInvalidError extends Error {
+  readonly status: number;
+  readonly body: string;
+  constructor(status: number, body: string) {
+    super(
+      `Cursor token refresh rejected (HTTP ${status}): ${body || "<empty body>"}`,
+    );
+    this.name = "RefreshTokenInvalidError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
+function looksLikeJwt(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const parts = value.split(".");
+  return parts.length === 3 && parts.every((p) => p.length > 0);
+}
+
 export async function refreshCursorToken(
   refreshToken: string,
 ): Promise<CursorCredentials> {
@@ -99,18 +124,39 @@ export async function refreshCursorToken(
   });
 
   if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Cursor token refresh failed: ${error}`);
+    const body = await response.text().catch(() => "");
+    // 4xx (except 408/429) = permanent: refresh token is invalid/revoked/expired.
+    // 5xx, 408, 429 = transient: server-side or rate-limit, safe to retry.
+    const isPermanent =
+      response.status >= 400 &&
+      response.status < 500 &&
+      response.status !== 408 &&
+      response.status !== 429;
+    if (isPermanent) {
+      throw new RefreshTokenInvalidError(response.status, body);
+    }
+    throw new Error(
+      `Cursor token refresh failed (HTTP ${response.status}): ${body || "<empty body>"}`,
+    );
   }
 
   const data = (await response.json()) as {
     accessToken: string;
-    refreshToken: string;
+    refreshToken?: string;
   };
+
+  // Cursor's /auth/exchange_user_api_key historically returns an API key
+  // string (not a JWT) for `accessToken`, and sometimes echoes the value
+  // back as `refreshToken`. Persisting that as the new refresh would clobber
+  // the original long-lived OAuth JWT and break every subsequent refresh.
+  // Only adopt `data.refreshToken` when it actually looks like a JWT.
+  const nextRefresh = looksLikeJwt(data.refreshToken)
+    ? data.refreshToken
+    : refreshToken;
 
   return {
     access: data.accessToken,
-    refresh: data.refreshToken || refreshToken,
+    refresh: nextRefresh,
     expires: getTokenExpiry(data.accessToken),
   };
 }
