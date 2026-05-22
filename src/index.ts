@@ -18,6 +18,101 @@ import { startProxy, getProxyPort } from "./proxy";
 
 const CURSOR_PROVIDER_ID = "cursor";
 
+type CursorOAuthAuth = {
+  type: "oauth";
+  access?: string;
+  refresh: string;
+  expires: number;
+};
+
+async function loadCursorRuntime(
+  input: PluginInput,
+  getAuth: () => Promise<unknown>,
+  provider?: unknown,
+): Promise<
+  | {
+      port: number;
+      providerModels: Record<string, any>;
+    }
+  | undefined
+> {
+  const auth = await getAuth();
+  if (!isCursorOAuthAuth(auth)) return undefined;
+
+  // Ensure we have a valid access token, refreshing if expired.
+  // Refresh failures must NOT throw out of provider/auth hooks, or
+  // OpenCode's provider.list() fails entirely and every Discord /model and
+  // /login call surfaces "Failed to fetch providers". Return undefined so
+  // Cursor is simply treated as unavailable until the user re-runs login.
+  let accessToken = auth.access;
+  if (!accessToken || auth.expires < Date.now()) {
+    try {
+      const refreshed = await refreshCursorToken(auth.refresh);
+      await input.client.auth.set({
+        path: { id: CURSOR_PROVIDER_ID },
+        body: {
+          type: "oauth",
+          refresh: refreshed.refresh,
+          access: refreshed.access,
+          expires: refreshed.expires,
+        },
+      });
+      accessToken = refreshed.access;
+    } catch (err) {
+      const permanent = err instanceof RefreshTokenInvalidError;
+      const summary = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[opencode-cursor] Cursor token refresh ${permanent ? "rejected (re-login required)" : "failed (transient)"}: ${summary}`,
+      );
+      return undefined;
+    }
+  }
+
+  const models = await getCursorModels(accessToken);
+
+  // startProxy() is idempotent: if the proxy is already running on the same
+  // port it returns immediately. If it was stopped, it binds a new random port.
+  const port = await startProxy(async () => {
+    const currentAuth = await getAuth();
+    if (!isCursorOAuthAuth(currentAuth)) {
+      throw new Error("Cursor auth not configured");
+    }
+
+    if (!currentAuth.access || currentAuth.expires < Date.now()) {
+      const refreshed = await refreshCursorToken(currentAuth.refresh);
+      await input.client.auth.set({
+        path: { id: CURSOR_PROVIDER_ID },
+        body: {
+          type: "oauth",
+          refresh: refreshed.refresh,
+          access: refreshed.access,
+          expires: refreshed.expires,
+        },
+      });
+      return refreshed.access;
+    }
+
+    return currentAuth.access;
+  }, models);
+
+  const providerModels = buildCursorProviderModels(models, port);
+  if (provider) {
+    (provider as any).models = providerModels;
+  }
+
+  return { port, providerModels };
+}
+
+function isCursorOAuthAuth(auth: unknown): auth is CursorOAuthAuth {
+  return (
+    !!auth &&
+    typeof auth === "object" &&
+    (auth as { type?: unknown }).type === "oauth" &&
+    typeof (auth as { refresh?: unknown }).refresh === "string" &&
+    typeof (auth as { expires?: unknown }).expires === "number"
+  );
+}
+
 /**
  * OpenCode plugin that provides Cursor authentication and model access.
  * Register in opencode.json: { "plugin": ["@otto-assistant/opencode-cursor-oauth"] }
@@ -26,78 +121,27 @@ export const CursorAuthPlugin: Plugin = async (
   input: PluginInput,
 ): Promise<Hooks> => {
   return {
+    provider: {
+      id: CURSOR_PROVIDER_ID,
+      async models(provider, ctx) {
+        const runtime = await loadCursorRuntime(
+          input,
+          async () => ctx.auth,
+          provider,
+        );
+        return runtime?.providerModels ?? {};
+      },
+    },
+
     auth: {
       provider: CURSOR_PROVIDER_ID,
 
       async loader(getAuth, provider) {
-        const auth = await getAuth();
-        if (!auth || auth.type !== "oauth") return {};
-
-        // Ensure we have a valid access token, refreshing if expired.
-        // Refresh failures must NOT throw out of the loader, or OpenCode's
-        // provider.list() fails entirely and every Discord /model and /login
-        // call surfaces "Failed to fetch providers". Return {} so the Cursor
-        // provider remains visible-but-unauthenticated and the user can
-        // re-run /login cursor to start the OAuth flow.
-        let accessToken = auth.access;
-        if (!accessToken || auth.expires < Date.now()) {
-          try {
-            const refreshed = await refreshCursorToken(auth.refresh);
-            await input.client.auth.set({
-              path: { id: CURSOR_PROVIDER_ID },
-              body: {
-                type: "oauth",
-                refresh: refreshed.refresh,
-                access: refreshed.access,
-                expires: refreshed.expires,
-              },
-            });
-            accessToken = refreshed.access;
-          } catch (err) {
-            const permanent = err instanceof RefreshTokenInvalidError;
-            const summary = err instanceof Error ? err.message : String(err);
-            console.error(
-              `[opencode-cursor] Cursor token refresh ${permanent ? "rejected (re-login required)" : "failed (transient)"}: ${summary}`,
-            );
-            return {};
-          }
-        }
-
-        const models = await getCursorModels(accessToken);
-
-        // startProxy() is idempotent: if the proxy is already running on the
-        // same port it returns immediately.  If it was stopped (e.g. idle
-        // shutdown before the fix, or a future bug), it binds a new random
-        // port and we update provider.models + baseURL accordingly.
-        const port = await startProxy(async () => {
-          const currentAuth = await getAuth();
-          if (currentAuth.type !== "oauth") {
-            throw new Error("Cursor auth not configured");
-          }
-
-          if (!currentAuth.access || currentAuth.expires < Date.now()) {
-            const refreshed = await refreshCursorToken(currentAuth.refresh);
-            await input.client.auth.set({
-              path: { id: CURSOR_PROVIDER_ID },
-              body: {
-                type: "oauth",
-                refresh: refreshed.refresh,
-                access: refreshed.access,
-                expires: refreshed.expires,
-              },
-            });
-            return refreshed.access;
-          }
-
-          return currentAuth.access;
-        }, models);
-
-        if (provider) {
-          (provider as any).models = buildCursorProviderModels(models, port);
-        }
+        const runtime = await loadCursorRuntime(input, getAuth, provider);
+        if (!runtime) return {};
 
         return {
-          baseURL: `http://localhost:${port}/v1`,
+          baseURL: `http://localhost:${runtime.port}/v1`,
           apiKey: "cursor-proxy",
           async fetch(
             requestInput: RequestInfo | URL,
