@@ -18,6 +18,7 @@ import {
 } from "./auth";
 import { getCursorModels, FALLBACK_MODELS, type CursorModel } from "./models";
 import { startProxy, getProxyPort, getCursorProxyBaseUrl } from "./proxy";
+import { log } from "./log";
 
 const CURSOR_PROVIDER_ID = "cursor";
 const DEFAULT_MODEL_ID = "default";
@@ -71,7 +72,7 @@ async function loadCursorRuntime(
     } catch (err) {
       const permanent = err instanceof RefreshTokenInvalidError;
       const summary = err instanceof Error ? err.message : String(err);
-      console.error(
+      log.error(
         `[opencode-cursor] Cursor token refresh ${permanent ? "rejected (re-login required)" : "failed (transient)"}: ${summary}`,
       );
       return undefined;

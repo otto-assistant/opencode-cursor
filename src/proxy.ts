@@ -74,6 +74,7 @@ import { createHash } from "node:crypto";
 import { resolve as pathResolve } from "node:path";
 import { Mutex } from "./promise-queue";
 import { BridgePool, type BridgeHandle } from "./bridge-pool";
+import { log } from "./log";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -265,7 +266,7 @@ function shouldRejectByAdmissionControl(): boolean {
 function setActiveBridge(bridgeKey: string, active: ActiveBridge): boolean {
   if (activeBridges.size >= MAX_ACTIVE_BRIDGES && !activeBridges.has(bridgeKey)) {
     proxyTelemetry.capRejects += 1;
-    console.warn(`[proxy] active bridge cap reached (${MAX_ACTIVE_BRIDGES}), rejecting new bridge`);
+    log.warn(`[proxy] active bridge cap reached (${MAX_ACTIVE_BRIDGES}), rejecting new bridge`);
     killActiveBridge(active);
     return false;
   }
@@ -436,7 +437,7 @@ function runMaintenanceSweep(): void {
   if (staleConversations > 0 || staleMutexes > 0 || staleBridges > 0 || now - proxyTelemetry.lastSnapshotMs > 5 * 60 * 1000) {
     proxyTelemetry.lastSnapshotMs = now;
     const poolInfo = bridgePool ? ` pool(idle/active/total)=${bridgePool.stats().idle}/${bridgePool.stats().active}/${bridgePool.stats().total}` : "";
-    console.log(
+    log.info(
       `[proxy] health activeReq=${activeRequestCount} activeBridges=${activeBridges.size} conv=${conversationStates.size} mutex=${convMutexes.size} ` +
       `evict(conv/mutex/bridge)=${proxyTelemetry.staleConversationEvictions}/${proxyTelemetry.staleMutexEvictions}/${proxyTelemetry.staleBridgeEvictions} ` +
       `capRejects=${proxyTelemetry.capRejects} admissionRejects=${proxyTelemetry.admissionRejects} bridgeKills=${proxyTelemetry.forcedBridgeKills} pressureHits=${proxyTelemetry.pressureActivations} ` +
@@ -701,7 +702,7 @@ export async function startProxy(
       maxSize: BRIDGE_POOL_MAX_SIZE,
     });
     bridgePool.warmup();
-    console.log(`[proxy] bridge pool started min=${BRIDGE_POOL_MIN_SIZE} max=${BRIDGE_POOL_MAX_SIZE}`);
+    log.info(`[proxy] bridge pool started min=${BRIDGE_POOL_MIN_SIZE} max=${BRIDGE_POOL_MAX_SIZE}`);
   }
 
   try {
@@ -720,7 +721,7 @@ export async function startProxy(
         if (activeBridges.size >= ADMISSION_MAX_ACTIVE_BRIDGES) {
           const culled = cullOldestIdleBridgesForAdmission(ADMISSION_MAX_ACTIVE_BRIDGES);
           if (culled > 0) {
-            console.warn(`[proxy] admission preflight culled idle bridges=${culled}`);
+            log.warn(`[proxy] admission preflight culled idle bridges=${culled}`);
           }
         }
         if (shouldRejectByAdmissionControl()) {
@@ -761,7 +762,7 @@ export async function startProxy(
           try {
             const body = (await req.json()) as ChatCompletionRequest;
             const msgSummary = body.messages.map((m) => `${m.role}[${(typeof m.content === 'string' ? m.content : Array.isArray(m.content) ? m.content.length + ' parts' : 'null')?.slice(0, 40)}]`).join(', ');
-            console.log(`[proxy] REQUEST model=${body.model} stream=${body.stream} msgs=${body.messages.length} [${msgSummary.slice(0, 120)}]`);
+            log.info(`[proxy] REQUEST model=${body.model} stream=${body.stream} msgs=${body.messages.length} [${msgSummary.slice(0, 120)}]`);
             if (!proxyAccessTokenProvider) {
               throw new Error("Cursor proxy access token provider not configured");
             }
@@ -817,7 +818,7 @@ export async function startProxy(
       // statically-configured base URL would never match.
       proxyServer = undefined;
       proxyPort = CURSOR_PROXY_PORT;
-      console.warn(
+      log.warn(
         `[proxy] port ${CURSOR_PROXY_PORT} already in use; reusing existing proxy`,
       );
       return proxyPort;
@@ -832,9 +833,9 @@ export async function startProxy(
   // First title-gen request will await the result if not yet ready.
   discoverZenFreeModel().then((model) => {
     if (model) {
-      console.log(`[proxy] title-gen ready: using ${model}`);
+      log.info(`[proxy] title-gen ready: using ${model}`);
     } else {
-      console.warn(`[proxy] title-gen: no free model discovered at startup`);
+      log.warn(`[proxy] title-gen: no free model discovered at startup`);
     }
   }).catch(() => {});
 
@@ -921,7 +922,7 @@ async function handleTitleGenViaZen(
     });
 
     if (!zenResponse.ok) {
-      console.warn(`[proxy] title-gen Zen returned ${zenResponse.status}, falling back to empty`);
+      log.warn(`[proxy] title-gen Zen returned ${zenResponse.status}, falling back to empty`);
       return buildEmptyTitleResponse(completionId, created, modelId);
     }
 
@@ -983,7 +984,7 @@ async function handleTitleGenViaZen(
               }
             }
           } catch (err) {
-            console.warn(`[proxy] title-gen Zen stream error: ${err}`);
+            log.warn(`[proxy] title-gen Zen stream error: ${err}`);
           } finally {
             reader.cancel().catch(() => {});
             try { controller.close(); } catch {}
@@ -1000,7 +1001,7 @@ async function handleTitleGenViaZen(
       },
     });
   } catch (err) {
-    console.warn(`[proxy] title-gen Zen failed: ${err}, returning empty`);
+    log.warn(`[proxy] title-gen Zen failed: ${err}, returning empty`);
     return buildEmptyTitleResponse(completionId, created, modelId);
   }
 }
@@ -1067,7 +1068,7 @@ async function doHandleChatCompletion(
   const isTitleGen = isTitleGenerationRequest(body.messages);
   if (isTitleGen) {
     const titleModelId = await resolveTitleGenModel();
-    console.log(`[proxy] title-gen request model=${modelId} → zen ${titleModelId}`);
+    log.info(`[proxy] title-gen request model=${modelId} → zen ${titleModelId}`);
     release();
     return handleTitleGenViaZen(titleModelId, body);
   }
@@ -1080,7 +1081,7 @@ async function doHandleChatCompletion(
   const checkpointSize = prevStored?.checkpoint?.byteLength ?? 0;
   const blobCount = prevStored?.blobStore?.size ?? 0;
   const blobBytes = prevStored?.blobStore ? estimateBlobStoreBytes(prevStored.blobStore) : 0;
-  console.log(`[proxy] keys convKey=${convKey} bridgeKey=${bridgeKey} hasStored=${!!prevStored} hasCheckpoint=${!!prevStored?.checkpoint} turns=${turns.length} toolResults=${toolResults.length} checkpointBytes=${checkpointSize} blobs=${blobCount}/${blobBytes} workspace=${workspaceRoot ?? 'none'}`);
+  log.info(`[proxy] keys convKey=${convKey} bridgeKey=${bridgeKey} hasStored=${!!prevStored} hasCheckpoint=${!!prevStored?.checkpoint} turns=${turns.length} toolResults=${toolResults.length} checkpointBytes=${checkpointSize} blobs=${blobCount}/${blobBytes} workspace=${workspaceRoot ?? 'none'}`);
 
   // Mutex is already held by the fetch() handler — no need to acquire here.
 
@@ -1148,7 +1149,7 @@ async function doHandleChatCompletion(
     }
     if (historyLines.length > 0) {
       effectiveUserText = `[Previous conversation]\n${historyLines.join('\n')}\n\n[Current message]\n${effectiveUserText}`;
-      console.log(`[proxy] embedded ${turns.length} prior turns in UserMessage (no checkpoint)`);
+      log.info(`[proxy] embedded ${turns.length} prior turns in UserMessage (no checkpoint)`);
     }
   }
 
@@ -1668,7 +1669,7 @@ function handleKvMessage(
     const blobIdKey = Buffer.from(blobId).toString("hex");
     const blobData = blobStore.get(blobIdKey);
     if (!blobData) {
-      console.warn(`[proxy] getBlob MISS: ${blobIdKey.slice(0, 16)}... (store has ${blobStore.size} entries)`);
+      log.warn(`[proxy] getBlob MISS: ${blobIdKey.slice(0, 16)}... (store has ${blobStore.size} entries)`);
     }
     sendKvResponse(
       kvMsg, "getBlobResult",
@@ -1865,7 +1866,7 @@ function handleExecMessage(
   }
 
   // Unknown exec type — log and ignore
-  console.error(`[proxy] unhandled exec: ${execCase}`);
+  log.error(`[proxy] unhandled exec: ${execCase}`);
 }
 
 /** Send an exec client message back to Cursor. */
@@ -2069,7 +2070,7 @@ async function probeZenModel(modelId: string): Promise<string | undefined> {
     const content = json.choices?.[0]?.message?.content?.trim();
     const ms = Date.now() - start;
     if (!content) return undefined;
-    console.log(`[proxy] title-gen probe: ✅ ${modelId} responded (${ms}ms)`);
+    log.info(`[proxy] title-gen probe: ✅ ${modelId} responded (${ms}ms)`);
     return modelId;
   } catch {
     return undefined;
@@ -2103,7 +2104,7 @@ async function discoverZenFreeModel(): Promise<string | undefined> {
   lastDiscoveryAttemptMs = now;
 
   // Phase 1: Fast-track — probe known good models
-  console.log(`[proxy] title-gen discovery: fast-track probing ${ZEN_FAST_TRACK_MODELS.join(", ")}`);
+  log.info(`[proxy] title-gen discovery: fast-track probing ${ZEN_FAST_TRACK_MODELS.join(", ")}`);
   const fastResult = await raceProbeModels(ZEN_FAST_TRACK_MODELS);
   if (fastResult) {
     resolvedTitleGenModel = fastResult;
@@ -2113,12 +2114,12 @@ async function discoverZenFreeModel(): Promise<string | undefined> {
 
   // Phase 2: Full scan — fetch model list, probe everything
   try {
-    console.log(`[proxy] title-gen discovery: fast-track failed, scanning all models`);
+    log.info(`[proxy] title-gen discovery: fast-track failed, scanning all models`);
     const resp = await fetch(`${ZEN_BASE_URL}/models`, {
       signal: AbortSignal.timeout(10_000),
     });
     if (!resp.ok) {
-      console.warn(`[proxy] title-gen discovery: /models returned ${resp.status}`);
+      log.warn(`[proxy] title-gen discovery: /models returned ${resp.status}`);
       return resolvedTitleGenModel;
     }
     const json = await resp.json() as { data?: Array<{ id: string }> };
@@ -2126,7 +2127,7 @@ async function discoverZenFreeModel(): Promise<string | undefined> {
 
     // Skip models already tried in fast-track
     const remaining = allModels.filter((id) => !ZEN_FAST_TRACK_MODELS.includes(id));
-    console.log(`[proxy] title-gen discovery: probing ${remaining.length} remaining models (parallel)`);
+    log.info(`[proxy] title-gen discovery: probing ${remaining.length} remaining models (parallel)`);
 
     const scanResult = await raceProbeModels(remaining);
     if (scanResult) {
@@ -2135,10 +2136,10 @@ async function discoverZenFreeModel(): Promise<string | undefined> {
       return scanResult;
     }
 
-    console.warn(`[proxy] title-gen discovery: all ${allModels.length} models failed probe`);
+    log.warn(`[proxy] title-gen discovery: all ${allModels.length} models failed probe`);
     return resolvedTitleGenModel;
   } catch (err) {
-    console.warn(`[proxy] title-gen discovery error: ${err}`);
+    log.warn(`[proxy] title-gen discovery error: ${err}`);
     return resolvedTitleGenModel;
   }
 }
@@ -2159,7 +2160,7 @@ async function resolveTitleGenModel(): Promise<string> {
   if (discovered) return discovered;
 
   // Last resort: fall back to gpt-5-nano (will likely 401 but better than crashing)
-  console.warn(`[proxy] title-gen: no free model discovered, falling back to gpt-5-nano`);
+  log.warn(`[proxy] title-gen: no free model discovered, falling back to gpt-5-nano`);
   return "gpt-5-nano";
 }
 
@@ -2446,7 +2447,7 @@ function createBridgeStreamResponse(
                 requestBytes
               ) {
                 connectError = true;
-                console.warn(`[proxy] Connect error (attempt ${attempt + 1}/${maxConnectRetries + 1}, pressure=${pressureMode}): ${endError.message}`);
+                log.warn(`[proxy] Connect error (attempt ${attempt + 1}/${maxConnectRetries + 1}, pressure=${pressureMode}): ${endError.message}`);
                 return; // swallow error — onClose will retry
               }
               anyContentSent = true;
@@ -2490,7 +2491,7 @@ function createBridgeStreamResponse(
 
           watchdogHandled = true;
           proxyTelemetry.stallDetections += 1;
-          console.warn(
+          log.warn(
             `[proxy] stall detected bridgeKey=${bridgeKey} attempt=${attempt} timeoutMs=${resolvedStallTimeoutMs}`,
           );
 
@@ -2504,7 +2505,7 @@ function createBridgeStreamResponse(
             proxyTelemetry.stallRecoveryRetries += 1;
             const n = retryCtx.stallRecoveryCount;
             const delay = STALL_RECOVERY_BASE_DELAY_MS * Math.pow(2, n - 1);
-            console.warn(
+            log.warn(
               `[proxy] forced_recovery_retry_started bridgeKey=${bridgeKey} stallRecoveryAttempt=${n}/${MAX_STALL_RECOVERIES} delayMs=${delay}`,
             );
 
@@ -2526,7 +2527,7 @@ function createBridgeStreamResponse(
           }
 
           // Diagnostic: log why recovery was skipped
-          console.warn(
+          log.warn(
             `[proxy] stall recovery skipped bridgeKey=${bridgeKey} retryCtx=${!!retryCtx} stallRecoveryCount=${retryCtx?.stallRecoveryCount ?? "n/a"} max=${MAX_STALL_RECOVERIES} accessToken=${!!accessToken} requestBytes=${!!requestBytes}`,
           );
           proxyTelemetry.stallRecoveryFailures += 1;
@@ -2561,7 +2562,7 @@ function createBridgeStreamResponse(
 
           // Retry: clear stale checkpoint and start a fresh bridge
           if (blobNotFound && !anyContentSent && attempt === 0 && retryCtx) {
-            console.warn("[proxy] Blob not found, retrying without checkpoint");
+            log.warn("[proxy] Blob not found, retrying without checkpoint");
             if (stored) {
               stored.checkpoint = null;
               stored.blobStore.clear();
@@ -2593,7 +2594,7 @@ function createBridgeStreamResponse(
             deleteActiveBridge(bridgeKey);
             attemptBridge.kill();
             const delay = CONNECT_RETRY_BASE_DELAY_MS * retryDelayMultiplier * Math.pow(2, attempt);
-            console.warn(`[proxy] Retrying connect in ${delay}ms (attempt ${attempt + 1}/${maxConnectRetries + 1}, pressure=${pressureMode})`);
+            log.warn(`[proxy] Retrying connect in ${delay}ms (attempt ${attempt + 1}/${maxConnectRetries + 1}, pressure=${pressureMode})`);
             setTimeout(() => {
               // If the stream was already closed (client abort), don't retry.
               if (closed) return;
@@ -2627,7 +2628,7 @@ function createBridgeStreamResponse(
               let effectiveRequestBytes = retryRequestBytes;
               const isRetryAfterEmpty = attempt >= 1;
               if (isRetryAfterEmpty && retryCtx && retryCtx.stored.checkpoint) {
-                console.warn(
+                log.warn(
                   `[proxy] Empty stream close after retry; clearing checkpoint and rebuilding request (convKey=${convKey})`,
                 );
                 retryCtx.stored.checkpoint = null;
@@ -2645,7 +2646,7 @@ function createBridgeStreamResponse(
                 effectiveRequestBytes = freshPayload.requestBytes;
               }
 
-              console.warn(
+              log.warn(
                 `[proxy] Empty stream close; retrying in ${delay}ms (attempt ${attempt + 1}/${maxConnectRetries + 1}, code=${code}, pressure=${pressureMode}, checkpointCleared=${isRetryAfterEmpty && !!retryCtx?.stored})`,
               );
               setTimeout(() => {
@@ -2669,7 +2670,7 @@ function createBridgeStreamResponse(
             // a silent empty completion that looks like "instant empty reply" in Discord.
             // Suppress for title-gen to avoid polluting Discord thread names.
             if (!anyContentSent && !isTitleGenStream) {
-              console.warn(`[proxy] All retries exhausted; sending empty-stream error (bridgeKey=${bridgeKey})`);
+              log.warn(`[proxy] All retries exhausted; sending empty-stream error (bridgeKey=${bridgeKey})`);
               sendSSE(makeChunk({ content: "\n[Error: Cursor returned empty response. Try sending your message again.]" }));
             }
             sendSSE(makeChunk({}, "stop"));

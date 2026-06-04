@@ -1075,6 +1075,9 @@ async function main() {
   process.env.CURSOR_REFRESH_URL = backend.refreshUrl;
   process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS = "1200";
   process.env.OPENCODE_CURSOR_STALL_TICK_MS = "100";
+  // Use a dedicated proxy port so tests never collide with a live OpenCode
+  // session running the plugin on the default fixed port.
+  process.env.OPENCODE_CURSOR_PROXY_PORT = "8799";
 
   const modules = await loadModules();
 
