@@ -634,6 +634,36 @@ let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
 let proxyModels: Array<{ id: string; name: string }> = [];
 const DEFAULT_MODEL_ID = "default";
 
+const DEFAULT_PROXY_PORT = 8788;
+
+/**
+ * Fixed port the proxy binds to. OpenCode 1.15.x resolves the provider base
+ * URL from static config, so the proxy must listen on a deterministic port
+ * that matches that URL (a random port would leave the SDK unable to connect).
+ * Override with OPENCODE_CURSOR_PROXY_PORT if 8788 is taken.
+ */
+export const CURSOR_PROXY_PORT: number = (() => {
+  const raw = process.env.OPENCODE_CURSOR_PROXY_PORT;
+  const parsed = raw ? Number(raw) : NaN;
+  return Number.isInteger(parsed) && parsed > 0 && parsed < 65536
+    ? parsed
+    : DEFAULT_PROXY_PORT;
+})();
+
+export function getCursorProxyBaseUrl(): string {
+  return `http://localhost:${CURSOR_PROXY_PORT}/v1`;
+}
+
+function isAddrInUseError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const code = (err as { code?: unknown }).code;
+  const message = (err as { message?: unknown }).message;
+  return (
+    code === "EADDRINUSE" ||
+    (typeof message === "string" && /eaddrinuse|address already in use|in use/i.test(message))
+  );
+}
+
 function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }>): Array<{
   id: string;
   object: "model";
@@ -674,8 +704,9 @@ export async function startProxy(
     console.log(`[proxy] bridge pool started min=${BRIDGE_POOL_MIN_SIZE} max=${BRIDGE_POOL_MAX_SIZE}`);
   }
 
-  proxyServer = Bun.serve({
-    port: 0,
+  try {
+    proxyServer = Bun.serve({
+    port: CURSOR_PROXY_PORT,
     idleTimeout: 255, // max — Cursor responses can take 30s+
     async fetch(req) {
       clearIdleShutdownTimer();
@@ -777,7 +808,23 @@ export async function startProxy(
         scheduleIdleShutdown();
       }
     },
-  });
+    });
+  } catch (err) {
+    if (isAddrInUseError(err)) {
+      // A sibling plugin instance (another OpenCode session for the same
+      // user) already serves the proxy on the shared fixed port. Reuse it
+      // rather than failing provider initialization with a random port the
+      // statically-configured base URL would never match.
+      proxyServer = undefined;
+      proxyPort = CURSOR_PROXY_PORT;
+      console.warn(
+        `[proxy] port ${CURSOR_PROXY_PORT} already in use; reusing existing proxy`,
+      );
+      return proxyPort;
+    }
+    proxyServer = undefined;
+    throw err;
+  }
 
   maintenanceTimer = setInterval(runMaintenanceSweep, MAINTENANCE_INTERVAL_MS);
 

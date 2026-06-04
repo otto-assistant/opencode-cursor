@@ -414,6 +414,11 @@ async function testPluginShape(modules: TestModules) {
 async function testConfigHookSeedsProvider(modules: TestModules) {
   console.log("[test] Checking config hook seeds cursor provider...");
 
+  // Force the offline fallback path: point the auth store at an empty dir so
+  // the config hook does not perform real network discovery.
+  const prevXdg = process.env.XDG_DATA_HOME;
+  process.env.XDG_DATA_HOME = "/tmp/opencode-cursor-smoke-empty";
+
   const fakeInput = {
     client: { auth: { set: async () => {} } },
   } as any;
@@ -466,6 +471,12 @@ async function testConfigHookSeedsProvider(modules: TestModules) {
     "composer-1" in c2.models,
     "Expected seeded models to be merged alongside user models",
   );
+
+  if (prevXdg === undefined) {
+    delete process.env.XDG_DATA_HOME;
+  } else {
+    process.env.XDG_DATA_HOME = prevXdg;
+  }
 
   console.log("[test] Config hook seeding OK");
 }

@@ -5,6 +5,9 @@
  * 1. Browser-based OAuth login to Cursor
  * 2. Local proxy translating OpenAI format → Cursor gRPC protocol
  */
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
 import {
   generateCursorAuthParams,
@@ -14,17 +17,16 @@ import {
   RefreshTokenInvalidError,
 } from "./auth";
 import { getCursorModels, FALLBACK_MODELS, type CursorModel } from "./models";
-import { startProxy, getProxyPort } from "./proxy";
+import { startProxy, getProxyPort, getCursorProxyBaseUrl } from "./proxy";
 
 const CURSOR_PROVIDER_ID = "cursor";
 const DEFAULT_MODEL_ID = "default";
 const OPENAI_COMPATIBLE_NPM = "@ai-sdk/openai-compatible";
 
-// Placeholder base URL kept only so OpenCode accepts the statically-declared
-// provider during catalog/menu construction. The real port is supplied by the
-// auth `loader` at request time (the proxy binds a random port), which takes
-// precedence over this value.
-const PLACEHOLDER_BASE_URL = "http://localhost:8788/v1";
+// Base URL OpenCode uses for the statically-declared provider. It points at
+// the proxy's fixed port so requests reach the local proxy (OpenCode resolves
+// the base URL from static config, not from the auth loader).
+const CURSOR_BASE_URL = getCursorProxyBaseUrl();
 
 type CursorOAuthAuth = {
   type: "oauth";
@@ -136,7 +138,8 @@ export const CursorAuthPlugin: Plugin = async (
     // any user-defined overrides. The dynamic hook + auth loader below still
     // refine connection details and models at runtime.
     async config(config) {
-      ensureCursorProviderConfig(config);
+      const models = await resolveConfigModels();
+      ensureCursorProviderConfig(config, models);
     },
 
     provider: {
@@ -302,7 +305,10 @@ function buildProviderModel(
  * the provider and its models appear in the model menu. Existing user-defined
  * fields and models are preserved; only missing pieces are filled in.
  */
-function ensureCursorProviderConfig(config: unknown): void {
+function ensureCursorProviderConfig(
+  config: unknown,
+  models: CursorModel[],
+): void {
   if (!config || typeof config !== "object") return;
   const cfg = config as { provider?: Record<string, any> };
   cfg.provider ??= {};
@@ -322,15 +328,70 @@ function ensureCursorProviderConfig(config: unknown): void {
     ...existing,
     npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
     options: {
-      baseURL: PLACEHOLDER_BASE_URL,
+      baseURL: CURSOR_BASE_URL,
       ...existingOptions,
     },
     // User-declared model entries win over the seeded defaults.
     models: {
-      ...buildConfigModelEntries(FALLBACK_MODELS),
+      ...buildConfigModelEntries(models),
       ...existingModels,
     },
   };
+}
+
+/**
+ * Resolve the model list used to seed the static provider config. Prefers the
+ * full set discovered from Cursor (using the stored OAuth access token) so the
+ * whole catalog shows up in the menu, and falls back to the bundled list when
+ * no valid token is available or discovery is slow/unavailable. Never throws.
+ */
+async function resolveConfigModels(): Promise<CursorModel[]> {
+  const token = readStoredCursorAccessToken();
+  if (!token) return FALLBACK_MODELS;
+  try {
+    const discovered = await withTimeout(getCursorModels(token), 4000);
+    return discovered.length > 0 ? discovered : FALLBACK_MODELS;
+  } catch {
+    return FALLBACK_MODELS;
+  }
+}
+
+/**
+ * Best-effort read of the stored Cursor OAuth access token from OpenCode's
+ * auth store. Returns undefined if missing, malformed, or expired.
+ */
+function readStoredCursorAccessToken(): string | undefined {
+  try {
+    const base =
+      process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
+    const authPath = join(base, "opencode", "auth.json");
+    const data = JSON.parse(readFileSync(authPath, "utf8"));
+    const cursor = data?.[CURSOR_PROVIDER_ID];
+    if (!cursor || cursor.type !== "oauth") return undefined;
+    if (typeof cursor.access !== "string" || !cursor.access) return undefined;
+    if (typeof cursor.expires === "number" && cursor.expires < Date.now()) {
+      return undefined;
+    }
+    return cursor.access;
+  } catch {
+    return undefined;
+  }
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("timeout")), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
 }
 
 function buildConfigModelEntries(
