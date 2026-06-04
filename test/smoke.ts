@@ -63,6 +63,18 @@ function assertArrayEqual(
   }
 }
 
+function assertDefaultProviderModel(
+  provider: { models: Record<string, any> },
+  expectedApiModelId: string,
+  message: string,
+): void {
+  const model = provider.models.default;
+  assert(model, `${message}: missing provider model 'default'`);
+  assertEqual(model.id, "default", `${message}: unexpected alias id`);
+  assertEqual(model.providerID, "cursor", `${message}: unexpected provider id`);
+  assertEqual(model.api?.id, expectedApiModelId, `${message}: unexpected API model id`);
+}
+
 function makeJwt(expiresAtSeconds: number): string {
   const header = btoa(JSON.stringify({ alg: "HS256", typ: "JWT" }));
   const payload = btoa(JSON.stringify({ exp: expiresAtSeconds }));
@@ -399,6 +411,65 @@ async function testPluginShape(modules: TestModules) {
   console.log("[test] Plugin shape OK");
 }
 
+async function testConfigHookSeedsProvider(modules: TestModules) {
+  console.log("[test] Checking config hook seeds cursor provider...");
+
+  const fakeInput = {
+    client: { auth: { set: async () => {} } },
+  } as any;
+  const hooks = await modules.CursorAuthPlugin(fakeInput);
+
+  if (typeof hooks.config !== "function") {
+    throw new Error("Plugin hooks.config is not a function");
+  }
+
+  // Fresh config: provider + models should be seeded.
+  const fresh: any = {};
+  await hooks.config!(fresh);
+  const cursor = fresh.provider?.cursor;
+  assert(cursor, "Expected config hook to create provider.cursor");
+  assertEqual(cursor.name, "Cursor", "Expected seeded provider name");
+  assertEqual(cursor.npm, "@ai-sdk/openai-compatible", "Expected seeded npm");
+  assert(cursor.options?.baseURL, "Expected seeded options.baseURL");
+  assert(
+    Object.keys(cursor.models ?? {}).length > 0,
+    "Expected seeded provider to declare models",
+  );
+  assert(
+    "composer-1" in cursor.models,
+    "Expected fallback model composer-1 to be seeded",
+  );
+
+  // User overrides must be preserved and win over seeded defaults.
+  const custom: any = {
+    provider: {
+      cursor: {
+        name: "My Cursor",
+        npm: "custom-npm",
+        options: { baseURL: "http://localhost:1234/v1", apiKey: "x" },
+        models: { "my-model": { name: "My Model" } },
+      },
+    },
+  };
+  await hooks.config!(custom);
+  const c2 = custom.provider.cursor;
+  assertEqual(c2.name, "My Cursor", "Expected user name to be preserved");
+  assertEqual(c2.npm, "custom-npm", "Expected user npm to be preserved");
+  assertEqual(
+    c2.options.baseURL,
+    "http://localhost:1234/v1",
+    "Expected user baseURL to be preserved",
+  );
+  assertEqual(c2.options.apiKey, "x", "Expected user option to be preserved");
+  assert("my-model" in c2.models, "Expected user model to be preserved");
+  assert(
+    "composer-1" in c2.models,
+    "Expected seeded models to be merged alongside user models",
+  );
+
+  console.log("[test] Config hook seeding OK");
+}
+
 async function testArrayContentParsing(modules: TestModules) {
   console.log("[test] Testing array content (plan-mode) parsing...");
   const port = await modules.startProxy(async () => "test-token");
@@ -492,6 +563,11 @@ async function testExpiredTokenRefreshBeforeDiscovery(
   assert(
     Object.keys(provider.models).length > 0,
     "Expected provider models to come from successful discovery",
+  );
+  assertDefaultProviderModel(
+    provider,
+    "fresh-model",
+    "Expected cursor/default to target the discovered model",
   );
 
   modules.stopProxy();
@@ -691,6 +767,11 @@ async function testDiscoveryFallbackAndSuccess(
     !("stale" in provider.models),
     "Expected stale models to be replaced",
   );
+  assertDefaultProviderModel(
+    provider,
+    "composer-1.5",
+    "Expected cursor/default to target the best fallback Composer model",
+  );
   const degradedModelsRes = await fetch(`${degradedConfig.baseURL}/models`);
   assertEqual(degradedModelsRes.status, 200, "Expected degraded /v1/models to succeed");
   const degradedModelsBody = await degradedModelsRes.json();
@@ -711,6 +792,11 @@ async function testDiscoveryFallbackAndSuccess(
   assert(
     Object.keys(provider.models).length > 0,
     "Expected successful discovery to replace fallback models",
+  );
+  assertDefaultProviderModel(
+    provider,
+    "real-model-a",
+    "Expected cursor/default to target the first discovered model",
   );
   const discoveredModelsRes = await fetch(`${discoveredConfig.baseURL}/models`);
   assertEqual(discoveredModelsRes.status, 200, "Expected discovered /v1/models to succeed");
@@ -986,6 +1072,7 @@ async function main() {
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testPluginShape(modules);
+    await testConfigHookSeedsProvider(modules);
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testRefreshFailureKeepsProviderListable(modules, backend);

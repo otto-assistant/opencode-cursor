@@ -632,6 +632,7 @@ let proxyServer: ReturnType<typeof Bun.serve> | undefined;
 let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
 let proxyModels: Array<{ id: string; name: string }> = [];
+const DEFAULT_MODEL_ID = "default";
 
 function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }>): Array<{
   id: string;
@@ -793,6 +794,17 @@ export async function startProxy(
   proxyPort = proxyServer.port;
   if (!proxyPort) throw new Error("Failed to bind proxy to a port");
   return proxyPort;
+}
+
+function resolveProxyModelId(modelId: string): string {
+  if (modelId !== DEFAULT_MODEL_ID) return modelId;
+  return (
+    proxyModels.find((model) => model.id === "composer-2") ??
+    proxyModels.find((model) => model.id === "composer-2-fast") ??
+    proxyModels.find((model) => model.id === "composer-1.5") ??
+    proxyModels.find((model) => model.id.startsWith("composer-")) ??
+    proxyModels[0]
+  )?.id ?? modelId;
 }
 
 export function stopProxy(): void {
@@ -985,7 +997,7 @@ async function doHandleChatCompletion(
   release: () => void,
 ): Promise<Response> {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
-  const modelId = body.model;
+  const modelId = resolveProxyModelId(body.model);
   const tools = (body.tools ?? []).filter((tool) => !shouldBlockTool(tool));
   const workspaceRoot = extractWorkspaceRoot(systemPrompt);
 

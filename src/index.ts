@@ -13,10 +13,18 @@ import {
   refreshCursorToken,
   RefreshTokenInvalidError,
 } from "./auth";
-import { getCursorModels, type CursorModel } from "./models";
+import { getCursorModels, FALLBACK_MODELS, type CursorModel } from "./models";
 import { startProxy, getProxyPort } from "./proxy";
 
 const CURSOR_PROVIDER_ID = "cursor";
+const DEFAULT_MODEL_ID = "default";
+const OPENAI_COMPATIBLE_NPM = "@ai-sdk/openai-compatible";
+
+// Placeholder base URL kept only so OpenCode accepts the statically-declared
+// provider during catalog/menu construction. The real port is supplied by the
+// auth `loader` at request time (the proxy binds a random port), which takes
+// precedence over this value.
+const PLACEHOLDER_BASE_URL = "http://localhost:8788/v1";
 
 type CursorOAuthAuth = {
   type: "oauth";
@@ -121,6 +129,16 @@ export const CursorAuthPlugin: Plugin = async (
   input: PluginInput,
 ): Promise<Hooks> => {
   return {
+    // Newer OpenCode releases (1.15.x) build the model catalog/menu only from
+    // statically declared `config.provider.<id>` entries (or models.dev) and no
+    // longer surface a plugin's dynamic `provider.models()` hook there. Seed a
+    // concrete `cursor` provider here so it always appears, without clobbering
+    // any user-defined overrides. The dynamic hook + auth loader below still
+    // refine connection details and models at runtime.
+    async config(config) {
+      ensureCursorProviderConfig(config);
+    },
+
     provider: {
       id: CURSOR_PROVIDER_ID,
       async models(provider, ctx) {
@@ -207,52 +225,132 @@ function buildCursorProviderModels(
   models: CursorModel[],
   port: number,
 ): Record<string, any> {
-  return Object.fromEntries(
-    models.map((model) => [
-      model.id,
-      {
-        id: model.id,
-        providerID: CURSOR_PROVIDER_ID,
-        api: {
-          id: model.id,
-          url: `http://localhost:${port}/v1`,
-          npm: "@ai-sdk/openai-compatible",
-        },
-        name: model.name,
-        capabilities: {
-          temperature: true,
-          reasoning: model.reasoning,
-          attachment: false,
-          toolcall: true,
-          input: {
-            text: true,
-            audio: false,
-            image: false,
-            video: false,
-            pdf: false,
-          },
-          output: {
-            text: true,
-            audio: false,
-            image: false,
-            video: false,
-            pdf: false,
-          },
-          interleaved: false,
-        },
-        cost: estimateModelCost(model.id),
-        limit: {
-          context: model.contextWindow,
-          output: model.maxTokens,
-        },
-        status: "active" as const,
-        options: {},
-        headers: {},
-        release_date: "",
-        variants: {},
-      },
-    ]),
+  const providerModels = Object.fromEntries(
+    models.map((model) => [model.id, buildProviderModel(model, model.id, port)]),
   );
+  const defaultModel = selectDefaultCursorModel(models);
+  if (defaultModel && !(DEFAULT_MODEL_ID in providerModels)) {
+    providerModels[DEFAULT_MODEL_ID] = buildProviderModel(
+      defaultModel,
+      DEFAULT_MODEL_ID,
+      port,
+    );
+  }
+  return providerModels;
+}
+
+function selectDefaultCursorModel(models: CursorModel[]): CursorModel | undefined {
+  return (
+    models.find((model) => model.id === "composer-2") ??
+    models.find((model) => model.id === "composer-2-fast") ??
+    models.find((model) => model.id === "composer-1.5") ??
+    models.find((model) => model.id.startsWith("composer-")) ??
+    models[0]
+  );
+}
+
+function buildProviderModel(
+  model: CursorModel,
+  id: string,
+  port: number,
+): Record<string, any> {
+  return {
+    id,
+    providerID: CURSOR_PROVIDER_ID,
+    api: {
+      id: model.id,
+      url: `http://localhost:${port}/v1`,
+      npm: "@ai-sdk/openai-compatible",
+    },
+    name: id === DEFAULT_MODEL_ID ? `Default (${model.name})` : model.name,
+    capabilities: {
+      temperature: true,
+      reasoning: model.reasoning,
+      attachment: false,
+      toolcall: true,
+      input: {
+        text: true,
+        audio: false,
+        image: false,
+        video: false,
+        pdf: false,
+      },
+      output: {
+        text: true,
+        audio: false,
+        image: false,
+        video: false,
+        pdf: false,
+      },
+      interleaved: false,
+    },
+    cost: estimateModelCost(model.id),
+    limit: {
+      context: model.contextWindow,
+      output: model.maxTokens,
+    },
+    status: "active" as const,
+    options: {},
+    headers: {},
+    release_date: "",
+    variants: {},
+  };
+}
+
+/**
+ * Ensure OpenCode has a concrete `cursor` provider declaration in its config so
+ * the provider and its models appear in the model menu. Existing user-defined
+ * fields and models are preserved; only missing pieces are filled in.
+ */
+function ensureCursorProviderConfig(config: unknown): void {
+  if (!config || typeof config !== "object") return;
+  const cfg = config as { provider?: Record<string, any> };
+  cfg.provider ??= {};
+
+  const existing = cfg.provider[CURSOR_PROVIDER_ID] ?? {};
+  const existingOptions =
+    existing.options && typeof existing.options === "object"
+      ? existing.options
+      : {};
+  const existingModels =
+    existing.models && typeof existing.models === "object"
+      ? existing.models
+      : {};
+
+  cfg.provider[CURSOR_PROVIDER_ID] = {
+    name: "Cursor",
+    ...existing,
+    npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
+    options: {
+      baseURL: PLACEHOLDER_BASE_URL,
+      ...existingOptions,
+    },
+    // User-declared model entries win over the seeded defaults.
+    models: {
+      ...buildConfigModelEntries(FALLBACK_MODELS),
+      ...existingModels,
+    },
+  };
+}
+
+function buildConfigModelEntries(
+  models: CursorModel[],
+): Record<string, Record<string, any>> {
+  const entries: Record<string, Record<string, any>> = {};
+  for (const model of models) {
+    entries[model.id] = {
+      name: model.name,
+      reasoning: model.reasoning,
+      tool_call: true,
+      cost: estimateModelCost(model.id),
+      limit: {
+        context: model.contextWindow,
+        output: model.maxTokens,
+      },
+      options: {},
+    };
+  }
+  return entries;
 }
 
 interface ModelCost {

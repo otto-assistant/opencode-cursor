@@ -51,7 +51,7 @@ export interface CursorModel {
   maxTokens: number;
 }
 
-const FALLBACK_MODELS: CursorModel[] = [
+export const FALLBACK_MODELS: CursorModel[] = [
   // Composer models
   { id: "composer-1", name: "Composer 1", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
   { id: "composer-1.5", name: "Composer 1.5", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
