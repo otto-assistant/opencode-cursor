@@ -634,6 +634,7 @@ let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
 let proxyModels: Array<{ id: string; name: string }> = [];
 const DEFAULT_MODEL_ID = "default";
+const AUTO_MODEL_IDS = new Set([DEFAULT_MODEL_ID, "auto"]);
 
 const DEFAULT_PROXY_PORT = 8788;
 
@@ -844,15 +845,66 @@ export async function startProxy(
   return proxyPort;
 }
 
-function resolveProxyModelId(modelId: string): string {
-  if (modelId !== DEFAULT_MODEL_ID) return modelId;
+function isAutoModelId(modelId: string): boolean {
+  return AUTO_MODEL_IDS.has(modelId.trim().toLowerCase());
+}
+
+function selectPreferredAutoModel(): { id: string; name: string } | undefined {
   return (
+    proxyModels.find((model) => model.id === "composer-2.5") ??
     proxyModels.find((model) => model.id === "composer-2") ??
+    proxyModels.find((model) => model.id === "composer-2.5-fast") ??
     proxyModels.find((model) => model.id === "composer-2-fast") ??
     proxyModels.find((model) => model.id === "composer-1.5") ??
     proxyModels.find((model) => model.id.startsWith("composer-")) ??
     proxyModels[0]
-  )?.id ?? modelId;
+  );
+}
+
+function resolveProxyModelId(modelId: string): string {
+  if (!isAutoModelId(modelId)) return modelId;
+  return selectPreferredAutoModel()?.id ?? modelId;
+}
+
+function resolveAutoFallbackModelId(primaryModelId: string): string | undefined {
+  const directFastModelId = `${primaryModelId}-fast`;
+  if (proxyModels.some((model) => model.id === directFastModelId)) {
+    return directFastModelId;
+  }
+
+  const unfastPrimaryModelId = primaryModelId.replace(/-fast$/, "");
+  const siblingFastModelId = `${unfastPrimaryModelId}-fast`;
+  if (
+    siblingFastModelId !== primaryModelId &&
+    proxyModels.some((model) => model.id === siblingFastModelId)
+  ) {
+    return siblingFastModelId;
+  }
+
+  const preferredFallbacks = [
+    "composer-2.5-fast",
+    "composer-2-fast",
+  ];
+  for (const fallbackModelId of preferredFallbacks) {
+    if (
+      fallbackModelId !== primaryModelId &&
+      proxyModels.some((model) => model.id === fallbackModelId)
+    ) {
+      return fallbackModelId;
+    }
+  }
+
+  return (
+    proxyModels.find((model) =>
+      model.id !== primaryModelId &&
+      model.id.startsWith("composer-") &&
+      model.id.endsWith("-fast")
+    ) ??
+    proxyModels.find((model) =>
+      model.id !== primaryModelId &&
+      model.id.endsWith("-fast")
+    )
+  )?.id;
 }
 
 export function stopProxy(): void {
@@ -1173,14 +1225,13 @@ async function doHandleChatCompletion(
     stallRecoveryCount: 0,
   };
 
-  // When the user selected auto/default and it resolves to a composer model,
-  // pre-build a fallback request using the "-fast" variant so the proxy can
-  // silently switch if the primary model hits a resource_exhausted quota.
-  if (body.model === DEFAULT_MODEL_ID) {
-    const fastModelId = modelId + "-fast";
-    const fastModelExists = proxyModels.some((m) => m.id === fastModelId);
-    if (fastModelExists) {
-      log.info(`[proxy] auto model: pre-built fallback to ${fastModelId}`);
+  // When the user selected auto/default, pre-build a fallback request using a
+  // known fast model so the proxy can switch immediately if Cursor rate-limits
+  // the primary auto pool.
+  if (isAutoModelId(body.model)) {
+    const fastModelId = resolveAutoFallbackModelId(modelId);
+    if (fastModelId) {
+      log.info(`[proxy] auto model: pre-built fallback ${modelId} -> ${fastModelId}`);
       const fallbackPayload = buildCursorRequest(
         fastModelId, systemPrompt, effectiveUserText, turns,
         stored.conversationId, stored.checkpoint, stored.blobStore,
