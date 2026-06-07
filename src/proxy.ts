@@ -634,7 +634,6 @@ let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
 let proxyModels: Array<{ id: string; name: string }> = [];
 const DEFAULT_MODEL_ID = "default";
-const AUTO_MODEL_IDS = new Set([DEFAULT_MODEL_ID, "auto"]);
 
 const DEFAULT_PROXY_PORT = 8788;
 
@@ -845,66 +844,11 @@ export async function startProxy(
   return proxyPort;
 }
 
-function isAutoModelId(modelId: string): boolean {
-  return AUTO_MODEL_IDS.has(modelId.trim().toLowerCase());
-}
-
-function selectPreferredAutoModel(): { id: string; name: string } | undefined {
-  return (
-    proxyModels.find((model) => model.id === "composer-2.5") ??
-    proxyModels.find((model) => model.id === "composer-2") ??
-    proxyModels.find((model) => model.id === "composer-2.5-fast") ??
-    proxyModels.find((model) => model.id === "composer-2-fast") ??
-    proxyModels.find((model) => model.id === "composer-1.5") ??
-    proxyModels.find((model) => model.id.startsWith("composer-")) ??
-    proxyModels[0]
-  );
-}
-
 function resolveProxyModelId(modelId: string): string {
-  if (!isAutoModelId(modelId)) return modelId;
-  return selectPreferredAutoModel()?.id ?? modelId;
-}
-
-function resolveAutoFallbackModelId(primaryModelId: string): string | undefined {
-  const directFastModelId = `${primaryModelId}-fast`;
-  if (proxyModels.some((model) => model.id === directFastModelId)) {
-    return directFastModelId;
-  }
-
-  const unfastPrimaryModelId = primaryModelId.replace(/-fast$/, "");
-  const siblingFastModelId = `${unfastPrimaryModelId}-fast`;
-  if (
-    siblingFastModelId !== primaryModelId &&
-    proxyModels.some((model) => model.id === siblingFastModelId)
-  ) {
-    return siblingFastModelId;
-  }
-
-  const preferredFallbacks = [
-    "composer-2.5-fast",
-    "composer-2-fast",
-  ];
-  for (const fallbackModelId of preferredFallbacks) {
-    if (
-      fallbackModelId !== primaryModelId &&
-      proxyModels.some((model) => model.id === fallbackModelId)
-    ) {
-      return fallbackModelId;
-    }
-  }
-
-  return (
-    proxyModels.find((model) =>
-      model.id !== primaryModelId &&
-      model.id.startsWith("composer-") &&
-      model.id.endsWith("-fast")
-    ) ??
-    proxyModels.find((model) =>
-      model.id !== primaryModelId &&
-      model.id.endsWith("-fast")
-    )
-  )?.id;
+  // Pass every model ID literally to Cursor's API — including "default"/"auto".
+  // Cursor's server handles auto-selection internally; the proxy must NOT
+  // resolve these to a concrete model or it defeats Cursor's dynamic routing.
+  return modelId;
 }
 
 export function stopProxy(): void {
@@ -1225,22 +1169,9 @@ async function doHandleChatCompletion(
     stallRecoveryCount: 0,
   };
 
-  // When the user selected auto/default, pre-build a fallback request using a
-  // known fast model so the proxy can switch immediately if Cursor rate-limits
-  // the primary auto pool.
-  if (isAutoModelId(body.model)) {
-    const fastModelId = resolveAutoFallbackModelId(modelId);
-    if (fastModelId) {
-      log.info(`[proxy] auto model: pre-built fallback ${modelId} -> ${fastModelId}`);
-      const fallbackPayload = buildCursorRequest(
-        fastModelId, systemPrompt, effectiveUserText, turns,
-        stored.conversationId, stored.checkpoint, stored.blobStore,
-      );
-      fallbackPayload.mcpTools = mcpTools;
-      retryCtx.fallbackRequestBytes = fallbackPayload.requestBytes;
-      retryCtx.fallbackModelName = fastModelId;
-    }
-  }
+  // NOTE: Auto model fallback was intentionally removed. The proxy now passes
+  // every model ID (including "default"/"auto") literally to Cursor's API so
+  // Cursor's server handles its own auto-selection and rate-limit routing.
 
   return handleStreamingResponse(
     payload, accessToken, modelId, bridgeKey, convKey, release,
@@ -2060,12 +1991,9 @@ interface RetryContext {
   mcpTools: McpToolDefinition[];
   /** Consecutive internal stall recoveries without forward progress (reset on progress). */
   stallRecoveryCount: number;
-  /** Pre-built request bytes for an automatic fallback model (auto mode). */
-  fallbackRequestBytes?: Uint8Array;
-  /** Display name of the fallback model for user-facing messages. */
-  fallbackModelName?: string;
-  /** Prevent infinite fallback loops. */
-  fallbackAttempted?: boolean;
+  // Note: fallback model fields were intentionally removed — the proxy now
+  // passes model IDs (including "default"/"auto") literally to Cursor. Cursor's
+  // server handles its own auto-selection and rate-limit routing internally.
 }
 
 /** Max automatic retries for transient connect errors (e.g. "invalid_argument"). */
@@ -2514,39 +2442,17 @@ function createBridgeStreamResponse(
                 blobNotFound = true;
                 return; // swallow error — onClose will retry
               }
-              // resource_exhausted on the auto/default model -> switch directly
-              // to the pre-built fallback before spending retries on the
-              // rate-limited primary pool.
-              const isRateLimit = endError.message.includes("resource_exhausted");
-              if (
-                isRateLimit &&
-                accessToken &&
-                retryCtx?.fallbackRequestBytes &&
-                !retryCtx.fallbackAttempted
-              ) {
-                retryCtx.fallbackAttempted = true;
-                attemptSuperseded = true;
-                log.warn(`[proxy] auto-fallback: ${modelId} -> ${retryCtx.fallbackModelName} (resource_exhausted)`);
-
-                deleteActiveBridge(bridgeKey);
-                clearInterval(attemptHeartbeat);
-                attemptBridge.kill();
-                currentAttemptBridge = undefined;
-                currentAttemptHeartbeat = undefined;
-
-                const { bridge: fbBridge, heartbeatTimer: fbTimer } =
-                  startBridge(accessToken, retryCtx.fallbackRequestBytes);
-                runAttempt(fbBridge, fbTimer, attemptBlobStore, attemptMcpTools, 0);
-                return;
-              }
               // Auto-retry on transient connect errors (e.g. "invalid_argument",
               // "resource_exhausted") if no content was emitted and we haven't
               // exhausted retries. resource_exhausted can be temporary server
               // overload that clears after a brief delay.
+              // The proxy does NOT switch models for auto/default — it passes
+              // every model ID (including "default") literally to Cursor's API
+              // and relies on Cursor's server-side routing for rate limits.
+              const isRateLimit = endError.message.includes("resource_exhausted");
               if (
                 !anyContentSent &&
                 !blobNotFound &&
-                !retryCtx?.fallbackAttempted &&
                 attempt < maxConnectRetries &&
                 accessToken &&
                 requestBytes
@@ -2703,7 +2609,10 @@ function createBridgeStreamResponse(
           // The setTimeout is scoped inside the ReadableStream — if the client
           // aborts (otto abort), the stream closes and safeRelease fires,
           // so no further retries will execute.
-          if (connectError && !anyContentSent && !retryCtx?.fallbackAttempted && attempt < maxConnectRetries && accessToken && requestBytes) {
+          // Note: !retryCtx?.fallbackAttempted removed intentionally — the
+          // fallback model may also hit resource_exhausted, and we still want
+          // connect-error retries (with backoff) before surfacing the error.
+          if (connectError && !anyContentSent && attempt < maxConnectRetries && accessToken && requestBytes) {
             deleteActiveBridge(bridgeKey);
             attemptBridge.kill();
             const delay = CONNECT_RETRY_BASE_DELAY_MS * retryDelayMultiplier * Math.pow(2, attempt);
