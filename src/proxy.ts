@@ -1172,6 +1172,25 @@ async function doHandleChatCompletion(
     mcpTools,
     stallRecoveryCount: 0,
   };
+
+  // When the user selected auto/default and it resolves to a composer model,
+  // pre-build a fallback request using the "-fast" variant so the proxy can
+  // silently switch if the primary model hits a resource_exhausted quota.
+  if (body.model === DEFAULT_MODEL_ID) {
+    const fastModelId = modelId + "-fast";
+    const fastModelExists = proxyModels.some((m) => m.id === fastModelId);
+    if (fastModelExists) {
+      log.info(`[proxy] auto model: pre-built fallback to ${fastModelId}`);
+      const fallbackPayload = buildCursorRequest(
+        fastModelId, systemPrompt, effectiveUserText, turns,
+        stored.conversationId, stored.checkpoint, stored.blobStore,
+      );
+      fallbackPayload.mcpTools = mcpTools;
+      retryCtx.fallbackRequestBytes = fallbackPayload.requestBytes;
+      retryCtx.fallbackModelName = fastModelId;
+    }
+  }
+
   return handleStreamingResponse(
     payload, accessToken, modelId, bridgeKey, convKey, release,
     retryCtx,
@@ -1990,6 +2009,12 @@ interface RetryContext {
   mcpTools: McpToolDefinition[];
   /** Consecutive internal stall recoveries without forward progress (reset on progress). */
   stallRecoveryCount: number;
+  /** Pre-built request bytes for an automatic fallback model (auto mode). */
+  fallbackRequestBytes?: Uint8Array;
+  /** Display name of the fallback model for user-facing messages. */
+  fallbackModelName?: string;
+  /** Prevent infinite fallback loops. */
+  fallbackAttempted?: boolean;
 }
 
 /** Max automatic retries for transient connect errors (e.g. "invalid_argument"). */
@@ -2297,6 +2322,7 @@ function createBridgeStreamResponse(
         let connectError = false;
         let emptyCloseRetry = false;
         let watchdogHandled = false;
+        let attemptSuperseded = false;
         let lastProgressAt = Date.now();
         const markProgress = () => {
           lastProgressAt = Date.now();
@@ -2437,11 +2463,39 @@ function createBridgeStreamResponse(
                 blobNotFound = true;
                 return; // swallow error — onClose will retry
               }
-              // Auto-retry on transient connect errors (e.g. "invalid_argument")
-              // if no content was emitted and we haven't exhausted retries.
+              // resource_exhausted on the auto/default model -> switch directly
+              // to the pre-built fallback before spending retries on the
+              // rate-limited primary pool.
+              const isRateLimit = endError.message.includes("resource_exhausted");
+              if (
+                isRateLimit &&
+                accessToken &&
+                retryCtx?.fallbackRequestBytes &&
+                !retryCtx.fallbackAttempted
+              ) {
+                retryCtx.fallbackAttempted = true;
+                attemptSuperseded = true;
+                log.warn(`[proxy] auto-fallback: ${modelId} -> ${retryCtx.fallbackModelName} (resource_exhausted)`);
+
+                deleteActiveBridge(bridgeKey);
+                clearInterval(attemptHeartbeat);
+                attemptBridge.kill();
+                currentAttemptBridge = undefined;
+                currentAttemptHeartbeat = undefined;
+
+                const { bridge: fbBridge, heartbeatTimer: fbTimer } =
+                  startBridge(accessToken, retryCtx.fallbackRequestBytes);
+                runAttempt(fbBridge, fbTimer, attemptBlobStore, attemptMcpTools, 0);
+                return;
+              }
+              // Auto-retry on transient connect errors (e.g. "invalid_argument",
+              // "resource_exhausted") if no content was emitted and we haven't
+              // exhausted retries. resource_exhausted can be temporary server
+              // overload that clears after a brief delay.
               if (
                 !anyContentSent &&
                 !blobNotFound &&
+                !retryCtx?.fallbackAttempted &&
                 attempt < maxConnectRetries &&
                 accessToken &&
                 requestBytes
@@ -2450,12 +2504,17 @@ function createBridgeStreamResponse(
                 log.warn(`[proxy] Connect error (attempt ${attempt + 1}/${maxConnectRetries + 1}, pressure=${pressureMode}): ${endError.message}`);
                 return; // swallow error — onClose will retry
               }
+
               anyContentSent = true;
               // For title-gen requests, suppress error-as-content to prevent
               // error messages (e.g. "Connect error resource_exhausted") from
               // becoming the Discord thread title. An empty response is better.
               if (!isTitleGenStream) {
-                sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
+                // Map known gRPC codes to user-friendly messages.
+                const displayMsg = isRateLimit
+                  ? `Cursor responded with "resource exhausted" after ${attempt + 1} attempt(s). This may be a temporary server overload or a rate limit. If the model usually works for you, please retry; if the error persists, try switching to a different model.`
+                  : endError.message;
+                sendSSE(makeChunk({ content: `\n[Error: ${displayMsg}]` }));
               }
             }
           },
@@ -2550,6 +2609,9 @@ function createBridgeStreamResponse(
         attemptBridge.onClose((code) => {
           clearInterval(stallTimer);
           clearInterval(attemptHeartbeat);
+          if (attemptSuperseded) {
+            return;
+          }
           if (watchdogHandled) {
             return;
           }
@@ -2590,7 +2652,7 @@ function createBridgeStreamResponse(
           // The setTimeout is scoped inside the ReadableStream — if the client
           // aborts (otto abort), the stream closes and safeRelease fires,
           // so no further retries will execute.
-          if (connectError && !anyContentSent && attempt < maxConnectRetries && accessToken && requestBytes) {
+          if (connectError && !anyContentSent && !retryCtx?.fallbackAttempted && attempt < maxConnectRetries && accessToken && requestBytes) {
             deleteActiveBridge(bridgeKey);
             attemptBridge.kill();
             const delay = CONNECT_RETRY_BASE_DELAY_MS * retryDelayMultiplier * Math.pow(2, attempt);
