@@ -262,7 +262,11 @@ function buildProviderModel(
     id,
     providerID: CURSOR_PROVIDER_ID,
     api: {
-      id: model.id,
+      // Send the catalog/alias id literally. For the "default" alias this means
+      // Cursor receives "default" and performs its own server-side model
+      // auto-selection and rate-limit routing. Pre-resolving it to a concrete
+      // model here would defeat that (see proxy.resolveProxyModelId).
+      id,
       url: `http://localhost:${port}/v1`,
       npm: "@ai-sdk/openai-compatible",
     },
@@ -408,6 +412,24 @@ function buildConfigModelEntries(
       limit: {
         context: model.contextWindow,
         output: model.maxTokens,
+      },
+      options: {},
+    };
+  }
+
+  // Seed a "default" entry so OpenCode versions that build the model menu from
+  // static config still expose Cursor's auto-routing. The entry key ("default")
+  // is sent upstream verbatim, so Cursor selects/routes the model itself.
+  const defaultModel = selectDefaultCursorModel(models);
+  if (defaultModel && !(DEFAULT_MODEL_ID in entries)) {
+    entries[DEFAULT_MODEL_ID] = {
+      name: `Default (${defaultModel.name})`,
+      reasoning: defaultModel.reasoning,
+      tool_call: true,
+      cost: estimateModelCost(defaultModel.id),
+      limit: {
+        context: defaultModel.contextWindow,
+        output: defaultModel.maxTokens,
       },
       options: {},
     };

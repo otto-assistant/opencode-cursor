@@ -577,8 +577,8 @@ async function testExpiredTokenRefreshBeforeDiscovery(
   );
   assertDefaultProviderModel(
     provider,
-    "fresh-model",
-    "Expected cursor/default to target the discovered model",
+    "default",
+    "Expected cursor/default to pass 'default' literally for Cursor auto-routing",
   );
 
   modules.stopProxy();
@@ -780,8 +780,8 @@ async function testDiscoveryFallbackAndSuccess(
   );
   assertDefaultProviderModel(
     provider,
-    "composer-1.5",
-    "Expected cursor/default to target the best fallback Composer model",
+    "default",
+    "Expected cursor/default to pass 'default' literally (fallback models)",
   );
   const degradedModelsRes = await fetch(`${degradedConfig.baseURL}/models`);
   assertEqual(degradedModelsRes.status, 200, "Expected degraded /v1/models to succeed");
@@ -806,8 +806,8 @@ async function testDiscoveryFallbackAndSuccess(
   );
   assertDefaultProviderModel(
     provider,
-    "real-model-a",
-    "Expected cursor/default to target the first discovered model",
+    "default",
+    "Expected cursor/default to pass 'default' literally (discovered models)",
   );
   const discoveredModelsRes = await fetch(`${discoveredConfig.baseURL}/models`);
   assertEqual(discoveredModelsRes.status, 200, "Expected discovered /v1/models to succeed");

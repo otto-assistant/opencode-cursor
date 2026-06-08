@@ -1044,6 +1044,7 @@ async function doHandleChatCompletion(
   const modelId = resolveProxyModelId(body.model);
   const tools = (body.tools ?? []).filter((tool) => !shouldBlockTool(tool));
   const workspaceRoot = extractWorkspaceRoot(systemPrompt);
+  log.info(`[proxy] bridge model input=${body.model} resolved=${modelId}`);
 
   if (!userText && toolResults.length === 0) {
     return new Response(
