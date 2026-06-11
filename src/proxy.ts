@@ -633,9 +633,13 @@ let proxyServer: ReturnType<typeof Bun.serve> | undefined;
 let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
 let proxyModels: Array<{ id: string; name: string }> = [];
+let sharedProxyMonitorTimer: ReturnType<typeof setInterval> | undefined;
+let sharedProxyMonitorRecovering = false;
 const DEFAULT_MODEL_ID = "default";
 
 const DEFAULT_PROXY_PORT = 8788;
+const SHARED_PROXY_HEALTH_TIMEOUT_MS = 750;
+const SHARED_PROXY_MONITOR_INTERVAL_MS = 5_000;
 
 /**
  * Fixed port the proxy binds to. OpenCode 1.15.x resolves the provider base
@@ -663,6 +667,61 @@ function isAddrInUseError(err: unknown): boolean {
     code === "EADDRINUSE" ||
     (typeof message === "string" && /eaddrinuse|address already in use|in use/i.test(message))
   );
+}
+
+async function isSharedProxyHealthy(): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SHARED_PROXY_HEALTH_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${getCursorProxyBaseUrl()}/models`, {
+      signal: controller.signal,
+    });
+    if (!res.ok) return false;
+    const body = await res.json().catch(() => undefined);
+    return (
+      !!body &&
+      typeof body === "object" &&
+      (body as { object?: unknown }).object === "list" &&
+      Array.isArray((body as { data?: unknown }).data)
+    );
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function clearSharedProxyMonitor(): void {
+  if (!sharedProxyMonitorTimer) return;
+  clearInterval(sharedProxyMonitorTimer);
+  sharedProxyMonitorTimer = undefined;
+}
+
+function startSharedProxyMonitor(): void {
+  if (sharedProxyMonitorTimer) return;
+  sharedProxyMonitorTimer = setInterval(async () => {
+    if (sharedProxyMonitorRecovering || proxyServer) return;
+    if (await isSharedProxyHealthy()) return;
+
+    if (!proxyAccessTokenProvider) {
+      log.warn("[proxy] shared proxy disappeared, but no access token provider is configured");
+      return;
+    }
+
+    sharedProxyMonitorRecovering = true;
+    try {
+      log.warn(`[proxy] shared proxy on port ${CURSOR_PROXY_PORT} is unavailable; attempting to bind locally`);
+      await startProxy(proxyAccessTokenProvider, proxyModels);
+      if (proxyServer) {
+        clearSharedProxyMonitor();
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log.warn(`[proxy] shared proxy recovery failed: ${message}`);
+    } finally {
+      sharedProxyMonitorRecovering = false;
+    }
+  }, SHARED_PROXY_MONITOR_INTERVAL_MS);
 }
 
 function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }>): Array<{
@@ -812,12 +871,22 @@ export async function startProxy(
     });
   } catch (err) {
     if (isAddrInUseError(err)) {
+      if (!(await isSharedProxyHealthy())) {
+        proxyServer = undefined;
+        proxyPort = undefined;
+        throw new Error(
+          `Port ${CURSOR_PROXY_PORT} is already in use, but no healthy Cursor proxy responded on ${getCursorProxyBaseUrl()}/models`,
+          { cause: err },
+        );
+      }
+
       // A sibling plugin instance (another OpenCode session for the same
       // user) already serves the proxy on the shared fixed port. Reuse it
-      // rather than failing provider initialization with a random port the
-      // statically-configured base URL would never match.
+      // only after verifying it responds like this proxy. Keep monitoring so
+      // this process can claim the fixed port if the sibling exits later.
       proxyServer = undefined;
       proxyPort = CURSOR_PROXY_PORT;
+      startSharedProxyMonitor();
       log.warn(
         `[proxy] port ${CURSOR_PROXY_PORT} already in use; reusing existing proxy`,
       );
@@ -840,6 +909,7 @@ export async function startProxy(
   }).catch(() => {});
 
   proxyPort = proxyServer.port;
+  clearSharedProxyMonitor();
   if (!proxyPort) throw new Error("Failed to bind proxy to a port");
   return proxyPort;
 }
@@ -853,6 +923,7 @@ function resolveProxyModelId(modelId: string): string {
 
 export function stopProxy(): void {
   clearIdleShutdownTimer();
+  clearSharedProxyMonitor();
   resolvedTitleGenModel = undefined;
   lastDiscoveryMs = 0;
   if (maintenanceTimer) {
