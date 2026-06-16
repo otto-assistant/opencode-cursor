@@ -14,6 +14,7 @@ interface TestModules {
   startProxy: typeof import("../src/proxy").startProxy;
   stopProxy: typeof import("../src/proxy").stopProxy;
   getProxyPort: typeof import("../src/proxy").getProxyPort;
+  resolveProxyModelId: typeof import("../src/proxy").resolveProxyModelId;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
@@ -269,6 +270,7 @@ async function loadModules(): Promise<TestModules> {
     startProxy: proxy.startProxy,
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
+    resolveProxyModelId: proxy.resolveProxyModelId,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
@@ -379,6 +381,28 @@ async function testTokenExpiry(modules: TestModules) {
   }
 
   console.log("[test] Token expiry OK");
+}
+
+async function testProxyModelAliasResolution(modules: TestModules) {
+  console.log("[test] Testing proxy model alias resolution...");
+
+  assertEqual(
+    modules.resolveProxyModelId("default"),
+    "default",
+    "Expected default alias to pass through for Cursor auto-routing",
+  );
+  assertEqual(
+    modules.resolveProxyModelId("auto"),
+    "default",
+    "Expected legacy auto alias to use Cursor's supported default model id",
+  );
+  assertEqual(
+    modules.resolveProxyModelId("claude-4.5-sonnet"),
+    "claude-4.5-sonnet",
+    "Expected concrete model ids to pass through unchanged",
+  );
+
+  console.log("[test] Proxy model alias resolution OK");
 }
 
 async function testPluginShape(modules: TestModules) {
@@ -1085,6 +1109,7 @@ async function main() {
     await testProxyStartStop(modules);
     await testAuthParams(modules);
     await testTokenExpiry(modules);
+    await testProxyModelAliasResolution(modules);
     await testPluginShape(modules);
     await testConfigHookSeedsProvider(modules);
     await testArrayContentParsing(modules);

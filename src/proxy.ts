@@ -914,10 +914,10 @@ export async function startProxy(
   return proxyPort;
 }
 
-function resolveProxyModelId(modelId: string): string {
-  // Pass every model ID literally to Cursor's API — including "default"/"auto".
-  // Cursor's server handles auto-selection internally; the proxy must NOT
-  // resolve these to a concrete model or it defeats Cursor's dynamic routing.
+export function resolveProxyModelId(modelId: string): string {
+  // Cursor accepts "default" for server-side model auto-selection, but no
+  // longer accepts the older OpenCode/Cursor "auto" alias here.
+  if (modelId === "auto") return DEFAULT_MODEL_ID;
   return modelId;
 }
 
