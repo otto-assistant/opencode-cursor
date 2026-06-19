@@ -1645,14 +1645,19 @@ function createThinkingTagFilter(): {
 interface StreamState {
   toolCallIndex: number;
   pendingExecs: PendingExec[];
+  /** Generated (output) tokens for this turn, accumulated from tokenDelta updates. */
   outputTokens: number;
-  totalTokens: number;
+  /**
+   * Conversation context size reported by Cursor (`tokenDetails.usedTokens`).
+   * This is the input/prompt token count, not the prompt+completion total.
+   */
+  promptTokens: number;
 }
 
 function computeUsage(state: StreamState) {
-  const completion_tokens = state.outputTokens;
-  const total_tokens = state.totalTokens || completion_tokens;
-  const prompt_tokens = Math.max(0, total_tokens - completion_tokens);
+  const completion_tokens = Math.max(0, state.outputTokens);
+  const prompt_tokens = Math.max(0, state.promptTokens);
+  const total_tokens = prompt_tokens + completion_tokens;
   return { prompt_tokens, completion_tokens, total_tokens };
 }
 
@@ -1684,7 +1689,7 @@ function processServerMessage(
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
     if (stateStructure.tokenDetails) {
-      state.totalTokens = stateStructure.tokenDetails.usedTokens;
+      state.promptTokens = stateStructure.tokenDetails.usedTokens;
     }
     if (onCheckpoint) {
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
@@ -2360,7 +2365,7 @@ function createBridgeStreamResponse(
           toolCallIndex: 0,
           pendingExecs: [],
           outputTokens: 0,
-          totalTokens: 0,
+          promptTokens: 0,
         };
         const tagFilter = createThinkingTagFilter();
         // Title-gen requests use convKey starting with "title:".
@@ -2972,7 +2977,7 @@ async function collectFullResponse(
     toolCallIndex: 0,
     pendingExecs: [],
     outputTokens: 0,
-    totalTokens: 0,
+    promptTokens: 0,
   };
   const tagFilter = createThinkingTagFilter();
 
