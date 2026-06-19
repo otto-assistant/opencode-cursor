@@ -69,12 +69,12 @@ import {
   type ExecServerMessage,
   type KvServerMessage,
   type McpToolDefinition,
-} from "./proto/agent_pb";
+} from "./proto/agent_pb.js";
 import { createHash } from "node:crypto";
 import { resolve as pathResolve } from "node:path";
-import { Mutex } from "./promise-queue";
-import { BridgePool, type BridgeHandle } from "./bridge-pool";
-import { log } from "./log";
+import { Mutex } from "./promise-queue.js";
+import { BridgePool, type BridgeHandle } from "./bridge-pool.js";
+import { log } from "./log.js";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;

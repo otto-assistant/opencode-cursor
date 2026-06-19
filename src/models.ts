@@ -6,11 +6,11 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { tool } from "@opencode-ai/plugin";
 const z = tool.schema;
-import { callCursorUnaryRpc } from "./proxy";
+import { callCursorUnaryRpc } from "./proxy.js";
 import {
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
-} from "./proto/agent_pb";
+} from "./proto/agent_pb.js";
 
 const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
 
