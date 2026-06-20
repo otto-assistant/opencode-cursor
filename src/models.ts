@@ -104,8 +104,14 @@ export async function getCursorModels(
 ): Promise<CursorModel[]> {
   if (cachedModels) return cachedModels;
   const discovered = await fetchCursorUsableModels(apiKey);
-  cachedModels = discovered && discovered.length > 0 ? discovered : FALLBACK_MODELS;
-  return cachedModels;
+  // Only cache a successful discovery. Caching FALLBACK_MODELS would pin the
+  // whole process to the bundled list after a single transient failure; instead
+  // return the fallback for this call and let the next call retry discovery.
+  if (discovered && discovered.length > 0) {
+    cachedModels = discovered;
+    return cachedModels;
+  }
+  return FALLBACK_MODELS;
 }
 
 /** @internal Test-only. */

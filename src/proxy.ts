@@ -981,7 +981,7 @@ async function handleTitleGenViaZen(
       })),
     };
 
-    const zenResponse = await fetch("https://opencode.ai/zen/v1/chat/completions", {
+    const zenResponse = await fetch(`${ZEN_BASE_URL}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(zenBody),
@@ -1241,9 +1241,10 @@ async function doHandleChatCompletion(
     stallRecoveryCount: 0,
   };
 
-  // NOTE: Auto model fallback was intentionally removed. The proxy now passes
-  // every model ID (including "default"/"auto") literally to Cursor's API so
-  // Cursor's server handles its own auto-selection and rate-limit routing.
+  // NOTE: Auto model fallback was intentionally removed. The proxy passes model
+  // IDs literally to Cursor's API (Cursor handles its own server-side routing).
+  // The only exception is the legacy "auto" alias, which resolveProxyModelId
+  // maps to "default" because Cursor no longer accepts "auto" here.
 
   return handleStreamingResponse(
     payload, accessToken, modelId, bridgeKey, convKey, release,
@@ -2068,9 +2069,10 @@ interface RetryContext {
   mcpTools: McpToolDefinition[];
   /** Consecutive internal stall recoveries without forward progress (reset on progress). */
   stallRecoveryCount: number;
-  // Note: fallback model fields were intentionally removed — the proxy now
-  // passes model IDs (including "default"/"auto") literally to Cursor. Cursor's
-  // server handles its own auto-selection and rate-limit routing internally.
+  // Note: fallback model fields were intentionally removed — the proxy passes
+  // model IDs literally to Cursor (the legacy "auto" alias is mapped to
+  // "default" by resolveProxyModelId). Cursor's server handles its own
+  // auto-selection and rate-limit routing internally.
 }
 
 /** Max automatic retries for transient connect errors (e.g. "invalid_argument"). */
@@ -2523,9 +2525,10 @@ function createBridgeStreamResponse(
               // "resource_exhausted") if no content was emitted and we haven't
               // exhausted retries. resource_exhausted can be temporary server
               // overload that clears after a brief delay.
-              // The proxy does NOT switch models for auto/default — it passes
-              // every model ID (including "default") literally to Cursor's API
-              // and relies on Cursor's server-side routing for rate limits.
+              // The proxy does NOT switch models on rate limits — it passes
+              // every model ID literally to Cursor's API (the legacy "auto"
+              // alias is normalized to "default" earlier) and relies on
+              // Cursor's server-side routing for rate limits.
               const isRateLimit = endError.message.includes("resource_exhausted");
               if (
                 !anyContentSent &&

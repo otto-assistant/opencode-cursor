@@ -10,6 +10,10 @@ const POLL_MAX_ATTEMPTS = 150;
 const POLL_BASE_DELAY = 1000;
 const POLL_MAX_DELAY = 10_000;
 const POLL_BACKOFF_MULTIPLIER = 1.2;
+/** Per-request network timeout for a single poll attempt. */
+const POLL_REQUEST_TIMEOUT_MS = 30_000;
+/** Network timeout for the token refresh exchange (runs inside provider/auth loading). */
+const REFRESH_REQUEST_TIMEOUT_MS = 30_000;
 
 export interface CursorAuthParams {
   verifier: string;
@@ -53,6 +57,7 @@ export async function pollCursorAuth(
     try {
       const response = await fetch(
         `${CURSOR_POLL_URL}?uuid=${uuid}&verifier=${verifier}`,
+        { signal: AbortSignal.timeout(POLL_REQUEST_TIMEOUT_MS) },
       );
 
       if (response.status === 404) {
@@ -121,6 +126,7 @@ export async function refreshCursorToken(
       "Content-Type": "application/json",
     },
     body: "{}",
+    signal: AbortSignal.timeout(REFRESH_REQUEST_TIMEOUT_MS),
   });
 
   if (!response.ok) {

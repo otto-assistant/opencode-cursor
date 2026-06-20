@@ -1054,6 +1054,50 @@ async function testPoolSequentialRequests() {
   console.log("[test] Pool sequential requests OK");
 }
 
+/**
+ * Test that concurrent requests beyond maxSize succeed via ephemeral overflow
+ * workers, and that those untracked workers do not inflate the tracked pool
+ * (regression guard for the ephemeral-worker leak fix in BridgePool).
+ */
+async function testPoolOverflowEphemeralWorkers() {
+  console.log("[test] Testing pool overflow ephemeral workers...");
+
+  const { BridgePool } = await import("../src/bridge-pool");
+  const server = await createPoolTestServer();
+
+  const pool = new BridgePool({ minSize: 1, maxSize: 1 });
+  pool.warmup();
+  await new Promise((r) => setTimeout(r, 200));
+
+  // Fire more concurrent requests than maxSize so the pool must spawn
+  // ephemeral overflow workers (not tracked in allWorkers).
+  const CONCURRENCY = 4;
+  const results = await Promise.all(
+    Array.from({ length: CONCURRENCY }, () => poolRequest(pool, server.url)),
+  );
+  for (let i = 0; i < results.length; i++) {
+    assertEqual(results[i]!.code, 0, `Overflow request ${i} should succeed (code=0)`);
+  }
+
+  // Give streamDone-driven shutdown of ephemeral workers time to run.
+  await new Promise((r) => setTimeout(r, 200));
+
+  const stats = pool.stats();
+  console.log(`[test]   pool stats after overflow: ${JSON.stringify(stats)}`);
+  assert(
+    stats.total <= 1,
+    `Tracked pool must stay within maxSize after overflow, got total=${stats.total}`,
+  );
+  assert(
+    server.streamCount() >= CONCURRENCY,
+    `Expected >= ${CONCURRENCY} streams, got ${server.streamCount()}`,
+  );
+
+  pool.shutdown();
+  await server.close();
+  console.log("[test] Pool overflow ephemeral workers OK");
+}
+
 async function testStreamingWatchdogRecoversFromStalledRun(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -1121,6 +1165,7 @@ async function main() {
     await testPersistentBridgeSessionIsolation();
     await testPoolRecoveryAfterServerRestart();
     await testPoolSequentialRequests();
+    await testPoolOverflowEphemeralWorkers();
     await testStreamingWatchdogRecoversFromStalledRun(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;

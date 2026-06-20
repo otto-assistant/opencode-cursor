@@ -333,6 +333,12 @@ export class BridgePool {
       cbNow?.(code);
       if (isPooled) {
         pool.release(worker);
+      } else {
+        // Ephemeral overflow worker (pool was saturated at acquire time): it is
+        // not tracked by the pool and will never be reused, so shut it down
+        // instead of leaking the child process.
+        workerSendShutdown(worker);
+        workerKill(worker);
       }
     };
 
@@ -346,6 +352,8 @@ export class BridgePool {
       cbNow?.(1);
       if (isPooled) {
         pool.remove(worker);
+      } else {
+        workerKill(worker);
       }
     };
 
