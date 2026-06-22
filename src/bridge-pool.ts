@@ -21,7 +21,6 @@ const IN_SHUTDOWN = 0x03;
 
 const OUT_DATA = 0x00;
 const OUT_STREAM_DONE = 0x01;
-// const OUT_ERROR = 0x02;
 
 // --- Typed framing helpers ---
 

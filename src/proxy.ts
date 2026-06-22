@@ -22,10 +22,6 @@ import {
   ClientHeartbeatSchema,
   ConversationActionSchema,
   ConversationStateStructureSchema,
-  ConversationStepSchema,
-  AgentConversationTurnStructureSchema,
-  ConversationTurnStructureSchema,
-  AssistantMessageSchema,
   BackgroundShellSpawnResultSchema,
   CursorRuleSchema,
   CursorRuleTypeSchema,
@@ -192,7 +188,6 @@ const MAX_CONVERSATION_BLOB_ENTRIES = Number(process.env.OPENCODE_CURSOR_MAX_CON
 const MAX_LIVE_BRIDGE_BLOB_BYTES = Number(process.env.OPENCODE_CURSOR_MAX_BRIDGE_BLOB_BYTES ?? 128 * 1024 * 1024);
 const MAX_LIVE_BRIDGE_BLOB_ENTRIES = Number(process.env.OPENCODE_CURSOR_MAX_BRIDGE_BLOB_ENTRIES ?? 8192);
 const MAX_TOTAL_CONVERSATION_BLOB_BYTES = Number(process.env.OPENCODE_CURSOR_MAX_TOTAL_CONV_BLOB_BYTES ?? 256 * 1024 * 1024);
-const PROXY_IDLE_SHUTDOWN_MS = 10 * 60 * 1000;
 const MAINTENANCE_INTERVAL_MS = 60 * 1000;
 
 // Bridge pool configuration
@@ -274,35 +269,6 @@ function setActiveBridge(bridgeKey: string, active: ActiveBridge): boolean {
   activeBridges.set(bridgeKey, active);
   return true;
 }
-
-/**
- * Wrap a Response so we can detect when its body stream is fully consumed.
- * Returns the wrapped response (identical to the client) and a `done` promise
- * that resolves when the stream finishes (success, error, or cancellation).
- */
-function trackResponseCompletion(response: Response): {
-  response: Response;
-  done: Promise<void>;
-} {
-  if (!response.body) {
-    return { response, done: Promise.resolve() };
-  }
-
-  const { promise, resolve } = Promise.withResolvers<void>();
-  const { readable, writable } = new TransformStream();
-
-  // Pipe the original body through; resolve when done (success or error).
-  response.body.pipeTo(writable).then(resolve, resolve);
-
-  return {
-    response: new Response(readable, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers,
-    }),
-    done: promise,
-  };
-} // 30 minutes
 
 function evictStaleConversations(): number {
   let evicted = 0;
@@ -647,7 +613,7 @@ const SHARED_PROXY_MONITOR_INTERVAL_MS = 5_000;
  * that matches that URL (a random port would leave the SDK unable to connect).
  * Override with OPENCODE_CURSOR_PROXY_PORT if 8788 is taken.
  */
-export const CURSOR_PROXY_PORT: number = (() => {
+const CURSOR_PROXY_PORT: number = (() => {
   const raw = process.env.OPENCODE_CURSOR_PROXY_PORT;
   const parsed = raw ? Number(raw) : NaN;
   return Number.isInteger(parsed) && parsed > 0 && parsed < 65536
@@ -1222,7 +1188,7 @@ async function doHandleChatCompletion(
   }
 
   const payload = buildCursorRequest(
-    modelId, systemPrompt, effectiveUserText, turns,
+    modelId, systemPrompt, effectiveUserText,
     stored.conversationId, stored.checkpoint, stored.blobStore,
   );
   payload.mcpTools = mcpTools;
@@ -1236,7 +1202,6 @@ async function doHandleChatCompletion(
     modelId,
     systemPrompt,
     effectiveUserText,
-    turns,
     mcpTools,
     stallRecoveryCount: 0,
   };
@@ -1399,7 +1364,6 @@ function buildCursorRequest(
   modelId: string,
   systemPrompt: string,
   userText: string,
-  turns: Array<{ userText: string; assistantText: string }>,
   conversationId: string,
   checkpoint: Uint8Array | null,
   existingBlobStore?: Map<string, Uint8Array>,
@@ -1513,7 +1477,6 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
           while (offset < bytes.length) {
             const tag = bytes[offset];
             const wireType = tag & 0x07;
-            const fieldNum = tag >> 3;
             offset++;
             if (wireType === 2) {
               let len = 0, shift = 0;
@@ -2065,7 +2028,6 @@ interface RetryContext {
   modelId: string;
   systemPrompt: string;
   effectiveUserText: string;
-  turns: Array<{ userText: string; assistantText: string }>;
   mcpTools: McpToolDefinition[];
   /** Consecutive internal stall recoveries without forward progress (reset on progress). */
   stallRecoveryCount: number;
@@ -2673,7 +2635,6 @@ function createBridgeStreamResponse(
               retryCtx.modelId,
               retryCtx.systemPrompt,
               retryCtx.effectiveUserText,
-              retryCtx.turns,
               retryCtx.stored.conversationId,
               null, // no checkpoint
               retryCtx.stored.blobStore,
@@ -2739,7 +2700,6 @@ function createBridgeStreamResponse(
                   retryCtx.modelId,
                   retryCtx.systemPrompt,
                   retryCtx.effectiveUserText,
-                  retryCtx.turns,
                   retryCtx.stored.conversationId,
                   null, // no checkpoint
                   retryCtx.stored.blobStore,

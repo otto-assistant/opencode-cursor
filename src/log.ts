@@ -7,7 +7,7 @@
  * enabled via `OPENCODE_CURSOR_DEBUG` (`1`/`true`/`yes`/`on`). When enabled,
  * messages go to stderr to avoid corrupting any stdout-based protocols.
  */
-export const debugEnabled: boolean = (() => {
+const debugEnabled: boolean = (() => {
   const value = (process.env.OPENCODE_CURSOR_DEBUG ?? "").toLowerCase();
   return value === "1" || value === "true" || value === "yes" || value === "on";
 })();
