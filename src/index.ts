@@ -17,7 +17,7 @@ import {
   RefreshTokenInvalidError,
 } from "./auth.js";
 import { getCursorModels, FALLBACK_MODELS, type CursorModel } from "./models.js";
-import { startProxy, getProxyPort, getCursorProxyBaseUrl } from "./proxy.js";
+import { startProxy, getCursorProxyBaseUrl } from "./proxy.js";
 import { log } from "./log.js";
 
 const CURSOR_PROVIDER_ID = "cursor";
