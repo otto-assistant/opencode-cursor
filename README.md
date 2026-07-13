@@ -10,6 +10,7 @@ Designed for real-world agent usage: streaming, tool calls, long conversations, 
 
 - OAuth login with automatic token refresh
 - Cursor model discovery directly from API
+- Native OpenCode variants for Cursor effort and thinking modes
 - OpenAI-compatible `/v1/chat/completions` proxy for OpenCode runtime compatibility
 - Stable streaming with tool-calling continuation
 - MCP-first tool execution flow for practical agent environments
@@ -71,7 +72,7 @@ This opens Cursor OAuth in your browser. Tokens are stored in `~/.local/share/op
 
 1. Start OpenCode.
 2. Select provider `cursor`.
-3. Choose a Cursor model.
+3. Choose a Cursor model family and, when available, an effort or thinking variant.
 4. Send prompts as usual; the plugin starts the local proxy on demand.
 
 ## Architecture
@@ -83,6 +84,14 @@ OpenCode
   -> Node HTTP/2 bridge (h2-bridge.mjs)
   -> Cursor gRPC API (api2.cursor.sh)
 ```
+
+### Model variant routing
+
+Cursor's variant-aware catalog describes context, thinking, effort, and Fast as model parameters. The plugin maps structural choices to separate OpenCode model listings, for example `Opus 4.8`, `Opus 4.8 Thinking`, `Opus 4.8 1M`, and `Opus 4.8 1M Thinking`. Fast configurations returned by Cursor receive separate `Fast` listings. Each listing exposes only applicable `none`, `low`, `medium`, `high`, `xhigh`, and `max` effort variants.
+
+OpenCode's selected listing and effort are resolved in the `chat.headers` hook. The local proxy consumes the encoded private selection and writes Cursor's server model, parameter values, and max-mode flag to `RequestedModel`, while retaining `ModelDetails` for protocol compatibility. Generic `reasoningEffort` options are removed before the OpenAI-compatible request is sent, so they cannot conflict with Cursor's parameterized selection.
+
+`AvailableModels.variants` is the source of truth for account- and organization-specific availability; parameter definitions never create missing combinations. If variant-aware discovery is unavailable, the plugin conservatively groups the older flat catalog and leaves ambiguous standalone IDs unchanged. The `cursor/default` model remains variant-free and continues to use Cursor's server-side automatic routing.
 
 ### Tool-call lifecycle
 

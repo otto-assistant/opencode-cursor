@@ -16,13 +16,35 @@ import {
   refreshCursorToken,
   RefreshTokenInvalidError,
 } from "./auth.js";
-import { getCursorModels, FALLBACK_MODELS, type CursorModel } from "./models.js";
-import { startProxy, getCursorProxyBaseUrl } from "./proxy.js";
+import {
+  getCursorModels,
+  FALLBACK_MODELS,
+  resolveCursorModelSelection,
+  type CursorModel,
+} from "./models.js";
+import {
+  startProxy,
+  getCursorProxyBaseUrl,
+} from "./proxy.js";
+import {
+  CURSOR_SELECTION_HEADER,
+  encodeCursorModelSelection,
+} from "./model-selection.js";
 import { log } from "./log.js";
 
 const CURSOR_PROVIDER_ID = "cursor";
 const DEFAULT_MODEL_ID = "default";
 const OPENAI_COMPATIBLE_NPM = "@ai-sdk/openai-compatible";
+const CURSOR_VARIANT_OPTION = "cursorVariant";
+const GENERATED_VARIANT_KEYS = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
 
 // Base URL OpenCode uses for the statically-declared provider. It points at
 // the proxy's fixed port so requests reach the local proxy (OpenCode resolves
@@ -40,6 +62,7 @@ async function loadCursorRuntime(
   input: PluginInput,
   getAuth: () => Promise<unknown>,
   provider?: unknown,
+  onModels?: (models: CursorModel[]) => void,
 ): Promise<
   | {
       port: number;
@@ -80,6 +103,7 @@ async function loadCursorRuntime(
   }
 
   const models = await getCursorModels(accessToken);
+  onModels?.(models);
 
   // startProxy() is idempotent: if the proxy is already running on the same
   // port it returns immediately. If it was stopped, it binds a new random port.
@@ -131,6 +155,11 @@ function isCursorOAuthAuth(auth: unknown): auth is CursorOAuthAuth {
 export const CursorAuthPlugin: Plugin = async (
   input: PluginInput,
 ): Promise<Hooks> => {
+  let modelCatalog = FALLBACK_MODELS;
+  const rememberModels = (models: CursorModel[]) => {
+    modelCatalog = models;
+  };
+
   return {
     // Newer OpenCode releases (1.15.x) build the model catalog/menu only from
     // statically declared `config.provider.<id>` entries (or models.dev) and no
@@ -140,7 +169,35 @@ export const CursorAuthPlugin: Plugin = async (
     // refine connection details and models at runtime.
     async config(config) {
       const models = await resolveConfigModels();
+      rememberModels(models);
       ensureCursorProviderConfig(config, models);
+    },
+
+    "chat.headers": async (hookInput, output) => {
+      if (hookInput.model.providerID !== CURSOR_PROVIDER_ID) return;
+      const messageModel = hookInput.message.model as typeof hookInput.message.model & {
+        variant?: unknown;
+      };
+      const variant =
+        typeof messageModel.variant === "string" ? messageModel.variant : undefined;
+      const selected = resolveCursorModelSelection(
+        modelCatalog,
+        hookInput.model.id,
+        variant,
+      );
+      if (selected) {
+        output.headers[CURSOR_SELECTION_HEADER] =
+          encodeCursorModelSelection(selected);
+      }
+    },
+
+    "chat.params": async (hookInput, output) => {
+      if (hookInput.model.providerID !== CURSOR_PROVIDER_ID) return;
+      // The selected Cursor variant is routed through a private local header.
+      // Do not let OpenCode's generic reasoning defaults or our marker leak to
+      // the OpenAI-compatible SDK request body.
+      delete output.options.reasoningEffort;
+      delete output.options[CURSOR_VARIANT_OPTION];
     },
 
     provider: {
@@ -150,6 +207,7 @@ export const CursorAuthPlugin: Plugin = async (
           input,
           async () => ctx.auth,
           provider,
+          rememberModels,
         );
         return runtime?.providerModels ?? {};
       },
@@ -159,7 +217,12 @@ export const CursorAuthPlugin: Plugin = async (
       provider: CURSOR_PROVIDER_ID,
 
       async loader(getAuth, provider) {
-        const runtime = await loadCursorRuntime(input, getAuth, provider);
+        const runtime = await loadCursorRuntime(
+          input,
+          getAuth,
+          provider,
+          rememberModels,
+        );
         if (!runtime) return {};
 
         return {
@@ -273,7 +336,10 @@ function buildProviderModel(
     name: id === DEFAULT_MODEL_ID ? `Default (${model.name})` : model.name,
     capabilities: {
       temperature: true,
-      reasoning: model.reasoning,
+      reasoning:
+        id === DEFAULT_MODEL_ID
+          ? false
+          : model.reasoning && Object.keys(model.variants).length > 0,
       attachment: false,
       toolcall: true,
       input: {
@@ -301,8 +367,30 @@ function buildProviderModel(
     options: {},
     headers: {},
     release_date: "",
-    variants: {},
+    variants: id === DEFAULT_MODEL_ID ? {} : buildRuntimeVariants(model),
   };
+}
+
+function buildRuntimeVariants(
+  model: CursorModel,
+): Record<string, Record<string, string>> {
+  return Object.fromEntries(
+    Object.keys(model.variants).map((key) => [
+      key,
+      { [CURSOR_VARIANT_OPTION]: key },
+    ]),
+  );
+}
+
+function buildConfigVariants(
+  model: CursorModel,
+): Record<string, Record<string, string | boolean>> {
+  const variants: Record<string, Record<string, string | boolean>> =
+    buildRuntimeVariants(model);
+  for (const key of GENERATED_VARIANT_KEYS) {
+    if (!(key in variants)) variants[key] = { disabled: true };
+  }
+  return variants;
 }
 
 /**
@@ -406,7 +494,12 @@ function buildConfigModelEntries(
   for (const model of models) {
     entries[model.id] = {
       name: model.name,
-      reasoning: model.reasoning,
+      // OpenCode prepends generic low/medium/high variants for reasoning-capable
+      // OpenAI-compatible models before merging custom variants. Marking this
+      // config descriptor non-reasoning keeps our explicit Cursor variant map
+      // authoritative, including its canonical presentation order. Cursor
+      // reasoning output and routing are handled by the local proxy.
+      reasoning: false,
       tool_call: true,
       cost: estimateModelCost(model.id),
       limit: {
@@ -414,6 +507,7 @@ function buildConfigModelEntries(
         output: model.maxTokens,
       },
       options: {},
+      variants: buildConfigVariants(model),
     };
   }
 
@@ -424,7 +518,7 @@ function buildConfigModelEntries(
   if (defaultModel && !(DEFAULT_MODEL_ID in entries)) {
     entries[DEFAULT_MODEL_ID] = {
       name: `Default (${defaultModel.name})`,
-      reasoning: defaultModel.reasoning,
+      reasoning: false,
       tool_call: true,
       cost: estimateModelCost(defaultModel.id),
       limit: {
@@ -432,6 +526,9 @@ function buildConfigModelEntries(
         output: defaultModel.maxTokens,
       },
       options: {},
+      variants: Object.fromEntries(
+        GENERATED_VARIANT_KEYS.map((key) => [key, { disabled: true }]),
+      ),
     };
   }
   return entries;

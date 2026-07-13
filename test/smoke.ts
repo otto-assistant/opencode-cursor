@@ -1,8 +1,9 @@
 import http from "node:http";
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
+  AgentClientMessageSchema,
   GetUsableModelsResponseSchema,
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
@@ -15,11 +16,17 @@ interface TestModules {
   stopProxy: typeof import("../src/proxy").stopProxy;
   getProxyPort: typeof import("../src/proxy").getProxyPort;
   resolveProxyModelId: typeof import("../src/proxy").resolveProxyModelId;
+  cursorSelectionHeader: typeof import("../src/model-selection").CURSOR_SELECTION_HEADER;
+  encodeCursorModelSelection: typeof import("../src/model-selection").encodeCursorModelSelection;
+  decodeCursorModelSelection: typeof import("../src/model-selection").decodeCursorModelSelection;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
   getCursorModels: typeof import("../src/models").getCursorModels;
   clearModelCache: typeof import("../src/models").clearModelCache;
+  normalizeCursorModels: typeof import("../src/models").normalizeCursorModels;
+  normalizeAvailableModels: typeof import("../src/models").normalizeAvailableModels;
+  resolveCursorModelSelection: typeof import("../src/models").resolveCursorModelSelection;
 }
 
 interface TestCursorBackend {
@@ -27,6 +34,7 @@ interface TestCursorBackend {
   refreshUrl: string;
   setDiscoveryMode: (mode: DiscoveryMode) => void;
   setDiscoveredModels: (models: Array<{ id: string; name: string; reasoning?: boolean }>) => void;
+  setAvailableModels: (models: unknown[] | undefined) => void;
   resetObservations: () => void;
   getDiscoveryAuthHeaders: () => string[];
   getDiscoveryRequestBodies: () => Uint8Array[];
@@ -39,6 +47,15 @@ interface TestCursorBackend {
   setRefreshResponseRefreshToken: (value: string | null | undefined) => void;
   setRunMode: (mode: RunMode) => void;
   getRunRequestCount: () => number;
+  getRunModelIds: () => string[];
+  getRunSelections: () => Array<{
+    publicId?: string;
+    displayName?: string;
+    modelDetailsMaxMode?: boolean;
+    modelId?: string;
+    maxMode?: boolean;
+    parameters: Record<string, string>;
+  }>;
   close: () => Promise<void>;
 }
 
@@ -94,10 +111,20 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let discoveryMode: DiscoveryMode = "success";
   let runMode: RunMode = "immediate-close";
   let runRequestCount = 0;
+  const runModelIds: string[] = [];
   let runStallConsumed = false;
   let discoveredModels: Array<{ id: string; name: string; reasoning?: boolean }> = [
     { id: "composer-2", name: "Composer 2", reasoning: true },
   ];
+  let availableModels: unknown[] | undefined;
+  const runSelections: Array<{
+    publicId?: string;
+    displayName?: string;
+    modelDetailsMaxMode?: boolean;
+    modelId?: string;
+    maxMode?: boolean;
+    parameters: Record<string, string>;
+  }> = [];
   const discoveryAuthHeaders: string[] = [];
   const discoveryRequestBodies: Uint8Array[] = [];
   const refreshAuthHeaders: string[] = [];
@@ -139,6 +166,39 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     const authHeader = String(headers.authorization ?? "");
     if (path === "/agent.v1.AgentService/Run") {
       runRequestCount++;
+      let pending = Buffer.alloc(0);
+      stream.on("data", (chunk) => {
+        pending = Buffer.concat([pending, Buffer.from(chunk)]);
+        while (pending.length >= 5) {
+          const messageLength = pending.readUInt32BE(1);
+          if (pending.length < 5 + messageLength) break;
+          const payload = pending.subarray(5, 5 + messageLength);
+          pending = pending.subarray(5 + messageLength);
+          try {
+            const message = fromBinary(AgentClientMessageSchema, payload);
+            if (message.message.case === "runRequest") {
+              const runRequest = message.message.value;
+              const modelId = runRequest.modelDetails?.modelId;
+              if (modelId) runModelIds.push(modelId);
+              runSelections.push({
+                publicId: modelId,
+                displayName: runRequest.modelDetails?.displayName,
+                modelDetailsMaxMode: runRequest.modelDetails?.maxMode,
+                modelId: runRequest.requestedModel?.modelId,
+                maxMode: runRequest.requestedModel?.maxMode,
+                parameters: Object.fromEntries(
+                  (runRequest.requestedModel?.parameters ?? []).map((parameter) => [
+                    parameter.id,
+                    parameter.value,
+                  ]),
+                ),
+              });
+            }
+          } catch {
+            // Other Connect frames are not relevant to model-routing assertions.
+          }
+        }
+      });
       stream.respond({
         ":status": 200,
         "content-type": "application/connect+proto",
@@ -166,6 +226,17 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       chunks.push(Buffer.from(chunk));
     });
     stream.on("end", () => {
+      if (path === "/aiserver.v1.AiService/AvailableModels") {
+        if (!availableModels) {
+          stream.respond({ ":status": 404, "content-type": "application/json" });
+          stream.end(JSON.stringify({ error: "not configured" }));
+          return;
+        }
+        stream.respond({ ":status": 200, "content-type": "application/json" });
+        stream.end(JSON.stringify({ models: availableModels }));
+        return;
+      }
+
       if (path === "/agent.v1.AgentService/GetUsableModels") {
         discoveryAuthHeaders.push(authHeader);
         discoveryRequestBodies.push(new Uint8Array(Buffer.concat(chunks)));
@@ -223,6 +294,9 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     setDiscoveredModels(models) {
       discoveredModels = models;
     },
+    setAvailableModels(models) {
+      availableModels = models;
+    },
     resetObservations() {
       discoveryAuthHeaders.length = 0;
       discoveryRequestBodies.length = 0;
@@ -244,9 +318,20 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       runMode = mode;
       runStallConsumed = false;
       runRequestCount = 0;
+      runModelIds.length = 0;
+      runSelections.length = 0;
     },
     getRunRequestCount() {
       return runRequestCount;
+    },
+    getRunModelIds() {
+      return [...runModelIds];
+    },
+    getRunSelections() {
+      return runSelections.map((selection) => ({
+        ...selection,
+        parameters: { ...selection.parameters },
+      }));
     },
     async close() {
       await Promise.all([
@@ -266,16 +351,23 @@ async function loadModules(): Promise<TestModules> {
   const auth = await import("../src/auth");
   const index = await import("../src/index");
   const models = await import("../src/models");
+  const modelSelection = await import("../src/model-selection");
   return {
     startProxy: proxy.startProxy,
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
     resolveProxyModelId: proxy.resolveProxyModelId,
+    cursorSelectionHeader: modelSelection.CURSOR_SELECTION_HEADER,
+    encodeCursorModelSelection: modelSelection.encodeCursorModelSelection,
+    decodeCursorModelSelection: modelSelection.decodeCursorModelSelection,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
     getCursorModels: models.getCursorModels,
     clearModelCache: models.clearModelCache,
+    normalizeCursorModels: models.normalizeCursorModels,
+    normalizeAvailableModels: models.normalizeAvailableModels,
+    resolveCursorModelSelection: models.resolveCursorModelSelection,
   };
 }
 
@@ -401,6 +493,11 @@ async function testProxyModelAliasResolution(modules: TestModules) {
     "claude-4.5-sonnet",
     "Expected concrete model ids to pass through unchanged",
   );
+  assertEqual(
+    modules.resolveProxyModelId("gpt-5.6-sol", "gpt-5.6-sol-high"),
+    "gpt-5.6-sol-high",
+    "Expected private header selection to override the public family id",
+  );
 
   console.log("[test] Proxy model alias resolution OK");
 }
@@ -431,8 +528,761 @@ async function testPluginShape(modules: TestModules) {
   if (typeof hooks.auth.methods[0].authorize !== "function") {
     throw new Error("Plugin auth method missing authorize function");
   }
+  if (typeof hooks["chat.headers"] !== "function") {
+    throw new Error("Plugin hooks missing 'chat.headers'");
+  }
+  if (typeof hooks["chat.params"] !== "function") {
+    throw new Error("Plugin hooks missing 'chat.params'");
+  }
 
   console.log("[test] Plugin shape OK");
+}
+
+function enumParameter(
+  id: string,
+  values: Array<{ value: string; displayName?: string }>,
+): Record<string, unknown> {
+  return {
+    id,
+    parameterType: { enumParameter: { values } },
+  };
+}
+
+function booleanParameter(id: string): Record<string, unknown> {
+  return {
+    id,
+    parameterType: {
+      booleanParameter: {
+        values: [{ value: "false" }, { value: "true", displayName: "Fast" }],
+      },
+    },
+  };
+}
+
+function makeGptAvailableModel(includeFast = false): Record<string, unknown> {
+  // Cursor does not guarantee the presentation order OpenCode expects.
+  const efforts = ["low", "medium", "high", "none", "xhigh", "max"];
+  const baseVariants = ["272k", "1m"].flatMap((context) =>
+    efforts.map((reasoning) => ({
+      parameterValues: [
+        { id: "context", value: context },
+        { id: "reasoning", value: reasoning },
+        { id: "fast", value: "false" },
+      ],
+      legacySlug: `gpt-5.6-sol-${reasoning}`,
+      isMaxMode: context === "1m",
+      isDefaultNonMaxConfig: context === "272k" && reasoning === "medium",
+      isDefaultMaxConfig: context === "1m" && reasoning === "medium",
+    })),
+  );
+  const variants = includeFast
+    ? baseVariants.flatMap((variant) => [
+        variant,
+        {
+          ...variant,
+          parameterValues: variant.parameterValues.map((parameter) =>
+            parameter.id === "fast"
+              ? { id: "fast", value: "true" }
+              : parameter,
+          ),
+          legacySlug: `${variant.legacySlug}-fast`,
+          isDefaultNonMaxConfig: false,
+          isDefaultMaxConfig: false,
+        },
+      ])
+    : baseVariants;
+  return {
+    name: "gpt-5.6-sol",
+    clientDisplayName: "GPT-5.6 Sol",
+    serverModelName: "gpt-5.6-sol",
+    parameterDefinitions: [
+      enumParameter("context", [
+        { value: "272k", displayName: "272K" },
+        { value: "1m", displayName: "1M" },
+      ]),
+      enumParameter(
+        "reasoning",
+        efforts.map((value) => ({ value })),
+      ),
+      booleanParameter("fast"),
+    ],
+    variants,
+  };
+}
+
+function makeOpusAvailableModel(): Record<string, unknown> {
+  const efforts = ["low", "medium", "high", "xhigh", "max"];
+  const variants = ["300k", "1m"].flatMap((context) =>
+    [false, true].flatMap((thinking) =>
+      efforts.map((effort) => ({
+        parameterValues: [
+          { id: "thinking", value: String(thinking) },
+          { id: "context", value: context },
+          { id: "effort", value: effort },
+          { id: "fast", value: "false" },
+        ],
+        legacySlug: `claude-opus-4-8-${thinking ? "thinking-" : ""}${effort}`,
+        isMaxMode: context === "1m",
+        isDefaultNonMaxConfig:
+          context === "300k" && thinking && effort === "high",
+        isDefaultMaxConfig: context === "1m" && thinking && effort === "high",
+      })),
+    ),
+  );
+  return {
+    name: "claude-opus-4-8",
+    clientDisplayName: "Opus 4.8",
+    serverModelName: "claude-opus-4-8",
+    parameterDefinitions: [
+      booleanParameter("thinking"),
+      enumParameter("context", [
+        { value: "300k", displayName: "300K" },
+        { value: "1m", displayName: "1M" },
+      ]),
+      enumParameter("effort", efforts.map((value) => ({ value }))),
+      booleanParameter("fast"),
+    ],
+    variants,
+  };
+}
+
+function filterAvailableVariants(
+  model: Record<string, unknown>,
+  predicate: (parameters: Record<string, string>) => boolean,
+): Record<string, unknown> {
+  const variants = Array.isArray(model.variants) ? model.variants : [];
+  return {
+    ...model,
+    variants: variants.filter((variant) => {
+      if (!variant || typeof variant !== "object" || Array.isArray(variant)) return false;
+      const variantRecord = variant as Record<string, unknown>;
+      const parameterValues = Array.isArray(variantRecord.parameterValues)
+        ? variantRecord.parameterValues
+        : [];
+      const values = Object.fromEntries(
+        parameterValues.flatMap((parameter) => {
+          if (!parameter || typeof parameter !== "object" || Array.isArray(parameter)) {
+            return [];
+          }
+          const parameterRecord = parameter as Record<string, unknown>;
+          return typeof parameterRecord.id === "string"
+            ? [[parameterRecord.id, String(parameterRecord.value)] as const]
+            : [];
+        }),
+      );
+      return predicate(values);
+    }),
+  };
+}
+
+async function testAvailableModelParameterGrouping(modules: TestModules) {
+  console.log("[test] Testing parameter-aware AvailableModels grouping...");
+  const models = modules.normalizeAvailableModels([
+    makeGptAvailableModel(),
+    makeOpusAvailableModel(),
+  ]);
+
+  const gptIds = models
+    .filter((model) => model.id.startsWith("gpt-5.6-sol"))
+    .map((model) => model.id);
+  assertArrayEqual(
+    gptIds,
+    [
+      "gpt-5.6-sol",
+      "gpt-5.6-sol-1m",
+    ],
+    "Expected only returned GPT context combinations",
+  );
+  for (const id of gptIds) {
+    const model = models.find((candidate) => candidate.id === id)!;
+    assertArrayEqual(
+      Object.keys(model.variants),
+      ["none", "low", "medium", "high", "xhigh", "max"],
+      `Expected simple GPT effort variants on ${id}`,
+    );
+  }
+
+  const gpt1mHigh = models.find((model) => model.id === "gpt-5.6-sol-1m")!
+    .variants.high;
+  assertEqual(gpt1mHigh.modelId, "gpt-5.6-sol", "Expected shared GPT server model");
+  assertEqual(gpt1mHigh.maxMode, true, "Expected 1M GPT max mode");
+  assertEqual(
+    Object.fromEntries(gpt1mHigh.parameters.map((parameter) => [parameter.id, parameter.value])).context,
+    "1m",
+    "Expected 1M GPT context parameter",
+  );
+  const fastModels = modules.normalizeAvailableModels([
+    makeGptAvailableModel(true),
+  ]);
+  assertArrayEqual(
+    fastModels.map((model) => model.id),
+    [
+      "gpt-5.6-sol",
+      "gpt-5.6-sol-1m",
+      "gpt-5.6-sol-1m-fast",
+      "gpt-5.6-sol-fast",
+    ],
+    "Expected Fast listings only when fast=true variants are returned",
+  );
+  const gptFast = fastModels.find((model) => model.id === "gpt-5.6-sol-fast")!;
+  assertEqual(
+    Object.fromEntries(
+      gptFast.variants.medium.parameters.map((parameter) => [parameter.id, parameter.value]),
+    ).fast,
+    "true",
+    "Expected returned GPT Fast listing",
+  );
+
+  const fastWithout1m = modules.normalizeAvailableModels([
+    filterAvailableVariants(
+      makeGptAvailableModel(true),
+      (parameters) => parameters.context === "272k",
+    ),
+  ]);
+  assertArrayEqual(
+    fastWithout1m.map((model) => model.id),
+    ["gpt-5.6-sol", "gpt-5.6-sol-fast"],
+    "Expected an org with Fast but no 1M to expose only those combinations",
+  );
+  const oneMWithoutFast = modules.normalizeAvailableModels([
+    filterAvailableVariants(
+      makeGptAvailableModel(false),
+      (parameters) => parameters.context === "1m",
+    ),
+  ]);
+  assertArrayEqual(
+    oneMWithoutFast.map((model) => model.id),
+    ["gpt-5.6-sol-1m"],
+    "Expected an org with 1M but no Fast to expose only the 1M listing",
+  );
+
+  const opusIds = models
+    .filter((model) => model.id.startsWith("claude-opus-4-8"))
+    .map((model) => model.id);
+  assertArrayEqual(
+    opusIds,
+    [
+      "claude-opus-4-8",
+      "claude-opus-4-8-1m",
+      "claude-opus-4-8-1m-thinking",
+      "claude-opus-4-8-thinking",
+    ],
+    "Expected only returned context and Thinking combinations for Opus",
+  );
+  for (const id of opusIds) {
+    const model = models.find((candidate) => candidate.id === id)!;
+    assertArrayEqual(
+      Object.keys(model.variants),
+      ["low", "medium", "high", "xhigh", "max"],
+      `Expected simple Opus effort variants on ${id}`,
+    );
+  }
+  assertEqual(
+    models.find((model) => model.id === "claude-opus-4-8-1m-thinking")?.name,
+    "Opus 4.8 1M Thinking",
+    "Expected Opus listing name to preserve context and Thinking",
+  );
+  const thinkingOnly = modules.normalizeAvailableModels([
+    filterAvailableVariants(
+      makeOpusAvailableModel(),
+      (parameters) =>
+        parameters.context === "300k" && parameters.thinking === "true",
+    ),
+  ]);
+  assertArrayEqual(
+    thinkingOnly.map((model) => model.id),
+    ["claude-opus-4-8-thinking"],
+    "Expected restricted Thinking availability to produce only its returned listing",
+  );
+
+  const edgeModels = modules.normalizeAvailableModels([
+    {
+      name: "partial",
+      clientDisplayName: "Partial",
+      serverModelName: "partial",
+      parameterDefinitions: [
+        enumParameter("effort", [
+          { value: "low" },
+          { value: "medium" },
+          { value: "high" },
+          { value: "turbo" },
+        ]),
+        booleanParameter("fast"),
+      ],
+      variants: [
+        { parameterValues: [{ id: "effort", value: "low" }, { id: "fast", value: "false" }], legacySlug: "partial-low" },
+        { parameterValues: [{ id: "effort", value: "low" }, { id: "fast", value: "true" }], legacySlug: "partial-low-fast" },
+        { parameterValues: [{ id: "effort", value: "medium" }], legacySlug: "partial-medium" },
+        { parameterValues: [{ id: "effort", value: "HIGH" }, { id: "fast", value: "false" }], legacySlug: "partial-high" },
+        { parameterValues: [{ id: "effort", value: "turbo" }, { id: "fast", value: "false" }], legacySlug: "partial-turbo" },
+      ],
+    },
+    {
+      name: "collision",
+      clientDisplayName: "Collision",
+      serverModelName: "collision",
+      parameterDefinitions: [
+        enumParameter("effort", [{ value: "low" }, { value: "medium" }]),
+        booleanParameter("fast"),
+      ],
+      variants: [
+        { parameterValues: [{ id: "effort", value: "low" }, { id: "fast", value: "false" }], legacySlug: "collision-low" },
+        { parameterValues: [{ id: "effort", value: "medium" }, { id: "fast", value: "false" }], legacySlug: "collision-medium" },
+        { parameterValues: [{ id: "effort", value: "low" }, { id: "fast", value: "true" }], legacySlug: "collision-low-fast" },
+        { parameterValues: [{ id: "effort", value: "medium" }, { id: "fast", value: "true" }], legacySlug: "collision-medium-fast" },
+      ],
+    },
+    {
+      name: "collision-fast",
+      clientDisplayName: "Native Collision Fast",
+      serverModelName: "collision-fast",
+      variants: [{ legacySlug: "collision-fast" }],
+    },
+    {
+      name: "dimensions",
+      clientDisplayName: "Dimensions",
+      serverModelName: "dimensions",
+      parameterDefinitions: [
+        enumParameter("region", [
+          { value: "us", displayName: "US" },
+          { value: "eu", displayName: "EU" },
+        ]),
+        enumParameter("effort", [{ value: "low" }, { value: "high" }]),
+      ],
+      variants: [
+        { parameterValues: [{ id: "region", value: "us" }, { id: "effort", value: "low" }], legacySlug: "dimensions-us-low" },
+        { parameterValues: [{ id: "region", value: "us" }, { id: "effort", value: "high" }], legacySlug: "dimensions-us-high" },
+        { parameterValues: [{ id: "region", value: "eu" }, { id: "effort", value: "low" }], legacySlug: "dimensions-eu-low" },
+        { parameterValues: [{ id: "region", value: "eu" }, { id: "effort", value: "high" }], legacySlug: "dimensions-eu-high" },
+      ],
+    },
+    {
+      name: "unknown-dimension",
+      clientDisplayName: "Unknown Dimension",
+      serverModelName: "unknown-dimension",
+      variants: [
+        { parameterValues: [{ id: "region", value: "us" }, { id: "effort", value: "low" }], legacySlug: "unknown-dimension-low" },
+        { parameterValues: [{ id: "effort", value: "high" }], legacySlug: "unknown-dimension-high" },
+      ],
+    },
+    {
+      name: "collision-values",
+      clientDisplayName: "Collision Values",
+      serverModelName: "collision-values",
+      parameterDefinitions: [
+        enumParameter("region", [
+          { value: "us" },
+          { value: "eu-west" },
+          { value: "eu west" },
+        ]),
+        enumParameter("effort", [{ value: "low" }, { value: "high" }]),
+      ],
+      variants: [
+        { parameterValues: [{ id: "region", value: "eu-west" }, { id: "effort", value: "low" }], legacySlug: "collision-values-low" },
+        { parameterValues: [{ id: "region", value: "eu west" }, { id: "effort", value: "high" }], legacySlug: "collision-values-high" },
+      ],
+    },
+    {
+      name: "sonnet-4-6-test",
+      clientDisplayName: "Sonnet 4.6 Test",
+      serverModelName: "sonnet-4-6-test",
+      variants: ["low", "medium", "high", "max"].map((effort) => ({
+        parameterValues: [{ id: "effort", value: effort }],
+        legacySlug: `sonnet-4-6-test-${effort}`,
+      })),
+    },
+    {
+      name: "sonnet-5-test",
+      clientDisplayName: "Sonnet 5 Test",
+      serverModelName: "sonnet-5-test",
+      variants: ["low", "medium", "high", "xhigh", "max"].map((effort) => ({
+        parameterValues: [{ id: "effort", value: effort }],
+        legacySlug: `sonnet-5-test-${effort}`,
+      })),
+    },
+  ]);
+  assertArrayEqual(
+    Object.keys(edgeModels.find((model) => model.id === "partial-fast")!.variants),
+    ["low"],
+    "Expected only explicitly returned Fast effort combinations",
+  );
+  assertArrayEqual(
+    Object.keys(edgeModels.find((model) => model.id === "partial")!.variants),
+    ["low", "medium", "high"],
+    "Expected unknown efforts to be excluded and mixed-case efforts normalized",
+  );
+  const collision = edgeModels.find((model) => model.id === "collision-fast");
+  assertEqual(
+    collision?.defaultSelection.modelId,
+    "collision-fast",
+    "Expected a declared model to win over a generated structural id collision",
+  );
+  assertEqual(
+    edgeModels.find((model) => model.id === "collision-fast-from-collision")
+      ?.defaultSelection.modelId,
+    "collision",
+    "Expected the colliding returned structural combination to remain addressable",
+  );
+  assertArrayEqual(
+    edgeModels
+      .filter((model) => model.id.startsWith("dimensions"))
+      .map((model) => model.id),
+    ["dimensions", "dimensions-region-eu"],
+    "Expected arbitrary returned structural parameter combinations to form listings",
+  );
+  assertArrayEqual(
+    edgeModels
+      .filter((model) => model.id.startsWith("unknown-dimension"))
+      .map((model) => model.id),
+    ["unknown-dimension", "unknown-dimension-region-unset"],
+    "Expected missing and explicit unknown structural values to remain distinct",
+  );
+  const normalizedCollisionIds = edgeModels
+    .filter((model) => model.id.startsWith("collision-values-region-eu-west"))
+    .map((model) => model.id);
+  assertArrayEqual(
+    normalizedCollisionIds,
+    [
+      "collision-values-region-eu-west",
+      "collision-values-region-eu-west-from-collision-values",
+    ],
+    "Expected lossless structural grouping before public-id normalization",
+  );
+  assertArrayEqual(
+    normalizedCollisionIds.map((id) =>
+      edgeModels.find((model) => model.id === id)!.defaultSelection.parameters
+        .find((parameter) => parameter.id === "region")!.value,
+    ),
+    ["eu-west", "eu west"],
+    "Expected both colliding structural values to remain addressable",
+  );
+  assertArrayEqual(
+    Object.keys(edgeModels.find((model) => model.id === "sonnet-4-6-test")!.variants),
+    ["low", "medium", "high", "max"],
+    "Expected Sonnet 4.6 to omit unavailable xhigh",
+  );
+  assertArrayEqual(
+    Object.keys(edgeModels.find((model) => model.id === "sonnet-5-test")!.variants),
+    ["low", "medium", "high", "xhigh", "max"],
+    "Expected Sonnet 5 to retain returned xhigh",
+  );
+
+  console.log("[test] Parameter-aware AvailableModels grouping OK");
+}
+
+async function testCursorModelVariantGrouping(modules: TestModules) {
+  console.log("[test] Testing Cursor model family grouping...");
+
+  const models = modules.normalizeCursorModels([
+    {
+      modelId: "gpt-5.6-sol-low",
+      displayName: "GPT-5.6 Sol Low",
+      thinkingDetails: {},
+    },
+    {
+      modelId: "gpt-5.6-sol-medium",
+      displayName: "GPT-5.6 Sol Medium",
+      thinkingDetails: {},
+    },
+    {
+      modelId: "gpt-5.6-sol-high",
+      displayName: "GPT-5.6 Sol High",
+      thinkingDetails: {},
+    },
+    {
+      modelId: "gpt-5.6-sol-extra-high",
+      displayName: "GPT-5.6 Sol Extra High",
+      thinkingDetails: {},
+    },
+    {
+      modelId: "claude-opus-4.8-none",
+      displayName: "Claude Opus 4.8 None",
+      thinkingDetails: {},
+    },
+    {
+      modelId: "claude-opus-4.8-high",
+      displayName: "Claude Opus 4.8 High",
+      thinkingDetails: {},
+    },
+    {
+      modelId: "claude-opus-4.8-low-thinking",
+      displayName: "Claude Opus 4.8 Low Thinking",
+      thinkingDetails: {},
+    },
+    {
+      modelId: "claude-opus-4.8-high-thinking",
+      displayName: "Claude Opus 4.8 High Thinking",
+      thinkingDetails: {},
+    },
+    {
+      modelId: "claude-opus-4.8-1m-none",
+      displayName: "Claude Opus 4.8 1M None",
+      thinkingDetails: {},
+    },
+    {
+      modelId: "claude-opus-4.8-1m-high",
+      displayName: "Claude Opus 4.8 1M High",
+      thinkingDetails: {},
+    },
+    {
+      modelId: "claude-opus-4.8-1m-low-thinking",
+      displayName: "Claude Opus 4.8 1M Low Thinking",
+      thinkingDetails: {},
+    },
+    {
+      modelId: "claude-opus-4.8-1m-high-thinking",
+      displayName: "Claude Opus 4.8 1M High Thinking",
+      thinkingDetails: {},
+    },
+    {
+      modelId: "gpt-5.1-codex-max",
+      displayName: "GPT-5.1 Codex Max",
+      thinkingDetails: {},
+    },
+  ]);
+
+  assertArrayEqual(
+    models.map((model) => model.id),
+    [
+      "claude-opus-4.8",
+      "claude-opus-4.8-1m",
+      "claude-opus-4.8-1m-thinking",
+      "claude-opus-4.8-thinking",
+      "gpt-5.1-codex-max",
+      "gpt-5.6-sol",
+    ],
+    "Expected effort permutations to collapse into stable families",
+  );
+
+  const gpt = models.find((model) => model.id === "gpt-5.6-sol");
+  assert(gpt, "Expected grouped GPT family");
+  assertEqual(gpt.name, "GPT-5.6 Sol", "Expected variant label removed from family name");
+  assertEqual(
+    gpt.defaultSelection.publicId,
+    "gpt-5.6-sol-medium",
+    "Expected medium to be the default when Cursor provides no bare model",
+  );
+  assertEqual(gpt.variants.low.publicId, "gpt-5.6-sol-low", "Expected low wire model");
+  assertEqual(gpt.variants.medium.publicId, "gpt-5.6-sol-medium", "Expected medium wire model");
+  assertEqual(gpt.variants.high.publicId, "gpt-5.6-sol-high", "Expected high wire model");
+  assertEqual(
+    gpt.variants.xhigh.publicId,
+    "gpt-5.6-sol-extra-high",
+    "Expected Extra High to use OpenCode's xhigh variant key",
+  );
+  assertEqual(
+    modules.resolveCursorModelSelection(models, "gpt-5.6-sol", "high")?.publicId,
+    "gpt-5.6-sol-high",
+    "Expected explicit variant to resolve to its Cursor wire model",
+  );
+  assertEqual(
+    modules.resolveCursorModelSelection(models, "gpt-5.6-sol", undefined)?.publicId,
+    "gpt-5.6-sol-medium",
+    "Expected missing variant to resolve to the family default",
+  );
+
+  const opus = models.find((model) => model.id === "claude-opus-4.8-1m");
+  assert(opus, "Expected grouped 1M family");
+  assertEqual(
+    opus.variants.high.publicId,
+    "claude-opus-4.8-1m-high",
+    "Expected non-thinking effort to remain on the 1M family",
+  );
+
+  const opusThinking = models.find(
+    (model) => model.id === "claude-opus-4.8-1m-thinking",
+  );
+  assert(opusThinking, "Expected Thinking to remain a separate 1M family");
+  assertEqual(
+    opusThinking.name,
+    "Claude Opus 4.8 1M Thinking",
+    "Expected Thinking to remain in the model name",
+  );
+  assertEqual(
+    opusThinking.variants.high.publicId,
+    "claude-opus-4.8-1m-high-thinking",
+    "Expected simple high effort on the separate Thinking family",
+  );
+
+  const codexMax = models.find((model) => model.id === "gpt-5.1-codex-max");
+  assert(codexMax, "Expected ambiguous lone -max model to remain flat");
+  assertEqual(
+    Object.keys(codexMax.variants).length,
+    0,
+    "Expected no inferred variants for an ambiguous lone model",
+  );
+
+  const mismatchedNames = modules.normalizeCursorModels([
+    { modelId: "vendor-model-low", displayName: "Legacy Low" },
+    { modelId: "vendor-model-high", displayName: "Next High" },
+  ]);
+  assertArrayEqual(
+    mismatchedNames.map((model) => model.id),
+    ["vendor-model-high", "vendor-model-low"],
+    "Expected mismatched display-name bases to remain separate",
+  );
+
+  console.log("[test] Cursor model family grouping OK");
+}
+
+async function testCursorVariantHooks(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing Cursor variant hook routing...");
+  modules.stopProxy();
+  modules.clearModelCache();
+  backend.setDiscoveryMode("success");
+  backend.setAvailableModels([makeGptAvailableModel()]);
+
+  const hooks = await modules.CursorAuthPlugin({
+    client: { auth: { set: async () => {} } },
+  } as any);
+  const provider = { models: {} as Record<string, any> };
+  await hooks.auth!.loader(
+    async () => ({
+      type: "oauth",
+      access: "variant-access",
+      refresh: "valid-refresh",
+      expires: Date.now() + 60_000,
+    }),
+    provider as any,
+  );
+
+  const family = provider.models["gpt-5.6-sol"];
+  assert(family, "Expected runtime provider to expose one GPT family");
+  assert(provider.models["gpt-5.6-sol-1m"], "Expected separate GPT 1M listing");
+  assert(
+    !("gpt-5.6-sol-fast" in provider.models),
+    "Expected no Fast listing when AvailableModels returns no fast=true variant",
+  );
+  assertEqual(
+    family.variants.high.cursorVariant,
+    "high",
+    "Expected namespaced high variant marker",
+  );
+
+  const headerOutput = { headers: {} as Record<string, string> };
+  await hooks["chat.headers"]!(
+    {
+      sessionID: "variant-session",
+      agent: "build",
+      model: family,
+      message: {
+        model: {
+          providerID: "cursor",
+          modelID: "gpt-5.6-sol",
+          variant: "high",
+        },
+      },
+    } as any,
+    headerOutput,
+  );
+  const encodedSelection = headerOutput.headers[modules.cursorSelectionHeader];
+  const decodedSelection = modules.decodeCursorModelSelection(encodedSelection);
+  assertEqual(
+    decodedSelection?.publicId,
+    "gpt-5.6-sol-high",
+    "Expected selected variant to become the exact Cursor selection header",
+  );
+  assertEqual(
+    decodedSelection?.modelId,
+    "gpt-5.6-sol",
+    "Expected selected variant to retain the Cursor server model",
+  );
+  assertEqual(
+    Object.fromEntries(
+      (decodedSelection?.parameters ?? []).map((parameter) => [
+        parameter.id,
+        parameter.value,
+      ]),
+    ).context,
+    "272k",
+    "Expected selected variant to retain its context parameter",
+  );
+
+  const paramsOutput = {
+    temperature: undefined,
+    topP: undefined,
+    topK: undefined,
+    options: {
+      reasoningEffort: "medium",
+      cursorVariant: "high",
+      keep: "value",
+    } as Record<string, unknown>,
+  };
+  await hooks["chat.params"]!(
+    { model: family } as any,
+    paramsOutput as any,
+  );
+  assert(
+    !("reasoningEffort" in paramsOutput.options),
+    "Expected injected reasoning effort to be removed",
+  );
+  assert(
+    !("cursorVariant" in paramsOutput.options),
+    "Expected private variant marker not to reach the SDK request body",
+  );
+  assertEqual(
+    paramsOutput.options.keep,
+    "value",
+    "Expected unrelated request options to remain",
+  );
+
+  modules.stopProxy();
+  backend.setAvailableModels(undefined);
+  modules.clearModelCache();
+  console.log("[test] Cursor variant hook routing OK");
+}
+
+async function testProxyConsumesCursorModelHeader(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing proxy consumes Cursor model header...");
+  modules.stopProxy();
+  backend.setRunMode("immediate-close");
+  const port = await modules.startProxy(async () => "test-token");
+
+  const res = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      [modules.cursorSelectionHeader]: modules.encodeCursorModelSelection({
+        publicId: "gpt-5.6-sol-high",
+        modelId: "gpt-5.6-sol",
+        displayName: "GPT-5.6 Sol",
+        parameters: [
+          { id: "context", value: "1m" },
+          { id: "reasoning", value: "high" },
+          { id: "fast", value: "false" },
+        ],
+        maxMode: true,
+      }),
+    },
+    body: JSON.stringify({
+      model: "gpt-5.6-sol",
+      stream: true,
+      messages: [{ role: "user", content: "route this model" }],
+    }),
+  });
+  assertEqual(res.status, 200, "Expected header-routed request to succeed");
+  await res.text();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert(
+    backend.getRunModelIds().includes("gpt-5.6-sol-high"),
+    `Expected Cursor Run model gpt-5.6-sol-high, got ${JSON.stringify(backend.getRunModelIds())}`,
+  );
+  const selection = backend.getRunSelections().at(-1);
+  assertEqual(selection?.modelId, "gpt-5.6-sol", "Expected RequestedModel server id");
+  assertEqual(selection?.maxMode, true, "Expected RequestedModel max mode");
+  assertEqual(selection?.displayName, "GPT-5.6 Sol", "Expected ModelDetails display name");
+  assertEqual(selection?.modelDetailsMaxMode, true, "Expected ModelDetails max mode");
+  assertEqual(selection?.parameters.context, "1m", "Expected context parameter");
+  assertEqual(selection?.parameters.reasoning, "high", "Expected reasoning parameter");
+
+  modules.stopProxy();
+  console.log("[test] Proxy Cursor model header routing OK");
 }
 
 async function testConfigHookSeedsProvider(modules: TestModules) {
@@ -467,6 +1317,31 @@ async function testConfigHookSeedsProvider(modules: TestModules) {
   assert(
     "composer-1" in cursor.models,
     "Expected fallback model composer-1 to be seeded",
+  );
+  assertEqual(
+    cursor.models["composer-1"].reasoning,
+    false,
+    "Expected Cursor config models to bypass OpenCode generic variant generation",
+  );
+  assertEqual(
+    cursor.models.default.reasoning,
+    false,
+    "Expected cursor/default not to generate misleading reasoning variants",
+  );
+  assertEqual(
+    cursor.models.default.variants.low.disabled,
+    true,
+    "Expected cursor/default low variant to be suppressed",
+  );
+  assertEqual(
+    cursor.models.default.variants.max.disabled,
+    true,
+    "Expected cursor/default max variant to be suppressed",
+  );
+  assertEqual(
+    cursor.models["composer-1"].variants.medium.disabled,
+    true,
+    "Expected unsupported generic variants to be suppressed on flat models",
   );
 
   // User overrides must be preserved and win over seeded defaults.
@@ -1155,6 +2030,9 @@ async function main() {
     await testTokenExpiry(modules);
     await testProxyModelAliasResolution(modules);
     await testPluginShape(modules);
+    await testAvailableModelParameterGrouping(modules);
+    await testCursorModelVariantGrouping(modules);
+    await testCursorVariantHooks(modules, backend);
     await testConfigHookSeedsProvider(modules);
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
@@ -1166,6 +2044,7 @@ async function main() {
     await testPoolRecoveryAfterServerRestart();
     await testPoolSequentialRequests();
     await testPoolOverflowEphemeralWorkers();
+    await testProxyConsumesCursorModelHeader(modules, backend);
     await testStreamingWatchdogRecoversFromStalledRun(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;

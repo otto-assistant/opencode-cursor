@@ -46,6 +46,8 @@ import {
   McpToolDefinitionSchema,
   McpToolResultContentItemSchema,
   ModelDetailsSchema,
+  RequestedModelSchema,
+  RequestedModel_ModelParameterbytesSchema,
   ReadRejectedSchema,
   ReadResultSchema,
   RequestContextResultSchema,
@@ -71,6 +73,12 @@ import { resolve as pathResolve } from "node:path";
 import { Mutex } from "./promise-queue.js";
 import { BridgePool, type BridgeHandle } from "./bridge-pool.js";
 import { log } from "./log.js";
+import {
+  CURSOR_SELECTION_HEADER,
+  decodeCursorModelSelection,
+  literalCursorModelSelection,
+  type CursorModelSelection,
+} from "./model-selection.js";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -454,6 +462,8 @@ interface SpawnBridgeOptions {
   url?: string;
   /** When true, use application/proto for unary RPCs instead of Connect streaming. */
   unary?: boolean;
+  contentType?: "application/proto" | "application/json";
+  connectProtocolVersion?: "1";
 }
 
 function spawnBridge(options: SpawnBridgeOptions): {
@@ -477,6 +487,8 @@ function spawnBridge(options: SpawnBridgeOptions): {
     url: options.url ?? CURSOR_API_URL,
     path: options.rpcPath,
     unary: options.unary ?? false,
+    contentType: options.contentType,
+    connectProtocolVersion: options.connectProtocolVersion,
   });
   proc.stdin.write(lpEncode(new TextEncoder().encode(config)));
 
@@ -550,6 +562,8 @@ interface CursorUnaryRpcOptions {
   requestBody: Uint8Array;
   url?: string;
   timeoutMs?: number;
+  contentType?: "application/proto" | "application/json";
+  connectProtocolVersion?: "1";
 }
 
 export async function callCursorUnaryRpc(
@@ -560,6 +574,8 @@ export async function callCursorUnaryRpc(
     rpcPath: options.rpcPath,
     url: options.url,
     unary: true,
+    contentType: options.contentType,
+    connectProtocolVersion: options.connectProtocolVersion,
   });
   const chunks: Buffer[] = [];
   const { promise, resolve } = Promise.withResolvers<{
@@ -811,7 +827,15 @@ export async function startProxy(
             // Pass the real release down so stream cleanup paths can unlock the mutex.
             // We do NOT use done.finally() because the HTTP client (OpenCode) may not
             // close the connection on abort, leaving pipeTo hanging forever.
-            const rawResponse = handleChatCompletion(body, accessToken, release);
+            const selectedModel = decodeCursorModelSelection(
+              req.headers.get(CURSOR_SELECTION_HEADER) ?? undefined,
+            );
+            const rawResponse = handleChatCompletion(
+              body,
+              accessToken,
+              release,
+              selectedModel,
+            );
             const resolvedResponse =
               rawResponse instanceof Promise ? await rawResponse : rawResponse;
             return resolvedResponse;
@@ -880,7 +904,12 @@ export async function startProxy(
   return proxyPort;
 }
 
-export function resolveProxyModelId(modelId: string): string {
+export function resolveProxyModelId(
+  modelId: string,
+  selectedModelId?: string,
+): string {
+  const selected = selectedModelId?.trim();
+  if (selected) return selected === "auto" ? DEFAULT_MODEL_ID : selected;
   // Cursor accepts "default" for server-side model auto-selection, but no
   // longer accepts the older OpenCode/Cursor "auto" alias here.
   if (modelId === "auto") return DEFAULT_MODEL_ID;
@@ -1068,20 +1097,26 @@ function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
   release: () => void,
+  selectedModel?: CursorModelSelection,
 ): Response | Promise<Response> {
-  return doHandleChatCompletion(body, accessToken, release);
+  return doHandleChatCompletion(body, accessToken, release, selectedModel);
 }
 
 async function doHandleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
   release: () => void,
+  selectedModel?: CursorModelSelection,
 ): Promise<Response> {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
-  const modelId = resolveProxyModelId(body.model);
+  const selection =
+    selectedModel ?? literalCursorModelSelection(resolveProxyModelId(body.model));
+  const modelId = selection.publicId;
   const tools = (body.tools ?? []).filter((tool) => !shouldBlockTool(tool));
   const workspaceRoot = extractWorkspaceRoot(systemPrompt);
-  log.info(`[proxy] bridge model input=${body.model} resolved=${modelId}`);
+  log.info(
+    `[proxy] bridge model input=${body.model} resolved=${modelId} server=${selection.modelId} max=${selection.maxMode}`,
+  );
 
   if (!userText && toolResults.length === 0) {
     return new Response(
@@ -1109,7 +1144,7 @@ async function doHandleChatCompletion(
 
   // bridgeKey: model-specific, for active tool-call bridges
   // convKey: model-independent, for conversation state that survives model switches
-  const bridgeKey = deriveBridgeKey(modelId, body);
+  const bridgeKey = deriveBridgeKey(selectionIdentity(selection), body);
   const convKey = deriveConversationKey(body);
   const prevStored = conversationStates.get(convKey);
   const checkpointSize = prevStored?.checkpoint?.byteLength ?? 0;
@@ -1188,7 +1223,7 @@ async function doHandleChatCompletion(
   }
 
   const payload = buildCursorRequest(
-    modelId, systemPrompt, effectiveUserText,
+    selection, systemPrompt, effectiveUserText,
     stored.conversationId, stored.checkpoint, stored.blobStore,
   );
   payload.mcpTools = mcpTools;
@@ -1199,17 +1234,15 @@ async function doHandleChatCompletion(
   const retryCtx: RetryContext = {
     stored,
     accessToken,
-    modelId,
+    selection,
     systemPrompt,
     effectiveUserText,
     mcpTools,
     stallRecoveryCount: 0,
   };
 
-  // NOTE: Auto model fallback was intentionally removed. The proxy passes model
-  // IDs literally to Cursor's API (Cursor handles its own server-side routing).
-  // The only exception is the legacy "auto" alias, which resolveProxyModelId
-  // maps to "default" because Cursor no longer accepts "auto" here.
+  // Auto model fallback remains literal. Concrete catalog selections carry
+  // Cursor's server model, parameters, and max-mode flag in RequestedModel.
 
   return handleStreamingResponse(
     payload, accessToken, modelId, bridgeKey, convKey, release,
@@ -1361,7 +1394,7 @@ function decodeMcpArgsMap(args: Record<string, Uint8Array>): Record<string, unkn
 }
 
 function buildCursorRequest(
-  modelId: string,
+  selection: CursorModelSelection,
   systemPrompt: string,
   userText: string,
   conversationId: string,
@@ -1435,15 +1468,24 @@ function buildCursorRequest(
   });
 
   const modelDetails = create(ModelDetailsSchema, {
-    modelId,
-    displayModelId: modelId,
-    displayName: modelId,
+    modelId: selection.publicId,
+    displayModelId: selection.publicId,
+    displayName: selection.displayName,
+    maxMode: selection.maxMode,
+  });
+  const requestedModel = create(RequestedModelSchema, {
+    modelId: selection.modelId,
+    maxMode: selection.maxMode,
+    parameters: selection.parameters.map((parameter) =>
+      create(RequestedModel_ModelParameterbytesSchema, parameter),
+    ),
   });
 
   const runRequest = create(AgentRunRequestSchema, {
     conversationState,
     action,
     modelDetails,
+    requestedModel,
     conversationId,
   });
 
@@ -1959,6 +2001,14 @@ function buildConversationIdentity(body: ChatCompletionRequest): string {
 }
 
 /** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
+function selectionIdentity(selection: CursorModelSelection): string {
+  return JSON.stringify({
+    modelId: selection.modelId,
+    maxMode: selection.maxMode,
+    parameters: selection.parameters,
+  });
+}
+
 function deriveBridgeKey(modelId: string, body: ChatCompletionRequest): string {
   const identity = buildConversationIdentity(body);
   const firstUserMsg = body.messages.find((m) => m.role === "user");
@@ -2025,16 +2075,14 @@ function deterministicConversationId(convKey: string): string {
 interface RetryContext {
   stored: StoredConversation;
   accessToken: string;
-  modelId: string;
+  selection: CursorModelSelection;
   systemPrompt: string;
   effectiveUserText: string;
   mcpTools: McpToolDefinition[];
   /** Consecutive internal stall recoveries without forward progress (reset on progress). */
   stallRecoveryCount: number;
-  // Note: fallback model fields were intentionally removed — the proxy passes
-  // model IDs literally to Cursor (the legacy "auto" alias is mapped to
-  // "default" by resolveProxyModelId). Cursor's server handles its own
-  // auto-selection and rate-limit routing internally.
+  // Cursor's server still handles the literal default model's auto-selection
+  // and rate-limit routing internally.
 }
 
 /** Max automatic retries for transient connect errors (e.g. "invalid_argument"). */
@@ -2632,7 +2680,7 @@ function createBridgeStreamResponse(
             attemptBridge.kill();
 
             const freshPayload = buildCursorRequest(
-              retryCtx.modelId,
+              retryCtx.selection,
               retryCtx.systemPrompt,
               retryCtx.effectiveUserText,
               retryCtx.stored.conversationId,
@@ -2697,7 +2745,7 @@ function createBridgeStreamResponse(
                 retryCtx.stored.checkpoint = null;
                 retryCtx.stored.blobStore.clear();
                 const freshPayload = buildCursorRequest(
-                  retryCtx.modelId,
+                  retryCtx.selection,
                   retryCtx.systemPrompt,
                   retryCtx.effectiveUserText,
                   retryCtx.stored.conversationId,
