@@ -19,6 +19,15 @@ import {
 const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
 const AVAILABLE_MODELS_PATH = "/aiserver.v1.AiService/AvailableModels";
 
+// Cursor's AvailableModels omits some catalog entries unless they are named
+// explicitly. Grok models (including Grok 4.5 / grok-4-5) are user-added
+// named models and never appear with an empty additionalModelNames list.
+const ADDITIONAL_MODEL_NAMES = [
+  "grok-4-5",
+  "grok-4.20",
+  "grok-code-fast-1",
+] as const;
+
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 64_000;
 
@@ -74,7 +83,9 @@ export const FALLBACK_MODELS: CursorModel[] = [
   flatModel("gpt-5.3-codex-spark-preview", "GPT-5.3 Codex Spark", true, 128_000, 128_000),
   // Other models
   flatModel("gemini-3.1-pro", "Gemini 3.1 Pro", true, 1_000_000, 64_000),
-  flatModel("grok-code-fast-1", "Grok Code Fast 1", false, 128_000, 64_000),
+  flatModel("grok-4-5", "Grok 4.5", true, 200_000, 64_000),
+  flatModel("grok-4.20", "Grok 4.20", true, 200_000, 64_000),
+  flatModel("grok-code-fast-1", "Grok Code Fast 1", false, 256_000, 64_000),
 ];
 
 interface VariantDescriptor {
@@ -152,7 +163,7 @@ async function fetchCursorAvailableModels(
       JSON.stringify({
         isNightly: false,
         excludeMaxNamedModels: true,
-        additionalModelNames: [],
+        additionalModelNames: [...ADDITIONAL_MODEL_NAMES],
         useModelParameters: true,
         useReactModelPicker: true,
       }),
@@ -313,10 +324,7 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
     const name = stringProp(model, "name");
     if (!model || !name) continue;
 
-    const displayName =
-      stringProp(model, "clientDisplayName") ??
-      stringProp(model, "inputboxShortModelName") ??
-      name;
+    const displayName = pickAvailableDisplayName(model, name);
     const serverModelName = stringProp(model, "serverModelName") ?? name;
     const definitions = arrayProp(model, "parameterDefinitions")
       .map(asRecord)
@@ -372,6 +380,31 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
         selection,
       });
       groups.set(groupKey, group);
+    }
+
+    if (groups.size === 0) {
+      const flatSelection: CursorModelSelection = {
+        publicId: name,
+        modelId: serverModelName,
+        displayName,
+        parameters: [],
+        maxMode:
+          model.supportsMaxMode === true && model.supportsNonMaxMode !== true,
+      };
+      const candidate: CursorModel = {
+        id: name,
+        name: displayName,
+        reasoning: model.supportsThinking === true,
+        contextWindow: DEFAULT_CONTEXT_WINDOW,
+        maxTokens: DEFAULT_MAX_TOKENS,
+        defaultSelection: flatSelection,
+        variants: {},
+      };
+      const existing = output.get(name);
+      if (!existing) {
+        output.set(name, { model: candidate, rank: 0, sourceName: name });
+      }
+      continue;
     }
 
     for (const group of groups.values()) {
@@ -857,4 +890,42 @@ function pickDisplayName(model: CursorModelDetails, fallbackId: string): string 
     if (trimmed) return trimmed;
   }
   return fallbackId;
+}
+
+function pickAvailableDisplayName(
+  model: Record<string, unknown>,
+  fallbackName: string,
+): string {
+  const tooltip = asRecord(model.tooltipData);
+  const tooltipTitle = parseTooltipTitle(stringProp(tooltip, "markdownContent"));
+  const explicit =
+    stringProp(model, "clientDisplayName") ?? tooltipTitle;
+  if (explicit) return explicit;
+
+  const shortName = stringProp(model, "inputboxShortModelName");
+  if (shortName && !looksLikeModelSlug(shortName)) return shortName;
+
+  return formatModelIdDisplayName(fallbackName);
+}
+
+function looksLikeModelSlug(value: string): boolean {
+  return value === value.toLowerCase() && value.includes("-");
+}
+
+function parseTooltipTitle(markdown: string | undefined): string | undefined {
+  const match = markdown?.match(/\*\*([^*]+)\*\*/);
+  return match?.[1]?.trim();
+}
+
+function formatModelIdDisplayName(id: string): string {
+  const grokVersion = id.match(/^grok-(\d+)-(\d+)$/);
+  if (grokVersion) return `Grok ${grokVersion[1]}.${grokVersion[2]}`;
+  const grokDotted = id.match(/^grok-(\d+\.\d+)$/);
+  if (grokDotted) return `Grok ${grokDotted[1]}`;
+  return id
+    .split("-")
+    .map((part) =>
+      /^\d/.test(part) ? part : part.charAt(0).toUpperCase() + part.slice(1),
+    )
+    .join(" ");
 }

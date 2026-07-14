@@ -599,6 +599,7 @@ const MODEL_COST_TABLE: Record<string, ModelCost> = {
   "gpt-5.4-nano":            { input: 0.2, output: 1.25, cache: { read: 0.02, write: 0 } },
 
   // xAI
+  "grok-4-5":                { input: 2, output: 6, cache: { read: 0.2, write: 0 } },
   "grok-4.20":               { input: 2, output: 6, cache: { read: 0.2, write: 0 } },
 
   // Moonshot

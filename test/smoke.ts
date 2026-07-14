@@ -969,6 +969,43 @@ async function testAvailableModelParameterGrouping(modules: TestModules) {
     "Expected Sonnet 5 to retain returned xhigh",
   );
 
+  const namedModels = modules.normalizeAvailableModels([
+    {
+      name: "grok-4-5",
+      serverModelName: "grok-4-5",
+      supportsThinking: true,
+      supportsMaxMode: true,
+      supportsNonMaxMode: true,
+      isUserAdded: true,
+      inputboxShortModelName: "grok-4-5",
+    },
+    {
+      name: "grok-code-fast-1",
+      serverModelName: "grok-code-fast-1",
+      supportsThinking: true,
+      tooltipData: {
+        markdownContent:
+          "**Grok Code Fast 1**<br />Fast, good for daily use.<br /><br />256k context window",
+      },
+      isUserAdded: true,
+    },
+  ]);
+  assertArrayEqual(
+    namedModels.map((model) => model.id).sort(),
+    ["grok-4-5", "grok-code-fast-1"],
+    "Expected named models without variants to be preserved",
+  );
+  assertEqual(
+    namedModels.find((model) => model.id === "grok-4-5")?.name,
+    "Grok 4.5",
+    "Expected Grok 4.5 display name formatting",
+  );
+  assertEqual(
+    namedModels.find((model) => model.id === "grok-code-fast-1")?.name,
+    "Grok Code Fast 1",
+    "Expected tooltip title for named Grok models",
+  );
+
   console.log("[test] Parameter-aware AvailableModels grouping OK");
 }
 
