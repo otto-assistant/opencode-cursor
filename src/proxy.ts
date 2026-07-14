@@ -187,8 +187,6 @@ interface StoredConversation {
    * turn ends before a fresh checkpoint arrives.
    */
   lastPromptTokens: number;
-  /** Last known Cursor context window (`tokenDetails.maxTokens`), if reported. */
-  lastMaxTokens: number;
 }
 
 const conversationStates = new Map<string, StoredConversation>();
@@ -196,7 +194,11 @@ const conversationStates = new Map<string, StoredConversation>();
 const lastStallWaitNoticeMsByConv = new Map<string, number>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 const MUTEX_TTL_MS = 30 * 60 * 1000;
-/** TTL for idle active bridges. Bridges awaiting tool results are exempt. */
+/**
+ * TTL for paused tool bridges. Kept generous so normal MCP/tool round-trip
+ * latency (including user approvals) survives without the resume falling back
+ * to a fresh Run; abandoned bridges are still reaped so they cannot leak.
+ */
 const ACTIVE_BRIDGE_TTL_MS = Number(process.env.OPENCODE_CURSOR_ACTIVE_BRIDGE_TTL_MS ?? 5 * 60 * 1000);
 const ADMISSION_BRIDGE_CULL_IDLE_MS = Number(process.env.OPENCODE_CURSOR_ADMISSION_BRIDGE_CULL_IDLE_MS ?? 30 * 1000);
 const MAX_ACTIVE_BRIDGES = 24;
@@ -370,19 +372,15 @@ function evictStaleMutexes(): number {
   return evicted;
 }
 
-/** True while OpenCode still owes tool results for this paused bridge. */
-function isAwaitingToolResults(active: ActiveBridge): boolean {
-  return active.pendingExecs.length > 0;
-}
-
 function evictStaleActiveBridges(): number {
   let evicted = 0;
   const now = Date.now();
   for (const [bridgeKey, active] of activeBridges) {
-    // Never kill bridges waiting on MCP/tool round-trips — Discord/OpenCode
-    // tool latency routinely exceeds the idle TTL, and eviction makes resume
-    // fall back to a fresh Run that drops mcpResult protocol state.
-    if (isAwaitingToolResults(active)) continue;
+    // Active bridges are always paused awaiting MCP tool results (setActiveBridge
+    // is only called with pending execs). ACTIVE_BRIDGE_TTL_MS is generous so
+    // normal tool latency survives; only genuinely abandoned bridges are reaped
+    // (an abandoned bridge would otherwise keep its heartbeat + h2 subprocess
+    // alive indefinitely).
     if (now - active.lastAccessMs > ACTIVE_BRIDGE_TTL_MS) {
       killActiveBridge(active);
       deleteActiveBridge(bridgeKey);
@@ -397,7 +395,9 @@ function cullOldestIdleBridgesForAdmission(maxBridges: number): number {
   const now = Date.now();
   const candidates: Array<[string, ActiveBridge]> = [];
   for (const [key, active] of activeBridges) {
-    if (isAwaitingToolResults(active)) continue;
+    // Under admission pressure, sacrifice the oldest paused tool bridges. Resume
+    // then falls back to a fresh Run with the persisted checkpoint (context is
+    // preserved), which is acceptable degradation when the proxy is saturated.
     if (now - active.lastAccessMs >= ADMISSION_BRIDGE_CULL_IDLE_MS) {
       candidates.push([key, active]);
     }
@@ -1214,19 +1214,15 @@ async function doHandleChatCompletion(
       blobStore: new Map(),
       lastAccessMs: Date.now(),
       lastPromptTokens: 0,
-      lastMaxTokens: 0,
     };
     conversationStates.set(convKey, stored);
   }
   stored.lastAccessMs = Date.now();
-  // Hydrate token details from a persisted checkpoint when present so the first
-  // SSE usage chunk after resume is not stuck at 0 while waiting for Cursor.
+  // Hydrate the prompt-token estimate from a persisted checkpoint when present so
+  // the first SSE usage chunk after resume is not stuck at 0 while awaiting Cursor.
   if (stored.lastPromptTokens <= 0 && stored.checkpoint) {
-    const fromCheckpoint = readTokenDetailsFromCheckpoint(stored.checkpoint);
-    if (fromCheckpoint) {
-      stored.lastPromptTokens = fromCheckpoint.usedTokens;
-      stored.lastMaxTokens = fromCheckpoint.maxTokens;
-    }
+    const usedTokens = readUsedTokensFromCheckpoint(stored.checkpoint);
+    if (usedTokens > 0) stored.lastPromptTokens = usedTokens;
   }
   runMaintenanceSweep();
 
@@ -1704,31 +1700,21 @@ export function computeUsage(state: StreamState) {
   return { prompt_tokens, completion_tokens, total_tokens };
 }
 
-function readTokenDetailsFromCheckpoint(
-  checkpoint: Uint8Array,
-): { usedTokens: number; maxTokens: number } | undefined {
+/** Decode just the prompt/context token count from a persisted checkpoint. */
+function readUsedTokensFromCheckpoint(checkpoint: Uint8Array): number {
   try {
     const stateStructure = fromBinary(ConversationStateStructureSchema, checkpoint);
-    const details = stateStructure.tokenDetails;
-    if (!details) return undefined;
-    const usedTokens = Math.max(0, details.usedTokens || 0);
-    const maxTokens = Math.max(0, details.maxTokens || 0);
-    if (usedTokens <= 0 && maxTokens <= 0) return undefined;
-    return { usedTokens, maxTokens };
+    return Math.max(0, stateStructure.tokenDetails?.usedTokens || 0);
   } catch {
-    return undefined;
+    return 0;
   }
 }
 
-function rememberConversationTokens(
-  convKey: string,
-  promptTokens: number,
-  maxTokens?: number,
-): void {
+function rememberConversationTokens(convKey: string, promptTokens: number): void {
+  if (promptTokens <= 0) return;
   const stored = conversationStates.get(convKey);
   if (!stored) return;
-  if (promptTokens > 0) stored.lastPromptTokens = promptTokens;
-  if (maxTokens && maxTokens > 0) stored.lastMaxTokens = maxTokens;
+  stored.lastPromptTokens = promptTokens;
   stored.lastAccessMs = Date.now();
 }
 
@@ -2490,13 +2476,18 @@ function createBridgeStreamResponse(
           if (retryCtx) retryCtx.stallRecoveryCount = 0;
         };
 
+        /**
+         * Build the trailing usage chunk, or null when we have no context info.
+         * Emitting prompt_tokens:0 would overwrite OpenCode's per-step input
+         * meter with zero (it does not accumulate input), so we skip it and let
+         * OpenCode keep the last known value.
+         */
         const makeUsageChunk = () => {
           const usage = computeUsage(state);
+          if (usage.prompt_tokens <= 0) return null;
           // Persist prompt size so subsequent tool-resume HTTP streams do not
           // report 0 and wipe OpenCode's session context meter.
-          if (usage.prompt_tokens > 0) {
-            rememberConversationTokens(convKey, usage.prompt_tokens);
-          }
+          rememberConversationTokens(convKey, usage.prompt_tokens);
           return {
             id: completionId,
             object: "chat.completion.chunk",
@@ -2509,7 +2500,8 @@ function createBridgeStreamResponse(
 
         const finishStream = (finishReason: string) => {
           sendSSE(makeChunk({}, finishReason));
-          sendSSE(makeUsageChunk());
+          const usageChunk = makeUsageChunk();
+          if (usageChunk) sendSSE(usageChunk);
           sendDone();
           closeController();
         };
@@ -2601,17 +2593,9 @@ function createBridgeStreamResponse(
                     for (const [k, v] of attemptBlobStore) stored.blobStore.set(k, v);
                     enforceConversationBlobBudget(stored);
                     stored.lastAccessMs = Date.now();
-                    const details = readTokenDetailsFromCheckpoint(checkpointBytes);
-                    if (details) {
-                      if (details.usedTokens > state.promptTokens) {
-                        state.promptTokens = details.usedTokens;
-                      }
-                      rememberConversationTokens(
-                        convKey,
-                        details.usedTokens,
-                        details.maxTokens,
-                      );
-                    }
+                    // processServerMessage already folded tokenDetails into
+                    // state.promptTokens (keeping the max); just persist it.
+                    rememberConversationTokens(convKey, state.promptTokens);
                     resetStallRecovery();
                   }
                 },
@@ -2735,7 +2719,7 @@ function createBridgeStreamResponse(
               stallRecoveryBackoffTimer = undefined;
               if (closed) return;
               const { bridge: retryBridge, heartbeatTimer: retryTimer } =
-                startBridge(accessToken, requestBytes, bridgeKey);
+                startBridge(accessToken, requestBytes);
               runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
             }, delay);
             return;
@@ -2795,7 +2779,7 @@ function createBridgeStreamResponse(
             );
             freshPayload.mcpTools = retryCtx.mcpTools;
             const { bridge: newBridge, heartbeatTimer: newTimer } =
-              startBridge(retryCtx.accessToken, freshPayload.requestBytes, bridgeKey);
+              startBridge(retryCtx.accessToken, freshPayload.requestBytes);
             runAttempt(newBridge, newTimer, freshPayload.blobStore, freshPayload.mcpTools, 1);
             return;
           }
@@ -2816,7 +2800,7 @@ function createBridgeStreamResponse(
               // If the stream was already closed (client abort), don't retry.
               if (closed) return;
               const { bridge: retryBridge, heartbeatTimer: retryTimer } =
-                startBridge(accessToken, requestBytes, bridgeKey);
+                startBridge(accessToken, requestBytes);
               runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
             }, delay);
             return;
@@ -2868,7 +2852,7 @@ function createBridgeStreamResponse(
               setTimeout(() => {
                 if (closed) return;
                 const { bridge: retryBridge, heartbeatTimer: retryTimer } =
-                  startBridge(retryAccessToken, effectiveRequestBytes, bridgeKey);
+                  startBridge(retryAccessToken, effectiveRequestBytes);
                 runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
               }, delay);
               return;
@@ -2924,7 +2908,6 @@ function createBridgeStreamResponse(
 function startBridge(
   accessToken: string,
   requestBytes: Uint8Array,
-  bridgeKey?: string,
 ): { bridge: ReturnType<typeof spawnBridge> | BridgeHandle; heartbeatTimer: NodeJS.Timeout } {
   const bridge: ReturnType<typeof spawnBridge> | BridgeHandle = bridgePool
     ? bridgePool.acquire({
@@ -2937,17 +2920,10 @@ function startBridge(
         rpcPath: "/agent.v1.AgentService/Run",
       });
   bridge.write(frameConnectMessage(requestBytes));
-  // Keep the H2 stream alive and refresh lastAccessMs while a bridge is paused
-  // awaiting OpenCode tool results (otherwise maintenance can evict it).
-  const heartbeatTimer = setInterval(() => {
-    bridge.write(makeHeartbeatBytes());
-    if (bridgeKey) {
-      const active = activeBridges.get(bridgeKey);
-      if (active?.bridge === bridge && isAwaitingToolResults(active)) {
-        active.lastAccessMs = Date.now();
-      }
-    }
-  }, 5_000);
+  // Heartbeats keep the H2 stream (and pooled subprocess) alive while a bridge
+  // is paused awaiting tool results. Eviction is driven by ACTIVE_BRIDGE_TTL_MS
+  // against the pause time, so the heartbeat must NOT bump lastAccessMs.
+  const heartbeatTimer = setInterval(() => bridge.write(makeHeartbeatBytes()), 5_000);
   return { bridge, heartbeatTimer };
 }
 
@@ -2961,7 +2937,7 @@ function handleStreamingResponse(
   retryCtx?: RetryContext,
   workspaceRoot?: string,
 ): Response {
-  const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes, bridgeKey);
+  const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     payload.blobStore, payload.mcpTools,
@@ -3133,17 +3109,8 @@ async function collectFullResponse(
               for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
               enforceConversationBlobBudget(stored);
               stored.lastAccessMs = Date.now();
-              const details = readTokenDetailsFromCheckpoint(checkpointBytes);
-              if (details) {
-                if (details.usedTokens > state.promptTokens) {
-                  state.promptTokens = details.usedTokens;
-                }
-                rememberConversationTokens(
-                  convKey,
-                  details.usedTokens,
-                  details.maxTokens,
-                );
-              }
+              // processServerMessage already updated state.promptTokens.
+              rememberConversationTokens(convKey, state.promptTokens);
             }
           },
           workspaceRoot,
