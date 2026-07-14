@@ -181,6 +181,14 @@ interface StoredConversation {
   checkpoint: Uint8Array | null;
   blobStore: Map<string, Uint8Array>;
   lastAccessMs: number;
+  /**
+   * Last known Cursor conversation context size (`tokenDetails.usedTokens`).
+   * Used to keep OpenCode's context meter alive across tool-call steps when a
+   * turn ends before a fresh checkpoint arrives.
+   */
+  lastPromptTokens: number;
+  /** Last known Cursor context window (`tokenDetails.maxTokens`), if reported. */
+  lastMaxTokens: number;
 }
 
 const conversationStates = new Map<string, StoredConversation>();
@@ -1205,10 +1213,21 @@ async function doHandleChatCompletion(
       checkpoint: null,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
+      lastPromptTokens: 0,
+      lastMaxTokens: 0,
     };
     conversationStates.set(convKey, stored);
   }
   stored.lastAccessMs = Date.now();
+  // Hydrate token details from a persisted checkpoint when present so the first
+  // SSE usage chunk after resume is not stuck at 0 while waiting for Cursor.
+  if (stored.lastPromptTokens <= 0 && stored.checkpoint) {
+    const fromCheckpoint = readTokenDetailsFromCheckpoint(stored.checkpoint);
+    if (fromCheckpoint) {
+      stored.lastPromptTokens = fromCheckpoint.usedTokens;
+      stored.lastMaxTokens = fromCheckpoint.maxTokens;
+    }
+  }
   runMaintenanceSweep();
 
   // Build the request. When tool results are present but the bridge died,
@@ -1669,13 +1688,48 @@ interface StreamState {
    * This is the input/prompt token count, not the prompt+completion total.
    */
   promptTokens: number;
+  /** Fallback prompt size from the previous turn when Cursor omits tokenDetails. */
+  fallbackPromptTokens: number;
 }
 
-function computeUsage(state: StreamState) {
-  const completion_tokens = Math.max(0, state.outputTokens);
-  const prompt_tokens = Math.max(0, state.promptTokens);
+export function computeUsage(state: StreamState) {
+  const completion_tokens = Math.max(0, Math.floor(state.outputTokens) || 0);
+  // Prefer live Cursor context size; otherwise reuse the last known prompt size
+  // so OpenCode does not overwrite the session meter with zeros on tool steps.
+  const prompt_tokens = Math.max(
+    0,
+    Math.floor(state.promptTokens > 0 ? state.promptTokens : state.fallbackPromptTokens) || 0,
+  );
   const total_tokens = prompt_tokens + completion_tokens;
   return { prompt_tokens, completion_tokens, total_tokens };
+}
+
+function readTokenDetailsFromCheckpoint(
+  checkpoint: Uint8Array,
+): { usedTokens: number; maxTokens: number } | undefined {
+  try {
+    const stateStructure = fromBinary(ConversationStateStructureSchema, checkpoint);
+    const details = stateStructure.tokenDetails;
+    if (!details) return undefined;
+    const usedTokens = Math.max(0, details.usedTokens || 0);
+    const maxTokens = Math.max(0, details.maxTokens || 0);
+    if (usedTokens <= 0 && maxTokens <= 0) return undefined;
+    return { usedTokens, maxTokens };
+  } catch {
+    return undefined;
+  }
+}
+
+function rememberConversationTokens(
+  convKey: string,
+  promptTokens: number,
+  maxTokens?: number,
+): void {
+  const stored = conversationStates.get(convKey);
+  if (!stored) return;
+  if (promptTokens > 0) stored.lastPromptTokens = promptTokens;
+  if (maxTokens && maxTokens > 0) stored.lastMaxTokens = maxTokens;
+  stored.lastAccessMs = Date.now();
 }
 
 function processServerMessage(
@@ -1706,7 +1760,11 @@ function processServerMessage(
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
     if (stateStructure.tokenDetails) {
-      state.promptTokens = stateStructure.tokenDetails.usedTokens;
+      const used = Math.max(0, stateStructure.tokenDetails.usedTokens || 0);
+      // Cursor reports conversation context fill here (input/prompt size).
+      // Keep the largest observed value in the turn so an early checkpoint
+      // cannot permanently clamp OpenCode's meter below the true context size.
+      if (used > state.promptTokens) state.promptTokens = used;
     }
     if (onCheckpoint) {
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
@@ -2403,6 +2461,7 @@ function createBridgeStreamResponse(
           pendingExecs: [],
           outputTokens: 0,
           promptTokens: 0,
+          fallbackPromptTokens: conversationStates.get(convKey)?.lastPromptTokens ?? 0,
         };
         const tagFilter = createThinkingTagFilter();
         // Title-gen requests use convKey starting with "title:".
@@ -2432,15 +2491,27 @@ function createBridgeStreamResponse(
         };
 
         const makeUsageChunk = () => {
-          const { prompt_tokens, completion_tokens, total_tokens } = computeUsage(state);
+          const usage = computeUsage(state);
+          // Persist prompt size so subsequent tool-resume HTTP streams do not
+          // report 0 and wipe OpenCode's session context meter.
+          if (usage.prompt_tokens > 0) {
+            rememberConversationTokens(convKey, usage.prompt_tokens);
+          }
           return {
             id: completionId,
             object: "chat.completion.chunk",
             created,
             model: modelId,
             choices: [],
-            usage: { prompt_tokens, completion_tokens, total_tokens },
+            usage,
           };
+        };
+
+        const finishStream = (finishReason: string) => {
+          sendSSE(makeChunk({}, finishReason));
+          sendSSE(makeUsageChunk());
+          sendDone();
+          closeController();
         };
 
         const processChunk = createConnectFrameParser(
@@ -2514,15 +2585,14 @@ function createBridgeStreamResponse(
                     if (!isTitleGenStream) {
                       sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
                     }
-                    sendSSE(makeChunk({}, "stop"));
-                    sendDone();
-                    closeController();
+                    finishStream("stop");
                     return;
                   }
 
-                  sendSSE(makeChunk({}, "tool_calls"));
-                  sendDone();
-                  closeController();
+                  // Always emit usage before [DONE]. OpenCode overwrites the
+                  // assistant message token meter per step; omitting usage on
+                  // tool_calls finishes zeros out context % mid-loop.
+                  finishStream("tool_calls");
                 },
                 (checkpointBytes) => {
                   const stored = conversationStates.get(convKey);
@@ -2531,6 +2601,17 @@ function createBridgeStreamResponse(
                     for (const [k, v] of attemptBlobStore) stored.blobStore.set(k, v);
                     enforceConversationBlobBudget(stored);
                     stored.lastAccessMs = Date.now();
+                    const details = readTokenDetailsFromCheckpoint(checkpointBytes);
+                    if (details) {
+                      if (details.usedTokens > state.promptTokens) {
+                        state.promptTokens = details.usedTokens;
+                      }
+                      rememberConversationTokens(
+                        convKey,
+                        details.usedTokens,
+                        details.maxTokens,
+                      );
+                    }
                     resetStallRecovery();
                   }
                 },
@@ -2672,10 +2753,7 @@ function createBridgeStreamResponse(
           if (!isTitleGenStream) {
             sendSSE(makeChunk({ content: "\n[Error: stream stalled; retrying...]" }));
           }
-          sendSSE(makeChunk({}, "stop"));
-          sendSSE(makeUsageChunk());
-          sendDone();
-          closeController();
+          finishStream("stop");
           deleteActiveBridge(bridgeKey);
           clearInterval(attemptHeartbeat);
           attemptBridge.kill();
@@ -2811,10 +2889,7 @@ function createBridgeStreamResponse(
               log.warn(`[proxy] All retries exhausted; sending empty-stream error (bridgeKey=${bridgeKey})`);
               sendSSE(makeChunk({ content: "\n[Error: Cursor returned empty response. Try sending your message again.]" }));
             }
-            sendSSE(makeChunk({}, "stop"));
-            sendSSE(makeUsageChunk());
-            sendDone();
-            closeController();
+            finishStream("stop");
             // Clean up bridge so h2-bridge subprocess can exit.
             clearInterval(attemptHeartbeat);
             attemptBridge.kill();
@@ -2831,10 +2906,7 @@ function createBridgeStreamResponse(
               if (!isTitleGenStream) {
                 sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
               }
-              sendSSE(makeChunk({}, "stop"));
-              sendSSE(makeUsageChunk());
-              sendDone();
-              closeController();
+              finishStream("stop");
             }
           }
         });
@@ -3031,6 +3103,7 @@ async function collectFullResponse(
     pendingExecs: [],
     outputTokens: 0,
     promptTokens: 0,
+    fallbackPromptTokens: conversationStates.get(convKey)?.lastPromptTokens ?? 0,
   };
   const tagFilter = createThinkingTagFilter();
 
@@ -3060,6 +3133,17 @@ async function collectFullResponse(
               for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
               enforceConversationBlobBudget(stored);
               stored.lastAccessMs = Date.now();
+              const details = readTokenDetailsFromCheckpoint(checkpointBytes);
+              if (details) {
+                if (details.usedTokens > state.promptTokens) {
+                  state.promptTokens = details.usedTokens;
+                }
+                rememberConversationTokens(
+                  convKey,
+                  details.usedTokens,
+                  details.maxTokens,
+                );
+              }
             }
           },
           workspaceRoot,
@@ -3088,6 +3172,9 @@ async function collectFullResponse(
     fullText += flushed.content;
 
     const usage = computeUsage(state);
+    if (usage.prompt_tokens > 0) {
+      rememberConversationTokens(convKey, usage.prompt_tokens);
+    }
     resolve({
       text: fullText,
       usage,

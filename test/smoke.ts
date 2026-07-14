@@ -16,6 +16,7 @@ interface TestModules {
   stopProxy: typeof import("../src/proxy").stopProxy;
   getProxyPort: typeof import("../src/proxy").getProxyPort;
   resolveProxyModelId: typeof import("../src/proxy").resolveProxyModelId;
+  computeUsage: typeof import("../src/proxy").computeUsage;
   cursorSelectionHeader: typeof import("../src/model-selection").CURSOR_SELECTION_HEADER;
   encodeCursorModelSelection: typeof import("../src/model-selection").encodeCursorModelSelection;
   decodeCursorModelSelection: typeof import("../src/model-selection").decodeCursorModelSelection;
@@ -357,6 +358,7 @@ async function loadModules(): Promise<TestModules> {
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
     resolveProxyModelId: proxy.resolveProxyModelId,
+    computeUsage: proxy.computeUsage,
     cursorSelectionHeader: modelSelection.CURSOR_SELECTION_HEADER,
     encodeCursorModelSelection: modelSelection.encodeCursorModelSelection,
     decodeCursorModelSelection: modelSelection.decodeCursorModelSelection,
@@ -2012,6 +2014,42 @@ async function testStreamingWatchdogRecoversFromStalledRun(
   console.log("[test] Streaming watchdog recovery OK");
 }
 
+async function testComputeUsageFallback(modules: TestModules) {
+  console.log("[test] Testing computeUsage context fallback...");
+  const live = modules.computeUsage({
+    toolCallIndex: 0,
+    pendingExecs: [],
+    outputTokens: 120,
+    promptTokens: 50_000,
+    fallbackPromptTokens: 1_000,
+  });
+  assertEqual(live.prompt_tokens, 50_000, "live prompt tokens");
+  assertEqual(live.completion_tokens, 120, "live completion tokens");
+  assertEqual(live.total_tokens, 50_120, "live total tokens");
+
+  const fallback = modules.computeUsage({
+    toolCallIndex: 0,
+    pendingExecs: [],
+    outputTokens: 40,
+    promptTokens: 0,
+    fallbackPromptTokens: 12_345,
+  });
+  assertEqual(fallback.prompt_tokens, 12_345, "fallback prompt tokens");
+  assertEqual(fallback.completion_tokens, 40, "fallback completion tokens");
+  assertEqual(fallback.total_tokens, 12_385, "fallback total tokens");
+
+  const empty = modules.computeUsage({
+    toolCallIndex: 0,
+    pendingExecs: [],
+    outputTokens: 0,
+    promptTokens: 0,
+    fallbackPromptTokens: 0,
+  });
+  assertEqual(empty.prompt_tokens, 0, "empty prompt tokens");
+  assertEqual(empty.total_tokens, 0, "empty total tokens");
+  console.log("[test] computeUsage context fallback OK");
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -2052,6 +2090,7 @@ async function main() {
     await testPoolOverflowEphemeralWorkers();
     await testProxyConsumesCursorModelHeader(modules, backend);
     await testStreamingWatchdogRecoversFromStalledRun(modules, backend);
+    await testComputeUsageFallback(modules);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {

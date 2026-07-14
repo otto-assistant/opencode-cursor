@@ -321,6 +321,9 @@ function buildProviderModel(
   id: string,
   port: number,
 ): Record<string, any> {
+  const contextWindow =
+    model.contextWindow > 0 ? model.contextWindow : 200_000;
+  const maxTokens = model.maxTokens > 0 ? model.maxTokens : 64_000;
   return {
     id,
     providerID: CURSOR_PROVIDER_ID,
@@ -360,11 +363,13 @@ function buildProviderModel(
     },
     cost: estimateModelCost(model.id),
     limit: {
-      context: model.contextWindow,
-      output: model.maxTokens,
+      context: contextWindow,
+      output: maxTokens,
     },
     status: "active" as const,
-    options: {},
+    options: {
+      includeUsage: true,
+    },
     headers: {},
     release_date: "",
     variants: id === DEFAULT_MODEL_ID ? {} : buildRuntimeVariants(model),
@@ -422,6 +427,9 @@ function ensureCursorProviderConfig(
     npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
     options: {
       baseURL: CURSOR_BASE_URL,
+      // Ensure OpenAI-compatible streams surface usage chunks to OpenCode's
+      // context meter (AI SDK includeUsage / stream_options.include_usage).
+      includeUsage: true,
       ...existingOptions,
     },
     // User-declared model entries win over the seeded defaults.
@@ -492,6 +500,9 @@ function buildConfigModelEntries(
 ): Record<string, Record<string, any>> {
   const entries: Record<string, Record<string, any>> = {};
   for (const model of models) {
+    const contextWindow =
+      model.contextWindow > 0 ? model.contextWindow : 200_000;
+    const maxTokens = model.maxTokens > 0 ? model.maxTokens : 64_000;
     entries[model.id] = {
       name: model.name,
       // OpenCode prepends generic low/medium/high variants for reasoning-capable
@@ -503,10 +514,12 @@ function buildConfigModelEntries(
       tool_call: true,
       cost: estimateModelCost(model.id),
       limit: {
-        context: model.contextWindow,
-        output: model.maxTokens,
+        context: contextWindow,
+        output: maxTokens,
       },
-      options: {},
+      options: {
+        includeUsage: true,
+      },
       variants: buildConfigVariants(model),
     };
   }
@@ -516,16 +529,21 @@ function buildConfigModelEntries(
   // is sent upstream verbatim, so Cursor selects/routes the model itself.
   const defaultModel = selectDefaultCursorModel(models);
   if (defaultModel && !(DEFAULT_MODEL_ID in entries)) {
+    const contextWindow =
+      defaultModel.contextWindow > 0 ? defaultModel.contextWindow : 200_000;
+    const maxTokens = defaultModel.maxTokens > 0 ? defaultModel.maxTokens : 64_000;
     entries[DEFAULT_MODEL_ID] = {
       name: `Default (${defaultModel.name})`,
       reasoning: false,
       tool_call: true,
       cost: estimateModelCost(defaultModel.id),
       limit: {
-        context: defaultModel.contextWindow,
-        output: defaultModel.maxTokens,
+        context: contextWindow,
+        output: maxTokens,
       },
-      options: {},
+      options: {
+        includeUsage: true,
+      },
       variants: Object.fromEntries(
         GENERATED_VARIANT_KEYS.map((key) => [key, { disabled: true }]),
       ),
