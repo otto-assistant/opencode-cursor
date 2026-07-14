@@ -188,7 +188,8 @@ const conversationStates = new Map<string, StoredConversation>();
 const lastStallWaitNoticeMsByConv = new Map<string, number>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 const MUTEX_TTL_MS = 30 * 60 * 1000;
-const ACTIVE_BRIDGE_TTL_MS = Number(process.env.OPENCODE_CURSOR_ACTIVE_BRIDGE_TTL_MS ?? 90 * 1000);
+/** TTL for idle active bridges. Bridges awaiting tool results are exempt. */
+const ACTIVE_BRIDGE_TTL_MS = Number(process.env.OPENCODE_CURSOR_ACTIVE_BRIDGE_TTL_MS ?? 5 * 60 * 1000);
 const ADMISSION_BRIDGE_CULL_IDLE_MS = Number(process.env.OPENCODE_CURSOR_ADMISSION_BRIDGE_CULL_IDLE_MS ?? 30 * 1000);
 const MAX_ACTIVE_BRIDGES = 24;
 const MAX_CONVERSATION_BLOB_BYTES = Number(process.env.OPENCODE_CURSOR_MAX_CONV_BLOB_BYTES ?? 64 * 1024 * 1024);
@@ -361,10 +362,19 @@ function evictStaleMutexes(): number {
   return evicted;
 }
 
+/** True while OpenCode still owes tool results for this paused bridge. */
+function isAwaitingToolResults(active: ActiveBridge): boolean {
+  return active.pendingExecs.length > 0;
+}
+
 function evictStaleActiveBridges(): number {
   let evicted = 0;
   const now = Date.now();
   for (const [bridgeKey, active] of activeBridges) {
+    // Never kill bridges waiting on MCP/tool round-trips — Discord/OpenCode
+    // tool latency routinely exceeds the idle TTL, and eviction makes resume
+    // fall back to a fresh Run that drops mcpResult protocol state.
+    if (isAwaitingToolResults(active)) continue;
     if (now - active.lastAccessMs > ACTIVE_BRIDGE_TTL_MS) {
       killActiveBridge(active);
       deleteActiveBridge(bridgeKey);
@@ -379,6 +389,7 @@ function cullOldestIdleBridgesForAdmission(maxBridges: number): number {
   const now = Date.now();
   const candidates: Array<[string, ActiveBridge]> = [];
   for (const [key, active] of activeBridges) {
+    if (isAwaitingToolResults(active)) continue;
     if (now - active.lastAccessMs >= ADMISSION_BRIDGE_CULL_IDLE_MS) {
       candidates.push([key, active]);
     }
@@ -2097,8 +2108,12 @@ const ADMISSION_MAX_ACTIVE_REQUESTS = 12;
 const ADMISSION_MAX_ACTIVE_BRIDGES = MAX_ACTIVE_BRIDGES;
 const STALL_TIMEOUT_MS = Number(process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS ?? 45_000);
 const STALL_TICK_MS = Number(process.env.OPENCODE_CURSOR_STALL_TICK_MS ?? 1_000);
-/** Emit a user-visible "still processing" marker before we treat stream as stalled. */
-const STALL_WAIT_NOTICE_MS = Number(process.env.OPENCODE_CURSOR_STALL_WAIT_NOTICE_MS ?? 20_000);
+/**
+ * Optional user-visible "still processing" marker. Default 0 (disabled): emitting
+ * this as SSE `content` posts into Discord mid-turn and interrupts slow agents.
+ * Set OPENCODE_CURSOR_STALL_WAIT_NOTICE_MS > 0 only if you explicitly want it.
+ */
+const STALL_WAIT_NOTICE_MS = Number(process.env.OPENCODE_CURSOR_STALL_WAIT_NOTICE_MS ?? 0);
 /** Minimum gap between those notices for the same conversation across back-to-back tool/MCP resumes. */
 const STALL_WAIT_NOTICE_CONV_INTERVAL_MS = Number(
   process.env.OPENCODE_CURSOR_STALL_WAIT_NOTICE_CONV_INTERVAL_MS ?? 120_000,
@@ -2109,9 +2124,13 @@ const MAX_STALL_RECOVERIES = Number(process.env.OPENCODE_CURSOR_MAX_STALL_RECOVE
 const STALL_RECOVERY_BASE_DELAY_MS = Number(
   process.env.OPENCODE_CURSOR_STALL_RECOVERY_BASE_DELAY_MS ?? 1_000,
 );
-/** Stall threshold while waiting for model output after MCP tool results (HTTP resume). */
+/**
+ * Stall threshold while waiting for model output after MCP tool results.
+ * Post-tool thinking is often much slower than the initial turn; a short
+ * timeout falsely "recovers" by restarting the original Run and drops mcpResults.
+ */
 const STALL_TIMEOUT_POST_TOOL_MS = Number(
-  process.env.OPENCODE_CURSOR_STALL_TIMEOUT_POST_TOOL_MS ?? STALL_TIMEOUT_MS,
+  process.env.OPENCODE_CURSOR_STALL_TIMEOUT_POST_TOOL_MS ?? 180_000,
 );
 /** Override model for title-gen requests. When set, skips auto-discovery
  *  and uses this model directly. When unset (default), the proxy discovers
@@ -2278,6 +2297,12 @@ function createBridgeStreamResponse(
   workspaceRoot?: string,
   /** Override no-progress threshold for this stream (e.g. post-tool resume). */
   stallTimeoutMs?: number,
+  /**
+   * When false, a stall closes the SSE cleanly without restarting Run from the
+   * original requestBytes. Required after mcpResult resume — a fresh Run would
+   * drop the tool results already written to the live bridge.
+   */
+  allowForcedStallRecovery: boolean = true,
 ): Response {
   const resolvedStallTimeoutMs = stallTimeoutMs ?? STALL_TIMEOUT_MS;
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
@@ -2575,7 +2600,10 @@ function createBridgeStreamResponse(
             return;
           }
           const noProgressMs = Date.now() - lastProgressAt;
+          // Opt-in only: default STALL_WAIT_NOTICE_MS is 0 so Discord bots are
+          // not interrupted by a mid-stream "[Info: ...]" content chunk.
           if (
+            STALL_WAIT_NOTICE_MS > 0 &&
             !stallWaitUserNoticeEmittedThisResponse &&
             !isTitleGenStream &&
             noProgressMs >= STALL_WAIT_NOTICE_MS &&
@@ -2586,22 +2614,22 @@ function createBridgeStreamResponse(
             const lastMs = lastStallWaitNoticeMsByConv.get(convKey) ?? 0;
             if (nowMs - lastMs >= STALL_WAIT_NOTICE_CONV_INTERVAL_MS) {
               lastStallWaitNoticeMsByConv.set(convKey, nowMs);
+              log.info(
+                `[proxy] stall wait notice bridgeKey=${bridgeKey} noProgressMs=${noProgressMs}`,
+              );
               sendSSE(makeChunk({ content: "\n[Info: Cursor is still processing; waiting for response...]" }));
             }
           }
           if (noProgressMs < resolvedStallTimeoutMs) return;
-          // In Bun.serve, activeRequestCount often drops to zero as soon as
-          // the Response is returned, while stream processing is still active.
-          // A prolonged no-progress window at that point is our stuck-busy signal.
-          if (activeRequestCount !== 0) return;
 
           watchdogHandled = true;
           proxyTelemetry.stallDetections += 1;
           log.warn(
-            `[proxy] stall detected bridgeKey=${bridgeKey} attempt=${attempt} timeoutMs=${resolvedStallTimeoutMs}`,
+            `[proxy] stall detected bridgeKey=${bridgeKey} attempt=${attempt} timeoutMs=${resolvedStallTimeoutMs} allowForcedRecovery=${allowForcedStallRecovery}`,
           );
 
           if (
+            allowForcedStallRecovery &&
             retryCtx &&
             accessToken &&
             requestBytes &&
@@ -2626,7 +2654,7 @@ function createBridgeStreamResponse(
               stallRecoveryBackoffTimer = undefined;
               if (closed) return;
               const { bridge: retryBridge, heartbeatTimer: retryTimer } =
-                startBridge(accessToken, requestBytes);
+                startBridge(accessToken, requestBytes, bridgeKey);
               runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
             }, delay);
             return;
@@ -2634,7 +2662,7 @@ function createBridgeStreamResponse(
 
           // Diagnostic: log why recovery was skipped
           log.warn(
-            `[proxy] stall recovery skipped bridgeKey=${bridgeKey} retryCtx=${!!retryCtx} stallRecoveryCount=${retryCtx?.stallRecoveryCount ?? "n/a"} max=${MAX_STALL_RECOVERIES} accessToken=${!!accessToken} requestBytes=${!!requestBytes}`,
+            `[proxy] stall recovery skipped bridgeKey=${bridgeKey} allowForcedRecovery=${allowForcedStallRecovery} retryCtx=${!!retryCtx} stallRecoveryCount=${retryCtx?.stallRecoveryCount ?? "n/a"} max=${MAX_STALL_RECOVERIES} accessToken=${!!accessToken} requestBytes=${!!requestBytes}`,
           );
           proxyTelemetry.stallRecoveryFailures += 1;
           // Send a clean stop so the client can auto-retry without showing
@@ -2689,7 +2717,7 @@ function createBridgeStreamResponse(
             );
             freshPayload.mcpTools = retryCtx.mcpTools;
             const { bridge: newBridge, heartbeatTimer: newTimer } =
-              startBridge(retryCtx.accessToken, freshPayload.requestBytes);
+              startBridge(retryCtx.accessToken, freshPayload.requestBytes, bridgeKey);
             runAttempt(newBridge, newTimer, freshPayload.blobStore, freshPayload.mcpTools, 1);
             return;
           }
@@ -2710,7 +2738,7 @@ function createBridgeStreamResponse(
               // If the stream was already closed (client abort), don't retry.
               if (closed) return;
               const { bridge: retryBridge, heartbeatTimer: retryTimer } =
-                startBridge(accessToken, requestBytes);
+                startBridge(accessToken, requestBytes, bridgeKey);
               runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
             }, delay);
             return;
@@ -2762,7 +2790,7 @@ function createBridgeStreamResponse(
               setTimeout(() => {
                 if (closed) return;
                 const { bridge: retryBridge, heartbeatTimer: retryTimer } =
-                  startBridge(retryAccessToken, effectiveRequestBytes);
+                  startBridge(retryAccessToken, effectiveRequestBytes, bridgeKey);
                 runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
               }, delay);
               return;
@@ -2824,6 +2852,7 @@ function createBridgeStreamResponse(
 function startBridge(
   accessToken: string,
   requestBytes: Uint8Array,
+  bridgeKey?: string,
 ): { bridge: ReturnType<typeof spawnBridge> | BridgeHandle; heartbeatTimer: NodeJS.Timeout } {
   const bridge: ReturnType<typeof spawnBridge> | BridgeHandle = bridgePool
     ? bridgePool.acquire({
@@ -2836,7 +2865,17 @@ function startBridge(
         rpcPath: "/agent.v1.AgentService/Run",
       });
   bridge.write(frameConnectMessage(requestBytes));
-  const heartbeatTimer = setInterval(() => bridge.write(makeHeartbeatBytes()), 5_000);
+  // Keep the H2 stream alive and refresh lastAccessMs while a bridge is paused
+  // awaiting OpenCode tool results (otherwise maintenance can evict it).
+  const heartbeatTimer = setInterval(() => {
+    bridge.write(makeHeartbeatBytes());
+    if (bridgeKey) {
+      const active = activeBridges.get(bridgeKey);
+      if (active?.bridge === bridge && isAwaitingToolResults(active)) {
+        active.lastAccessMs = Date.now();
+      }
+    }
+  }, 5_000);
   return { bridge, heartbeatTimer };
 }
 
@@ -2850,7 +2889,7 @@ function handleStreamingResponse(
   retryCtx?: RetryContext,
   workspaceRoot?: string,
 ): Response {
-  const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
+  const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes, bridgeKey);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     payload.blobStore, payload.mcpTools,
@@ -2922,6 +2961,8 @@ function handleToolResultResume(
     );
   }
 
+  // Do not forced-recover by restarting the original Run: mcpResults were
+  // already written to this live bridge and would be lost on a fresh stream.
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     blobStore, mcpTools,
@@ -2931,6 +2972,7 @@ function handleToolResultResume(
     active.requestBytes,
     workspaceRoot,
     STALL_TIMEOUT_POST_TOOL_MS,
+    false,
   );
 }
 

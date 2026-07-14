@@ -2002,10 +2002,56 @@ async function testStreamingWatchdogRecoversFromStalledRun(
     backend.getRunRequestCount() >= 2,
     `Expected watchdog retry (>=2 Run attempts), got ${backend.getRunRequestCount()}`,
   );
+  assert(
+    !bodyText.includes("[Info: Cursor is still processing"),
+    "Default stall wait notice must not interrupt Discord/content streams",
+  );
 
   backend.setRunMode("immediate-close");
   modules.stopProxy();
   console.log("[test] Streaming watchdog recovery OK");
+}
+
+async function testStallWaitNoticeDisabledByDefault(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing stall wait notice stays off by default...");
+  modules.stopProxy();
+  backend.resetObservations();
+  backend.setRunMode("stall-once-then-close");
+
+  // Keep the stream open longer than the historical 20s notice window would need
+  // in production; in tests the stall timeout is short, so just verify the
+  // default env leaves Info notices out of SSE content.
+  const prevNotice = process.env.OPENCODE_CURSOR_STALL_WAIT_NOTICE_MS;
+  delete process.env.OPENCODE_CURSOR_STALL_WAIT_NOTICE_MS;
+
+  const port = await modules.startProxy(async () => "test-token");
+  const res = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "composer-2",
+      stream: true,
+      messages: [{ role: "user", content: "still there?" }],
+    }),
+  });
+  assertEqual(res.status, 200, "Expected streaming request to succeed");
+  const bodyText = await res.text();
+  assert(
+    !bodyText.includes("[Info:"),
+    `Expected no Discord-visible stall Info chunk, got: ${bodyText.slice(0, 400)}`,
+  );
+
+  if (prevNotice === undefined) {
+    delete process.env.OPENCODE_CURSOR_STALL_WAIT_NOTICE_MS;
+  } else {
+    process.env.OPENCODE_CURSOR_STALL_WAIT_NOTICE_MS = prevNotice;
+  }
+  backend.setRunMode("immediate-close");
+  modules.stopProxy();
+  console.log("[test] Stall wait notice disabled-by-default OK");
 }
 
 // ---------------------------------------------------------------------------
@@ -2046,6 +2092,7 @@ async function main() {
     await testPoolOverflowEphemeralWorkers();
     await testProxyConsumesCursorModelHeader(modules, backend);
     await testStreamingWatchdogRecoversFromStalledRun(modules, backend);
+    await testStallWaitNoticeDisabledByDefault(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {
