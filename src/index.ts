@@ -601,6 +601,8 @@ const MODEL_COST_TABLE: Record<string, ModelCost> = {
   // xAI
   "grok-4-5":                { input: 2, output: 6, cache: { read: 0.2, write: 0 } },
   "grok-4.20":               { input: 2, output: 6, cache: { read: 0.2, write: 0 } },
+  "grok-4-fast-reasoning":   { input: 2, output: 6, cache: { read: 0.2, write: 0 } },
+  "grok-4-0709":             { input: 2, output: 6, cache: { read: 0.2, write: 0 } },
 
   // Moonshot
   "kimi-k2.5":               { input: 0.6, output: 3, cache: { read: 0.1, write: 0 } },

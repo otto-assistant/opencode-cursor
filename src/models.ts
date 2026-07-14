@@ -5,7 +5,7 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { tool } from "@opencode-ai/plugin";
 const z = tool.schema;
-import { callCursorUnaryRpc } from "./proxy.js";
+import { callCursorUnaryRpc, probeCursorAgentSelection } from "./proxy.js";
 import {
   literalCursorModelSelection,
   type CursorModelParameter,
@@ -26,7 +26,11 @@ const ADDITIONAL_MODEL_NAMES = [
   "grok-4-5",
   "grok-4.20",
   "grok-code-fast-1",
+  "grok-4-fast-reasoning",
+  "grok-4-0709",
 ] as const;
+
+const AGENT_PROBE_MODEL_IDS = new Set<string>(ADDITIONAL_MODEL_NAMES);
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 64_000;
@@ -83,9 +87,8 @@ export const FALLBACK_MODELS: CursorModel[] = [
   flatModel("gpt-5.3-codex-spark-preview", "GPT-5.3 Codex Spark", true, 128_000, 128_000),
   // Other models
   flatModel("gemini-3.1-pro", "Gemini 3.1 Pro", true, 1_000_000, 64_000),
-  flatModel("grok-4-5", "Grok 4.5", true, 200_000, 64_000),
-  flatModel("grok-4.20", "Grok 4.20", true, 200_000, 64_000),
   flatModel("grok-code-fast-1", "Grok Code Fast 1", false, 256_000, 64_000),
+  flatModel("grok-4-fast-reasoning", "Grok 4 Fast Reasoning", true, 200_000, 64_000),
 ];
 
 interface VariantDescriptor {
@@ -182,7 +185,10 @@ async function fetchCursorAvailableModels(
     const decoded = JSON.parse(new TextDecoder().decode(response.body)) as unknown;
     const record = asRecord(decoded);
     const models = Array.isArray(record?.models)
-      ? normalizeAvailableModels(record.models)
+      ? await filterAgentRunnableModels(
+          apiKey,
+          normalizeAvailableModels(record.models),
+        )
       : [];
     return models.length > 0 ? models : null;
   } catch {
@@ -234,6 +240,28 @@ export async function getCursorModels(
     return cachedModels;
   }
   return FALLBACK_MODELS;
+}
+
+async function filterAgentRunnableModels(
+  accessToken: string,
+  models: CursorModel[],
+): Promise<CursorModel[]> {
+  const probeTargets = models.filter((model) => AGENT_PROBE_MODEL_IDS.has(model.id));
+  if (probeTargets.length === 0) return models;
+
+  const probeResults = await Promise.all(
+    probeTargets.map(async (model) => ({
+      id: model.id,
+      runnable: await probeCursorAgentSelection(accessToken, model.defaultSelection),
+    })),
+  );
+  const runnableIds = new Set(
+    probeResults.filter((result) => result.runnable).map((result) => result.id),
+  );
+
+  return models.filter(
+    (model) => !AGENT_PROBE_MODEL_IDS.has(model.id) || runnableIds.has(model.id),
+  );
 }
 
 /** @internal Test-only. */
@@ -919,7 +947,9 @@ function parseTooltipTitle(markdown: string | undefined): string | undefined {
 
 function formatModelIdDisplayName(id: string): string {
   const grokVersion = id.match(/^grok-(\d+)-(\d+)$/);
-  if (grokVersion) return `Grok ${grokVersion[1]}.${grokVersion[2]}`;
+  if (grokVersion && grokVersion[2].length <= 2) {
+    return `Grok ${grokVersion[1]}.${grokVersion[2]}`;
+  }
   const grokDotted = id.match(/^grok-(\d+\.\d+)$/);
   if (grokDotted) return `Grok ${grokDotted[1]}`;
   return id

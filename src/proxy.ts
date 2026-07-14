@@ -1526,6 +1526,17 @@ function buildCursorRequest(
   };
 }
 
+export function formatConnectErrorForUser(
+  message: string,
+  modelId?: string,
+): string {
+  if (message.includes("not_found")) {
+    const label = modelId ? `"${modelId}"` : "This model";
+    return `${label} is listed in Cursor but is not available for agent requests on your account. Enable it in Cursor Settings → Models, or try Grok Code Fast 1 / Grok 4 Fast Reasoning.`;
+  }
+  return message;
+}
+
 function parseConnectEndStream(data: Uint8Array): Error | null {
   try {
     const payload = JSON.parse(new TextDecoder().decode(data));
@@ -2650,7 +2661,7 @@ function createBridgeStreamResponse(
                 // Map known gRPC codes to user-friendly messages.
                 const displayMsg = isRateLimit
                   ? `Cursor responded with "resource exhausted" after ${attempt + 1} attempt(s). This may be a temporary server overload or a rate limit. If the model usually works for you, please retry; if the error persists, try switching to a different model.`
-                  : endError.message;
+                  : formatConnectErrorForUser(endError.message, modelId);
                 sendSSE(makeChunk({ content: `\n[Error: ${displayMsg}]` }));
               }
             }
@@ -3061,6 +3072,119 @@ async function handleNonStreamingResponse(
 interface CollectedResponse {
   text: string;
   usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+}
+
+const AGENT_PROBE_TIMEOUT_MS = 30_000;
+const AGENT_PROBE_SYSTEM_PROMPT = "You are a helpful assistant.";
+const AGENT_PROBE_USER_TEXT = "Say hi";
+
+/** Minimal agent Run probe — true when Cursor accepts the model for agent requests. */
+export async function probeCursorAgentSelection(
+  accessToken: string,
+  selection: CursorModelSelection,
+): Promise<boolean> {
+  const payload = buildCursorRequest(
+    selection,
+    AGENT_PROBE_SYSTEM_PROMPT,
+    AGENT_PROBE_USER_TEXT,
+    crypto.randomUUID(),
+    null,
+  );
+
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+
+    const finish = (ok: boolean, reason: string) => {
+      if (settled) return;
+      settled = true;
+      if (process.env.OPENCODE_CURSOR_DEBUG_PROBE === "1") {
+        console.log(`[probe] finish ok=${ok} reason=${reason} model=${selection.publicId}`);
+      }
+      clearTimeout(timer);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      bridge.kill();
+      resolve(ok);
+    };
+
+    const timer = setTimeout(() => finish(false, "timeout"), AGENT_PROBE_TIMEOUT_MS);
+
+    const bridge: ReturnType<typeof spawnBridge> | BridgeHandle = bridgePool
+      ? bridgePool.acquire({
+          accessToken,
+          rpcPath: "/agent.v1.AgentService/Run",
+          url: CURSOR_API_URL,
+        })
+      : spawnBridge({
+          accessToken,
+          rpcPath: "/agent.v1.AgentService/Run",
+        });
+
+    const blobStore = payload.blobStore;
+    const state: StreamState = {
+      toolCallIndex: 0,
+      pendingExecs: [],
+      outputTokens: 0,
+      promptTokens: 0,
+      fallbackPromptTokens: 0,
+    };
+
+    bridge.onData(
+      createConnectFrameParser(
+        (messageBytes) => {
+          try {
+            const serverMessage = fromBinary(
+              AgentServerMessageSchema,
+              messageBytes,
+            );
+            processServerMessage(
+              serverMessage,
+              blobStore,
+              payload.mcpTools,
+              (data) => bridge.write(data),
+              state,
+              (text) => {
+                if (text.trim()) {
+                  finish(true, "text");
+                }
+              },
+              () => {},
+              () => {},
+              undefined,
+            );
+          } catch {
+            // Ignore unparseable frames during probe.
+          }
+        },
+        (endStreamBytes) => {
+          const err = parseConnectEndStream(endStreamBytes);
+          if (err) {
+            finish(false, "connect-error");
+            return;
+          }
+          if (state.outputTokens > 0) {
+            finish(true, "tokens");
+          }
+        },
+      ),
+    );
+
+    bridge.onClose((code) => {
+      if (!settled) {
+        if (state.outputTokens > 0) {
+          finish(true, "tokens-on-close");
+        } else {
+          finish(false, `close:${code}`);
+        }
+      }
+    });
+
+    bridge.write(frameConnectMessage(payload.requestBytes));
+    heartbeatTimer = setInterval(
+      () => bridge.write(makeHeartbeatBytes()),
+      5_000,
+    );
+  });
 }
 
 async function collectFullResponse(
