@@ -2045,10 +2045,139 @@ async function testStreamingWatchdogRecoversFromStalledRun(
     !bodyText.includes("[Info: Cursor is still processing"),
     "Default stall wait notice must not interrupt Discord/content streams",
   );
+  assert(
+    !bodyText.includes("stream stalled; retrying..."),
+    "Must not claim retrying when recovery actually ran (or when exhausted uses honest copy)",
+  );
 
   backend.setRunMode("immediate-close");
   modules.stopProxy();
   console.log("[test] Streaming watchdog recovery OK");
+}
+
+async function testStallExhaustionIsHonest(modules: TestModules, backend: TestCursorBackend) {
+  console.log("[test] Testing stall exhaustion uses honest error (no fake retrying)...");
+  modules.stopProxy();
+  const prevMax = process.env.OPENCODE_CURSOR_MAX_STALL_RECOVERIES;
+  process.env.OPENCODE_CURSOR_MAX_STALL_RECOVERIES = "0";
+  backend.setRunMode("stall-once-then-close");
+
+  try {
+    const port = await modules.startProxy(async () => "test-token");
+    const res = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "composer-2",
+        stream: true,
+        messages: [{ role: "user", content: "stall-exhaustion-probe" }],
+      }),
+    });
+    assertEqual(res.status, 200, "Expected streaming request to succeed");
+    const bodyText = await res.text();
+    assert(
+      bodyText.includes("stream stalled; automatic recovery exhausted"),
+      `Expected honest exhaustion message, got: ${bodyText.slice(0, 400)}`,
+    );
+    assert(
+      !bodyText.includes("stream stalled; retrying..."),
+      "Must not claim retrying when no recovery was scheduled",
+    );
+    assertEqual(
+      backend.getRunRequestCount(),
+      1,
+      "With max recoveries=0, only the initial Run should execute",
+    );
+  } finally {
+    if (prevMax === undefined) delete process.env.OPENCODE_CURSOR_MAX_STALL_RECOVERIES;
+    else process.env.OPENCODE_CURSOR_MAX_STALL_RECOVERIES = prevMax;
+    backend.setRunMode("immediate-close");
+    modules.stopProxy();
+  }
+  console.log("[test] Stall exhaustion honest error OK");
+}
+
+async function testMutexAbortDoesNotBlockQueue() {
+  console.log("[test] Testing mutex abort releases waiters without blocking queue...");
+  const { Mutex, isAbortError } = await import("../src/promise-queue");
+  const mutex = new Mutex();
+
+  const release1 = await mutex.acquire();
+  const controller = new AbortController();
+  let aborted = false;
+  const waiter = mutex.acquire(controller.signal).then(
+    () => {
+      throw new Error("Aborted waiter must not acquire the mutex");
+    },
+    (err: unknown) => {
+      aborted = true;
+      assert(isAbortError(err), "Expected AbortError from cancelled waiter");
+    },
+  );
+
+  // Let the waiter enqueue, then cancel it (simulates OpenCode dropping a
+  // queued HTTP request while another turn still holds the conversation lock).
+  await new Promise((r) => setTimeout(r, 10));
+  assertEqual(mutex.waiterCount(), 1, "Expected one waiter while lock held");
+  controller.abort();
+  await waiter;
+  assert(aborted, "Expected waiter promise to reject");
+  assertEqual(mutex.waiterCount(), 0, "Aborted waiter must leave the queue");
+
+  release1();
+  assert(mutex.isIdle(), "Mutex should be idle after holder release with no waiters");
+
+  // Next real acquire must succeed immediately (not blocked by a zombie).
+  const release2 = await mutex.acquire();
+  release2();
+  assert(mutex.isIdle(), "Mutex should be idle after second acquire/release");
+  console.log("[test] Mutex abort queue safety OK");
+}
+
+async function testSummaryGenerationDetection(modules: TestModules) {
+  console.log("[test] Testing /compact and summary request detection...");
+  const proxy = await import("../src/proxy");
+
+  assert(
+    proxy.isSummaryGenerationRequest([
+      {
+        role: "system",
+        content:
+          "You are an anchored context summarization assistant for coding sessions.\nDo not mention that you are summarizing, compacting, or merging context.",
+      },
+      { role: "user", content: "Summarize the conversation." },
+    ]),
+    "Expected compaction system prompt to be detected",
+  );
+  assert(
+    proxy.isSummaryGenerationRequest([
+      {
+        role: "system",
+        content:
+          "Summarize what was done in this conversation. Write like a pull request description.",
+      },
+      { role: "user", content: "please summarize" },
+    ]),
+    "Expected summary agent prompt to be detected",
+  );
+  assert(
+    !proxy.isSummaryGenerationRequest([
+      { role: "system", content: "You are a helpful coding agent." },
+      { role: "user", content: "fix the stall bug" },
+    ]),
+    "Normal chat must not be treated as summary generation",
+  );
+  assert(
+    !proxy.isTitleGenerationRequest([
+      {
+        role: "system",
+        content: "You are an anchored context summarization assistant for coding sessions.",
+      },
+      { role: "user", content: "Summarize" },
+    ]),
+    "Compaction must not be misclassified as title generation",
+  );
+  console.log("[test] Summary generation detection OK");
 }
 
 async function testComputeUsageFallback(modules: TestModules) {
@@ -2127,6 +2256,9 @@ async function main() {
     await testPoolOverflowEphemeralWorkers();
     await testProxyConsumesCursorModelHeader(modules, backend);
     await testStreamingWatchdogRecoversFromStalledRun(modules, backend);
+    await testStallExhaustionIsHonest(modules, backend);
+    await testMutexAbortDoesNotBlockQueue();
+    await testSummaryGenerationDetection(modules);
     await testComputeUsageFallback(modules);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;

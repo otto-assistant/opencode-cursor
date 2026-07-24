@@ -70,7 +70,7 @@ import {
 } from "./proto/agent_pb.js";
 import { createHash } from "node:crypto";
 import { resolve as pathResolve } from "node:path";
-import { Mutex } from "./promise-queue.js";
+import { Mutex, isAbortError } from "./promise-queue.js";
 import { BridgePool, type BridgeHandle } from "./bridge-pool.js";
 import { log } from "./log.js";
 import {
@@ -820,19 +820,44 @@ export async function startProxy(
         if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
           let release: (() => void) | undefined;
           try {
+            // Drop work immediately when OpenCode cancelled a queued/superseded request
+            // before we even read the body — otherwise zombies pile up on the mutex.
+            if (req.signal.aborted) {
+              return new Response(null, { status: 499, statusText: "Client Closed Request" });
+            }
             const body = (await req.json()) as ChatCompletionRequest;
+            if (req.signal.aborted) {
+              return new Response(null, { status: 499, statusText: "Client Closed Request" });
+            }
             const msgSummary = body.messages.map((m) => `${m.role}[${(typeof m.content === 'string' ? m.content : Array.isArray(m.content) ? m.content.length + ' parts' : 'null')?.slice(0, 40)}]`).join(', ');
             log.info(`[proxy] REQUEST model=${body.model} stream=${body.stream} msgs=${body.messages.length} [${msgSummary.slice(0, 120)}]`);
             if (!proxyAccessTokenProvider) {
               throw new Error("Cursor proxy access token provider not configured");
             }
             const accessToken = await proxyAccessTokenProvider();
+            if (req.signal.aborted) {
+              return new Response(null, { status: 499, statusText: "Client Closed Request" });
+            }
 
             // Serialize per-conversation requests to prevent race conditions
             // that cause "Blob not found" errors from concurrent state mutations.
+            // Pass req.signal so cancelled queue waiters never take the lock and
+            // block later real turns (common OpenCode multi-message queue failure).
             const convKey = deriveConversationKey(body);
             const mutex = getOrCreateMutex(convKey);
-            const acquired = await mutex.acquire();
+            let acquired: () => void;
+            try {
+              acquired = await mutex.acquire(req.signal);
+            } catch (err) {
+              if (isAbortError(err) || req.signal.aborted) {
+                return new Response(null, { status: 499, statusText: "Client Closed Request" });
+              }
+              throw err;
+            }
+            if (req.signal.aborted) {
+              acquired();
+              return new Response(null, { status: 499, statusText: "Client Closed Request" });
+            }
             // Guard against double-release: multiple cleanup paths
             // (closeController, cancel, onClose) can all fire for the same request.
             let released = false;
@@ -860,6 +885,9 @@ export async function startProxy(
             return resolvedResponse;
           } catch (err) {
             release?.();
+            if (isAbortError(err) || req.signal.aborted) {
+              return new Response(null, { status: 499, statusText: "Client Closed Request" });
+            }
             const message = err instanceof Error ? err.message : String(err);
             return new Response(
               JSON.stringify({
@@ -1131,10 +1159,15 @@ async function doHandleChatCompletion(
   const selection =
     selectedModel ?? literalCursorModelSelection(resolveProxyModelId(body.model));
   const modelId = selection.publicId;
-  const tools = (body.tools ?? []).filter((tool) => !shouldBlockTool(tool));
+  const isSummary = isSummaryGenerationRequest(body.messages);
+  // /compact and summary agents must never see tools — Cursor would call them
+  // and OpenCode throws "Tool call not allowed while generating summary".
+  const tools = isSummary
+    ? []
+    : (body.tools ?? []).filter((tool) => !shouldBlockTool(tool));
   const workspaceRoot = extractWorkspaceRoot(systemPrompt);
   log.info(
-    `[proxy] bridge model input=${body.model} resolved=${modelId} server=${selection.modelId} max=${selection.maxMode}`,
+    `[proxy] bridge model input=${body.model} resolved=${modelId} server=${selection.modelId} max=${selection.maxMode}${isSummary ? " summary=1" : ""}`,
   );
 
   if (!userText && toolResults.length === 0) {
@@ -1163,6 +1196,7 @@ async function doHandleChatCompletion(
 
   // bridgeKey: model-specific, for active tool-call bridges
   // convKey: model-independent, for conversation state that survives model switches
+  // Summary/compact requests are namespaced so they never reuse the live agent checkpoint.
   const bridgeKey = deriveBridgeKey(selectionIdentity(selection), body);
   const convKey = deriveConversationKey(body);
   const prevStored = conversationStates.get(convKey);
@@ -1198,6 +1232,13 @@ async function doHandleChatCompletion(
   }
 
   let stored: StoredConversation | undefined = conversationStates.get(convKey);
+  // Summary/compact must start from a clean Cursor conversation — never continue
+  // the live coding-agent checkpoint (that re-triggers tool calls mid-summary).
+  if (isSummary && stored) {
+    conversationStates.delete(convKey);
+    lastStallWaitNoticeMsByConv.delete(convKey);
+    stored = undefined;
+  }
   // Safety: if existing state has a checkpoint but this request has no conversation
   // history (no turns, no tool results), it's likely a key collision with a different
   // conversation type (e.g., title generation vs. regular chat). Reset to avoid
@@ -1236,6 +1277,8 @@ async function doHandleChatCompletion(
   // For fresh conversations (no checkpoint), embed prior conversation turns
   // into the user message so the model has context of previous interactions.
   // When a checkpoint exists, Cursor already has the full conversation state.
+  // Summary/compact already receives the history in the OpenAI messages that
+  // parseMessages folded into turns — embed them so Cursor can summarize.
   if (!stored.checkpoint && turns.length > 0) {
     const historyLines: string[] = [];
     for (const turn of turns) {
@@ -1255,7 +1298,7 @@ async function doHandleChatCompletion(
   payload.mcpTools = mcpTools;
 
   if (body.stream === false) {
-    return handleNonStreamingResponse(payload, accessToken, modelId, convKey, release, workspaceRoot);
+    return handleNonStreamingResponse(payload, accessToken, modelId, convKey, release, workspaceRoot, isSummary);
   }
   const retryCtx: RetryContext = {
     stored,
@@ -1274,6 +1317,7 @@ async function doHandleChatCompletion(
     payload, accessToken, modelId, bridgeKey, convKey, release,
     retryCtx,
     workspaceRoot,
+    isSummary,
   );
 }
 
@@ -1739,6 +1783,7 @@ function processServerMessage(
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
   workspaceRoot?: string,
+  toolsDisabled?: boolean,
 ): void {
   const msgCase = msg.message.case;
 
@@ -1753,6 +1798,7 @@ function processServerMessage(
       sendFrame,
       onMcpExec,
       workspaceRoot,
+      toolsDisabled,
     );
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
@@ -1844,6 +1890,7 @@ function handleExecMessage(
   sendFrame: (data: Uint8Array) => void,
   onMcpExec: (exec: PendingExec) => void,
   workspaceRoot?: string,
+  toolsDisabled?: boolean,
 ): void {
   const execCase = execMsg.message.case;
 
@@ -1851,7 +1898,9 @@ function handleExecMessage(
     const workspaceNote = workspaceRoot
       ? ` The project workspace root is "${workspaceRoot}". NEVER use /workspace/ — it does not exist on this system. All file paths must use the real absolute path starting with "${workspaceRoot}".`
       : " NEVER use /workspace/ as a path prefix — it does not exist. Use the absolute paths exactly as provided in the system prompt and tool responses.";
-    const MCP_ONLY_RULE = `CRITICAL: Do NOT use native tools (read, ls, grep, shell, write, delete, fetch, diagnostics, backgroundShellSpawn, writeShellStdin). They are ALL disabled in this environment. Use ONLY the MCP tools provided in the tools list. Every native tool call will be rejected and waste time. Always use MCP tools for all file operations, shell commands, searches, and any other actions.${workspaceNote}`;
+    const MCP_ONLY_RULE = toolsDisabled
+      ? `CRITICAL: You are generating a conversation summary/compaction. Do NOT call any tools (native or MCP) — read, ls, grep, shell, write, delete, fetch, and every MCP tool are forbidden. Output ONLY the requested summary as plain text.`
+      : `CRITICAL: Do NOT use native tools (read, ls, grep, shell, write, delete, fetch, diagnostics, backgroundShellSpawn, writeShellStdin). They are ALL disabled in this environment. Use ONLY the MCP tools provided in the tools list. Every native tool call will be rejected and waste time. Always use MCP tools for all file operations, shell commands, searches, and any other actions.${workspaceNote}`;
 
     const requestContext = create(RequestContextSchema, {
       rules: [
@@ -1865,7 +1914,7 @@ function handleExecMessage(
         }),
       ],
       repositoryInfo: [],
-      tools: mcpTools,
+      tools: toolsDisabled ? [] : mcpTools,
       gitRepos: [],
       projectLayouts: [],
       mcpInstructions: [
@@ -1888,6 +1937,24 @@ function handleExecMessage(
   }
 
   if (execCase === "mcpArgs") {
+    // During /compact and summary generation, never surface tool calls to OpenCode —
+    // it hard-throws "Tool call not allowed while generating summary".
+    if (toolsDisabled) {
+      log.warn(
+        `[proxy] suppressing MCP tool during summary: ${execMsg.message.value.toolName || execMsg.message.value.name || "unknown"}`,
+      );
+      const mcpResult = create(McpResultSchema, {
+        result: {
+          case: "error",
+          value: create(McpErrorSchema, {
+            error:
+              "Tools are disabled during summary/compaction. Output the summary as plain text only. Do not call any tools.",
+          }),
+        },
+      });
+      sendExecResult(execMsg, "mcpResult", mcpResult, sendFrame);
+      return;
+    }
     const mcpArgs = execMsg.message.value;
     const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
     const cursorToolCallId = mcpArgs.toolCallId || crypto.randomUUID();
@@ -1908,7 +1975,10 @@ function handleExecMessage(
   // --- Reject native Cursor tools ---
   // The model tries these first. We must respond with rejection/error
   // so it falls back to our MCP tools (registered via RequestContext).
-  const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
+  // During summary/compaction, steer it to plain-text output instead.
+  const REJECT_REASON = toolsDisabled
+    ? "Tools are disabled during summary/compaction. Output the summary as plain text only."
+    : "Tool not available in this environment. Use the MCP tools provided instead.";
 
   if (execCase === "readArgs") {
     const args = execMsg.message.value;
@@ -2079,8 +2149,8 @@ function deriveBridgeKey(modelId: string, body: ChatCompletionRequest): string {
   const identity = buildConversationIdentity(body);
   const firstUserMsg = body.messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  const titleNs = isTitleGenerationRequest(body.messages) ? "title:" : "";
-  const base = identity || `fallback:${titleNs}${firstUserText}`;
+  const ns = requestKeyNamespace(body.messages);
+  const base = identity ? `${ns}${identity}` : `fallback:${ns}${firstUserText}`;
   return createHash("sha256")
     .update(`bridge:${modelId}:${base}`)
     .digest("hex")
@@ -2088,13 +2158,55 @@ function deriveBridgeKey(modelId: string, body: ChatCompletionRequest): string {
 }
 
 /** Detect if this is a title generation request by checking for title-gen system prompt. */
-function isTitleGenerationRequest(messages: OpenAIMessage[]): boolean {
+export function isTitleGenerationRequest(messages: OpenAIMessage[]): boolean {
   const systemText = messages
     .filter((m) => m.role === "system")
     .map((m) => textContent(m.content))
     .join(" ");
   return systemText.toLowerCase().includes("title generator") ||
          systemText.toLowerCase().includes("generate a short title");
+}
+
+/**
+ * Detect OpenCode /compact (compaction) and summary-agent requests.
+ * These must not share the live agent conversation checkpoint and must not
+ * advertise or emit tools — otherwise Cursor continues the coding agent and
+ * OpenCode throws "Tool call not allowed while generating summary".
+ */
+export function isSummaryGenerationRequest(messages: OpenAIMessage[]): boolean {
+  const systemText = messages
+    .filter((m) => m.role === "system")
+    .map((m) => textContent(m.content))
+    .join(" ")
+    .toLowerCase();
+  if (
+    systemText.includes("anchored context summarization") ||
+    systemText.includes("summarizing, compacting, or merging context") ||
+    systemText.includes("tasked with summarizing conversations") ||
+    systemText.includes("write like a pull request description") ||
+    systemText.includes("summarize what was done in this conversation")
+  ) {
+    return true;
+  }
+
+  // Compaction user prompts (when agent.prompt is absent from system for any reason).
+  const userText = messages
+    .filter((m) => m.role === "user")
+    .map((m) => textContent(m.content))
+    .join(" ")
+    .toLowerCase();
+  return (
+    userText.includes("this summary will be the only context available when the conversation continues") ||
+    userText.includes("create a detailed summary for continuing this coding session") ||
+    (userText.includes("<previous-summary>") && userText.includes("compact"))
+  );
+}
+
+/** Namespace prefix so title/summary requests never collide with live agent state. */
+function requestKeyNamespace(messages: OpenAIMessage[]): string {
+  if (isTitleGenerationRequest(messages)) return "title:";
+  if (isSummaryGenerationRequest(messages)) return "summary:";
+  return "";
 }
 
 /** Derive a key for conversation state. Model-independent so context survives model switches.
@@ -2107,13 +2219,14 @@ function deriveConversationKey(body: ChatCompletionRequest): string {
   const identity = buildConversationIdentity(body);
   const firstUserMsg = body.messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  const titleNs = isTitleGenerationRequest(body.messages) ? "title:" : "";
+  const ns = requestKeyNamespace(body.messages);
   // NOTE: Do NOT include full system prompt in fallback key — OpenCode's system
   // prompt changes every request (dynamic context, per-turn metadata), which would
   // cause convKey to rotate and lose the stored conversation checkpoint.
   // Only firstUserText is used — it's the stable initial user message.
-  const fallbackSeed = `${titleNs}user:${firstUserText}`;
-  const seed = identity || `fallback:${fallbackSeed}`;
+  // Always apply ns so /compact and title-gen never reuse the live agent checkpoint.
+  const fallbackSeed = `${ns}user:${firstUserText}`;
+  const seed = identity ? `${ns}${identity}` : `fallback:${fallbackSeed}`;
   return createHash("sha256")
     .update(`conv:${seed}`)
     .digest("hex")
@@ -2174,7 +2287,9 @@ const STALL_WAIT_NOTICE_CONV_INTERVAL_MS = Number(
   process.env.OPENCODE_CURSOR_STALL_WAIT_NOTICE_CONV_INTERVAL_MS ?? 120_000,
 );
 /** Max internal Run-stream restarts per stall episode (resets after forward progress). */
-const MAX_STALL_RECOVERIES = Number(process.env.OPENCODE_CURSOR_MAX_STALL_RECOVERIES ?? 3);
+function maxStallRecoveries(): number {
+  return Number(process.env.OPENCODE_CURSOR_MAX_STALL_RECOVERIES ?? 3);
+}
 /** Base delay before restarting the Run stream after a stall (exponential backoff). */
 const STALL_RECOVERY_BASE_DELAY_MS = Number(
   process.env.OPENCODE_CURSOR_STALL_RECOVERY_BASE_DELAY_MS ?? 1_000,
@@ -2353,11 +2468,15 @@ function createBridgeStreamResponse(
   /** Override no-progress threshold for this stream (e.g. post-tool resume). */
   stallTimeoutMs?: number,
   /**
-   * When false, a stall closes the SSE cleanly without restarting Run from the
-   * original requestBytes. Required after mcpResult resume — a fresh Run would
-   * drop the tool results already written to the live bridge.
+   * When false, a stall must NOT restart the original Run requestBytes (those
+   * predate mcpResult writes). Instead we rebuild from the latest checkpoint
+   * plus the tool results already delivered on this resume.
    */
   allowForcedStallRecovery: boolean = true,
+  /** Tool results already written to the live bridge (post-tool resume only). */
+  postedToolResults?: ToolResultInfo[],
+  /** When true, advertise no tools and suppress MCP tool_calls (summary/compact). */
+  toolsDisabled: boolean = false,
 ): Response {
   const resolvedStallTimeoutMs = stallTimeoutMs ?? STALL_TIMEOUT_MS;
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
@@ -2406,6 +2525,9 @@ function createBridgeStreamResponse(
     },
     start(controller) {
       const encoder = new TextEncoder();
+      // Mutable so post-tool checkpoint rebuilds update connect-error / stall retries.
+      let liveAccessToken = accessToken;
+      let liveRequestBytes = requestBytes;
       const sendSSE = (data: object) => {
         if (closed) return;
         try {
@@ -2545,6 +2667,13 @@ function createBridgeStreamResponse(
                 },
                 // onMcpExec — the model wants to execute a tool.
                 (exec) => {
+                  if (toolsDisabled) {
+                    // Defense in depth: summary/compact must never emit tool_calls SSE.
+                    log.warn(
+                      `[proxy] dropping tool_calls emission during summary: ${exec.toolName}`,
+                    );
+                    return;
+                  }
                   markProgress();
                   state.pendingExecs.push(exec);
                   mcpExecReceived = true;
@@ -2576,11 +2705,11 @@ function createBridgeStreamResponse(
                     mcpTools: attemptMcpTools,
                     pendingExecs: state.pendingExecs,
                     lastAccessMs: Date.now(),
-                    ...(retryCtx && accessToken && requestBytes
+                    ...(retryCtx && liveAccessToken && liveRequestBytes
                       ? {
                         resumeRetryCtx: retryCtx,
-                        accessToken,
-                        requestBytes,
+                        accessToken: liveAccessToken,
+                        requestBytes: liveRequestBytes,
                       }
                       : {}),
                   });
@@ -2611,6 +2740,7 @@ function createBridgeStreamResponse(
                   }
                 },
                 workspaceRoot,
+                toolsDisabled,
               );
             } catch {
               // Skip unparseable messages
@@ -2645,8 +2775,8 @@ function createBridgeStreamResponse(
                 !anyContentSent &&
                 !blobNotFound &&
                 attempt < maxConnectRetries &&
-                accessToken &&
-                requestBytes
+                liveAccessToken &&
+                liveRequestBytes
               ) {
                 connectError = true;
                 log.warn(`[proxy] Connect error (attempt ${attempt + 1}/${maxConnectRetries + 1}, pressure=${pressureMode}): ${endError.message}`);
@@ -2704,19 +2834,23 @@ function createBridgeStreamResponse(
             `[proxy] stall detected bridgeKey=${bridgeKey} attempt=${attempt} timeoutMs=${resolvedStallTimeoutMs} allowForcedRecovery=${allowForcedStallRecovery}`,
           );
 
-          if (
-            allowForcedStallRecovery &&
-            retryCtx &&
-            accessToken &&
-            requestBytes &&
-            retryCtx.stallRecoveryCount < MAX_STALL_RECOVERIES
-          ) {
+          const stallRecoveryLimit = maxStallRecoveries();
+          const canRecover =
+            !!retryCtx &&
+            !!liveAccessToken &&
+            retryCtx.stallRecoveryCount < stallRecoveryLimit &&
+            (allowForcedStallRecovery
+              ? !!liveRequestBytes
+              : true /* checkpoint rebuild path */);
+
+          if (canRecover && retryCtx && liveAccessToken) {
             retryCtx.stallRecoveryCount += 1;
             proxyTelemetry.stallRecoveryRetries += 1;
             const n = retryCtx.stallRecoveryCount;
             const delay = STALL_RECOVERY_BASE_DELAY_MS * Math.pow(2, n - 1);
+            const useOriginalBytes = allowForcedStallRecovery && !!liveRequestBytes;
             log.warn(
-              `[proxy] forced_recovery_retry_started bridgeKey=${bridgeKey} stallRecoveryAttempt=${n}/${MAX_STALL_RECOVERIES} delayMs=${delay}`,
+              `[proxy] forced_recovery_retry_started bridgeKey=${bridgeKey} stallRecoveryAttempt=${n}/${stallRecoveryLimit} delayMs=${delay} mode=${useOriginalBytes ? "replay-run" : "checkpoint-rebuild"}`,
             );
 
             deleteActiveBridge(bridgeKey);
@@ -2729,24 +2863,55 @@ function createBridgeStreamResponse(
             stallRecoveryBackoffTimer = setTimeout(() => {
               stallRecoveryBackoffTimer = undefined;
               if (closed) return;
+
+              if (useOriginalBytes && liveRequestBytes) {
+                const { bridge: retryBridge, heartbeatTimer: retryTimer } =
+                  startBridge(liveAccessToken!, liveRequestBytes);
+                runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
+                return;
+              }
+
+              // Post-tool (or otherwise non-replayable) stall: rebuild a fresh
+              // Run from the latest checkpoint and re-attach tool results as a
+              // continuation user message. Restarting the original requestBytes
+              // would drop mcpResults already written to the dead bridge.
+              const continuation = buildPostToolStallContinuation(postedToolResults);
+              const freshPayload = buildCursorRequest(
+                retryCtx.selection,
+                retryCtx.systemPrompt,
+                continuation,
+                retryCtx.stored.conversationId,
+                retryCtx.stored.checkpoint,
+                retryCtx.stored.blobStore,
+              );
+              freshPayload.mcpTools = retryCtx.mcpTools;
+              liveAccessToken = retryCtx.accessToken;
+              liveRequestBytes = freshPayload.requestBytes;
               const { bridge: retryBridge, heartbeatTimer: retryTimer } =
-                startBridge(accessToken, requestBytes);
-              runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
+                startBridge(liveAccessToken, liveRequestBytes);
+              runAttempt(
+                retryBridge,
+                retryTimer,
+                freshPayload.blobStore,
+                freshPayload.mcpTools,
+                attempt + 1,
+              );
             }, delay);
             return;
           }
 
           // Diagnostic: log why recovery was skipped
           log.warn(
-            `[proxy] stall recovery skipped bridgeKey=${bridgeKey} allowForcedRecovery=${allowForcedStallRecovery} retryCtx=${!!retryCtx} stallRecoveryCount=${retryCtx?.stallRecoveryCount ?? "n/a"} max=${MAX_STALL_RECOVERIES} accessToken=${!!accessToken} requestBytes=${!!requestBytes}`,
+            `[proxy] stall recovery skipped bridgeKey=${bridgeKey} allowForcedRecovery=${allowForcedStallRecovery} retryCtx=${!!retryCtx} stallRecoveryCount=${retryCtx?.stallRecoveryCount ?? "n/a"} max=${maxStallRecoveries()} accessToken=${!!liveAccessToken} requestBytes=${!!liveRequestBytes}`,
           );
           proxyTelemetry.stallRecoveryFailures += 1;
-          // Send a clean stop so the client can auto-retry without showing
-          // a scary error.  The "[Error: ...]" prefix is recognized by
-          // OpenCode as a non-fatal proxy message and surfaced to the user.
-          // Suppress for title-gen to avoid polluting Discord thread names.
+          // Honest terminal error — do NOT claim "retrying" when we are not.
+          // OpenCode will not auto-retry a finished stop stream; a fake
+          // "retrying..." message left agents hung until the user nudged them.
           if (!isTitleGenStream) {
-            sendSSE(makeChunk({ content: "\n[Error: stream stalled; retrying...]" }));
+            sendSSE(makeChunk({
+              content: "\n[Error: stream stalled; automatic recovery exhausted. Please resend your message.]",
+            }));
           }
           finishStream("stop");
           deleteActiveBridge(bridgeKey);
@@ -2789,8 +2954,10 @@ function createBridgeStreamResponse(
               retryCtx.stored.blobStore,
             );
             freshPayload.mcpTools = retryCtx.mcpTools;
+            liveAccessToken = retryCtx.accessToken;
+            liveRequestBytes = freshPayload.requestBytes;
             const { bridge: newBridge, heartbeatTimer: newTimer } =
-              startBridge(retryCtx.accessToken, freshPayload.requestBytes);
+              startBridge(liveAccessToken, liveRequestBytes);
             runAttempt(newBridge, newTimer, freshPayload.blobStore, freshPayload.mcpTools, 1);
             return;
           }
@@ -2802,7 +2969,7 @@ function createBridgeStreamResponse(
           // Note: !retryCtx?.fallbackAttempted removed intentionally — the
           // fallback model may also hit resource_exhausted, and we still want
           // connect-error retries (with backoff) before surfacing the error.
-          if (connectError && !anyContentSent && attempt < maxConnectRetries && accessToken && requestBytes) {
+          if (connectError && !anyContentSent && attempt < maxConnectRetries && liveAccessToken && liveRequestBytes) {
             deleteActiveBridge(bridgeKey);
             attemptBridge.kill();
             const delay = CONNECT_RETRY_BASE_DELAY_MS * retryDelayMultiplier * Math.pow(2, attempt);
@@ -2811,7 +2978,7 @@ function createBridgeStreamResponse(
               // If the stream was already closed (client abort), don't retry.
               if (closed) return;
               const { bridge: retryBridge, heartbeatTimer: retryTimer } =
-                startBridge(accessToken, requestBytes);
+                startBridge(liveAccessToken!, liveRequestBytes!);
               runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
             }, delay);
             return;
@@ -2822,14 +2989,14 @@ function createBridgeStreamResponse(
           // This happens when Cursor silently rejects large conversation states.
           // Strategy: retry once with the same request, then retry once more with
           // a cleared checkpoint (fresh conversation state).
-          if (!mcpExecReceived && !anyContentSent && attempt < maxConnectRetries && accessToken && requestBytes) {
+          if (!mcpExecReceived && !anyContentSent && attempt < maxConnectRetries && liveAccessToken && liveRequestBytes) {
             emptyCloseRetry = true;
           }
           if (emptyCloseRetry) {
             deleteActiveBridge(bridgeKey);
             attemptBridge.kill();
-            const retryAccessToken = accessToken;
-            const retryRequestBytes = requestBytes;
+            const retryAccessToken = liveAccessToken;
+            const retryRequestBytes = liveRequestBytes;
             if (!retryAccessToken || !retryRequestBytes) {
               emptyCloseRetry = false;
             } else {
@@ -2855,6 +3022,7 @@ function createBridgeStreamResponse(
                 );
                 freshPayload.mcpTools = retryCtx.mcpTools;
                 effectiveRequestBytes = freshPayload.requestBytes;
+                liveRequestBytes = effectiveRequestBytes;
               }
 
               log.warn(
@@ -2915,6 +3083,27 @@ function createBridgeStreamResponse(
   return new Response(stream, { headers: SSE_HEADERS });
 }
 
+/** User-facing continuation prompt used when a post-tool stream stalls and we
+ *  rebuild a fresh Run from the stored checkpoint (mcpResults cannot be replayed). */
+function buildPostToolStallContinuation(toolResults?: ToolResultInfo[]): string {
+  const parts = [
+    "[Internal stream recovery] The previous model stream stalled after tool results were delivered.",
+    "Continue your answer from the current conversation checkpoint.",
+    "Do not repeat tool calls that already succeeded unless necessary.",
+  ];
+  if (toolResults && toolResults.length > 0) {
+    parts.push("Tool results already provided:");
+    for (const result of toolResults) {
+      const truncated =
+        result.content.length > 4_000
+          ? `${result.content.slice(0, 4_000)}…`
+          : result.content;
+      parts.push(`- ${result.toolCallId || "tool"}: ${truncated}`);
+    }
+  }
+  return parts.join("\n");
+}
+
 /** Spawn a bridge, send the initial request frame, and start heartbeat. */
 function startBridge(
   accessToken: string,
@@ -2947,6 +3136,7 @@ function handleStreamingResponse(
   release: () => void,
   retryCtx?: RetryContext,
   workspaceRoot?: string,
+  toolsDisabled: boolean = false,
 ): Response {
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
@@ -2957,6 +3147,10 @@ function handleStreamingResponse(
     accessToken,
     payload.requestBytes,
     workspaceRoot,
+    undefined,
+    true,
+    undefined,
+    toolsDisabled,
   );
 }
 
@@ -3020,8 +3214,9 @@ function handleToolResultResume(
     );
   }
 
-  // Do not forced-recover by restarting the original Run: mcpResults were
-  // already written to this live bridge and would be lost on a fresh stream.
+  // Post-tool stalls must not replay the original Run bytes (mcpResults would
+  // be lost). Instead createBridgeStreamResponse rebuilds from the checkpoint
+  // and re-attaches these tool results as a continuation prompt.
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     blobStore, mcpTools,
@@ -3032,6 +3227,7 @@ function handleToolResultResume(
     workspaceRoot,
     STALL_TIMEOUT_POST_TOOL_MS,
     false,
+    toolResults,
   );
 }
 
@@ -3042,11 +3238,18 @@ async function handleNonStreamingResponse(
   convKey: string,
   release: () => void,
   workspaceRoot?: string,
+  toolsDisabled: boolean = false,
 ): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
   try {
-    const { text, usage } = await collectFullResponse(payload, accessToken, convKey, workspaceRoot);
+    const { text, usage } = await collectFullResponse(
+      payload,
+      accessToken,
+      convKey,
+      workspaceRoot,
+      toolsDisabled,
+    );
     return new Response(
       JSON.stringify({
         id: completionId,
@@ -3192,6 +3395,7 @@ async function collectFullResponse(
   accessToken: string,
   convKey: string,
   workspaceRoot?: string,
+  toolsDisabled: boolean = false,
 ): Promise<CollectedResponse> {
   const { promise, resolve } = Promise.withResolvers<CollectedResponse>();
   let fullText = "";
@@ -3238,6 +3442,7 @@ async function collectFullResponse(
             }
           },
           workspaceRoot,
+          toolsDisabled,
         );
       } catch {
         // Skip
