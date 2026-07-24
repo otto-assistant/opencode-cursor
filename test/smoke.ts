@@ -2134,6 +2134,52 @@ async function testMutexAbortDoesNotBlockQueue() {
   console.log("[test] Mutex abort queue safety OK");
 }
 
+async function testSummaryGenerationDetection(modules: TestModules) {
+  console.log("[test] Testing /compact and summary request detection...");
+  const proxy = await import("../src/proxy");
+
+  assert(
+    proxy.isSummaryGenerationRequest([
+      {
+        role: "system",
+        content:
+          "You are an anchored context summarization assistant for coding sessions.\nDo not mention that you are summarizing, compacting, or merging context.",
+      },
+      { role: "user", content: "Summarize the conversation." },
+    ]),
+    "Expected compaction system prompt to be detected",
+  );
+  assert(
+    proxy.isSummaryGenerationRequest([
+      {
+        role: "system",
+        content:
+          "Summarize what was done in this conversation. Write like a pull request description.",
+      },
+      { role: "user", content: "please summarize" },
+    ]),
+    "Expected summary agent prompt to be detected",
+  );
+  assert(
+    !proxy.isSummaryGenerationRequest([
+      { role: "system", content: "You are a helpful coding agent." },
+      { role: "user", content: "fix the stall bug" },
+    ]),
+    "Normal chat must not be treated as summary generation",
+  );
+  assert(
+    !proxy.isTitleGenerationRequest([
+      {
+        role: "system",
+        content: "You are an anchored context summarization assistant for coding sessions.",
+      },
+      { role: "user", content: "Summarize" },
+    ]),
+    "Compaction must not be misclassified as title generation",
+  );
+  console.log("[test] Summary generation detection OK");
+}
+
 async function testComputeUsageFallback(modules: TestModules) {
   console.log("[test] Testing computeUsage context fallback...");
   const live = modules.computeUsage({
@@ -2212,6 +2258,7 @@ async function main() {
     await testStreamingWatchdogRecoversFromStalledRun(modules, backend);
     await testStallExhaustionIsHonest(modules, backend);
     await testMutexAbortDoesNotBlockQueue();
+    await testSummaryGenerationDetection(modules);
     await testComputeUsageFallback(modules);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;

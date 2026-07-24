@@ -1159,10 +1159,15 @@ async function doHandleChatCompletion(
   const selection =
     selectedModel ?? literalCursorModelSelection(resolveProxyModelId(body.model));
   const modelId = selection.publicId;
-  const tools = (body.tools ?? []).filter((tool) => !shouldBlockTool(tool));
+  const isSummary = isSummaryGenerationRequest(body.messages);
+  // /compact and summary agents must never see tools — Cursor would call them
+  // and OpenCode throws "Tool call not allowed while generating summary".
+  const tools = isSummary
+    ? []
+    : (body.tools ?? []).filter((tool) => !shouldBlockTool(tool));
   const workspaceRoot = extractWorkspaceRoot(systemPrompt);
   log.info(
-    `[proxy] bridge model input=${body.model} resolved=${modelId} server=${selection.modelId} max=${selection.maxMode}`,
+    `[proxy] bridge model input=${body.model} resolved=${modelId} server=${selection.modelId} max=${selection.maxMode}${isSummary ? " summary=1" : ""}`,
   );
 
   if (!userText && toolResults.length === 0) {
@@ -1191,6 +1196,7 @@ async function doHandleChatCompletion(
 
   // bridgeKey: model-specific, for active tool-call bridges
   // convKey: model-independent, for conversation state that survives model switches
+  // Summary/compact requests are namespaced so they never reuse the live agent checkpoint.
   const bridgeKey = deriveBridgeKey(selectionIdentity(selection), body);
   const convKey = deriveConversationKey(body);
   const prevStored = conversationStates.get(convKey);
@@ -1226,6 +1232,13 @@ async function doHandleChatCompletion(
   }
 
   let stored: StoredConversation | undefined = conversationStates.get(convKey);
+  // Summary/compact must start from a clean Cursor conversation — never continue
+  // the live coding-agent checkpoint (that re-triggers tool calls mid-summary).
+  if (isSummary && stored) {
+    conversationStates.delete(convKey);
+    lastStallWaitNoticeMsByConv.delete(convKey);
+    stored = undefined;
+  }
   // Safety: if existing state has a checkpoint but this request has no conversation
   // history (no turns, no tool results), it's likely a key collision with a different
   // conversation type (e.g., title generation vs. regular chat). Reset to avoid
@@ -1264,6 +1277,8 @@ async function doHandleChatCompletion(
   // For fresh conversations (no checkpoint), embed prior conversation turns
   // into the user message so the model has context of previous interactions.
   // When a checkpoint exists, Cursor already has the full conversation state.
+  // Summary/compact already receives the history in the OpenAI messages that
+  // parseMessages folded into turns — embed them so Cursor can summarize.
   if (!stored.checkpoint && turns.length > 0) {
     const historyLines: string[] = [];
     for (const turn of turns) {
@@ -1283,7 +1298,7 @@ async function doHandleChatCompletion(
   payload.mcpTools = mcpTools;
 
   if (body.stream === false) {
-    return handleNonStreamingResponse(payload, accessToken, modelId, convKey, release, workspaceRoot);
+    return handleNonStreamingResponse(payload, accessToken, modelId, convKey, release, workspaceRoot, isSummary);
   }
   const retryCtx: RetryContext = {
     stored,
@@ -1302,6 +1317,7 @@ async function doHandleChatCompletion(
     payload, accessToken, modelId, bridgeKey, convKey, release,
     retryCtx,
     workspaceRoot,
+    isSummary,
   );
 }
 
@@ -1767,6 +1783,7 @@ function processServerMessage(
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
   workspaceRoot?: string,
+  toolsDisabled?: boolean,
 ): void {
   const msgCase = msg.message.case;
 
@@ -1781,6 +1798,7 @@ function processServerMessage(
       sendFrame,
       onMcpExec,
       workspaceRoot,
+      toolsDisabled,
     );
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
@@ -1872,6 +1890,7 @@ function handleExecMessage(
   sendFrame: (data: Uint8Array) => void,
   onMcpExec: (exec: PendingExec) => void,
   workspaceRoot?: string,
+  toolsDisabled?: boolean,
 ): void {
   const execCase = execMsg.message.case;
 
@@ -1879,7 +1898,9 @@ function handleExecMessage(
     const workspaceNote = workspaceRoot
       ? ` The project workspace root is "${workspaceRoot}". NEVER use /workspace/ — it does not exist on this system. All file paths must use the real absolute path starting with "${workspaceRoot}".`
       : " NEVER use /workspace/ as a path prefix — it does not exist. Use the absolute paths exactly as provided in the system prompt and tool responses.";
-    const MCP_ONLY_RULE = `CRITICAL: Do NOT use native tools (read, ls, grep, shell, write, delete, fetch, diagnostics, backgroundShellSpawn, writeShellStdin). They are ALL disabled in this environment. Use ONLY the MCP tools provided in the tools list. Every native tool call will be rejected and waste time. Always use MCP tools for all file operations, shell commands, searches, and any other actions.${workspaceNote}`;
+    const MCP_ONLY_RULE = toolsDisabled
+      ? `CRITICAL: You are generating a conversation summary/compaction. Do NOT call any tools (native or MCP) — read, ls, grep, shell, write, delete, fetch, and every MCP tool are forbidden. Output ONLY the requested summary as plain text.`
+      : `CRITICAL: Do NOT use native tools (read, ls, grep, shell, write, delete, fetch, diagnostics, backgroundShellSpawn, writeShellStdin). They are ALL disabled in this environment. Use ONLY the MCP tools provided in the tools list. Every native tool call will be rejected and waste time. Always use MCP tools for all file operations, shell commands, searches, and any other actions.${workspaceNote}`;
 
     const requestContext = create(RequestContextSchema, {
       rules: [
@@ -1893,7 +1914,7 @@ function handleExecMessage(
         }),
       ],
       repositoryInfo: [],
-      tools: mcpTools,
+      tools: toolsDisabled ? [] : mcpTools,
       gitRepos: [],
       projectLayouts: [],
       mcpInstructions: [
@@ -1916,6 +1937,24 @@ function handleExecMessage(
   }
 
   if (execCase === "mcpArgs") {
+    // During /compact and summary generation, never surface tool calls to OpenCode —
+    // it hard-throws "Tool call not allowed while generating summary".
+    if (toolsDisabled) {
+      log.warn(
+        `[proxy] suppressing MCP tool during summary: ${execMsg.message.value.toolName || execMsg.message.value.name || "unknown"}`,
+      );
+      const mcpResult = create(McpResultSchema, {
+        result: {
+          case: "error",
+          value: create(McpErrorSchema, {
+            error:
+              "Tools are disabled during summary/compaction. Output the summary as plain text only. Do not call any tools.",
+          }),
+        },
+      });
+      sendExecResult(execMsg, "mcpResult", mcpResult, sendFrame);
+      return;
+    }
     const mcpArgs = execMsg.message.value;
     const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
     const cursorToolCallId = mcpArgs.toolCallId || crypto.randomUUID();
@@ -1936,7 +1975,10 @@ function handleExecMessage(
   // --- Reject native Cursor tools ---
   // The model tries these first. We must respond with rejection/error
   // so it falls back to our MCP tools (registered via RequestContext).
-  const REJECT_REASON = "Tool not available in this environment. Use the MCP tools provided instead.";
+  // During summary/compaction, steer it to plain-text output instead.
+  const REJECT_REASON = toolsDisabled
+    ? "Tools are disabled during summary/compaction. Output the summary as plain text only."
+    : "Tool not available in this environment. Use the MCP tools provided instead.";
 
   if (execCase === "readArgs") {
     const args = execMsg.message.value;
@@ -2107,8 +2149,8 @@ function deriveBridgeKey(modelId: string, body: ChatCompletionRequest): string {
   const identity = buildConversationIdentity(body);
   const firstUserMsg = body.messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  const titleNs = isTitleGenerationRequest(body.messages) ? "title:" : "";
-  const base = identity || `fallback:${titleNs}${firstUserText}`;
+  const ns = requestKeyNamespace(body.messages);
+  const base = identity ? `${ns}${identity}` : `fallback:${ns}${firstUserText}`;
   return createHash("sha256")
     .update(`bridge:${modelId}:${base}`)
     .digest("hex")
@@ -2116,13 +2158,55 @@ function deriveBridgeKey(modelId: string, body: ChatCompletionRequest): string {
 }
 
 /** Detect if this is a title generation request by checking for title-gen system prompt. */
-function isTitleGenerationRequest(messages: OpenAIMessage[]): boolean {
+export function isTitleGenerationRequest(messages: OpenAIMessage[]): boolean {
   const systemText = messages
     .filter((m) => m.role === "system")
     .map((m) => textContent(m.content))
     .join(" ");
   return systemText.toLowerCase().includes("title generator") ||
          systemText.toLowerCase().includes("generate a short title");
+}
+
+/**
+ * Detect OpenCode /compact (compaction) and summary-agent requests.
+ * These must not share the live agent conversation checkpoint and must not
+ * advertise or emit tools — otherwise Cursor continues the coding agent and
+ * OpenCode throws "Tool call not allowed while generating summary".
+ */
+export function isSummaryGenerationRequest(messages: OpenAIMessage[]): boolean {
+  const systemText = messages
+    .filter((m) => m.role === "system")
+    .map((m) => textContent(m.content))
+    .join(" ")
+    .toLowerCase();
+  if (
+    systemText.includes("anchored context summarization") ||
+    systemText.includes("summarizing, compacting, or merging context") ||
+    systemText.includes("tasked with summarizing conversations") ||
+    systemText.includes("write like a pull request description") ||
+    systemText.includes("summarize what was done in this conversation")
+  ) {
+    return true;
+  }
+
+  // Compaction user prompts (when agent.prompt is absent from system for any reason).
+  const userText = messages
+    .filter((m) => m.role === "user")
+    .map((m) => textContent(m.content))
+    .join(" ")
+    .toLowerCase();
+  return (
+    userText.includes("this summary will be the only context available when the conversation continues") ||
+    userText.includes("create a detailed summary for continuing this coding session") ||
+    (userText.includes("<previous-summary>") && userText.includes("compact"))
+  );
+}
+
+/** Namespace prefix so title/summary requests never collide with live agent state. */
+function requestKeyNamespace(messages: OpenAIMessage[]): string {
+  if (isTitleGenerationRequest(messages)) return "title:";
+  if (isSummaryGenerationRequest(messages)) return "summary:";
+  return "";
 }
 
 /** Derive a key for conversation state. Model-independent so context survives model switches.
@@ -2135,13 +2219,14 @@ function deriveConversationKey(body: ChatCompletionRequest): string {
   const identity = buildConversationIdentity(body);
   const firstUserMsg = body.messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  const titleNs = isTitleGenerationRequest(body.messages) ? "title:" : "";
+  const ns = requestKeyNamespace(body.messages);
   // NOTE: Do NOT include full system prompt in fallback key — OpenCode's system
   // prompt changes every request (dynamic context, per-turn metadata), which would
   // cause convKey to rotate and lose the stored conversation checkpoint.
   // Only firstUserText is used — it's the stable initial user message.
-  const fallbackSeed = `${titleNs}user:${firstUserText}`;
-  const seed = identity || `fallback:${fallbackSeed}`;
+  // Always apply ns so /compact and title-gen never reuse the live agent checkpoint.
+  const fallbackSeed = `${ns}user:${firstUserText}`;
+  const seed = identity ? `${ns}${identity}` : `fallback:${fallbackSeed}`;
   return createHash("sha256")
     .update(`conv:${seed}`)
     .digest("hex")
@@ -2390,6 +2475,8 @@ function createBridgeStreamResponse(
   allowForcedStallRecovery: boolean = true,
   /** Tool results already written to the live bridge (post-tool resume only). */
   postedToolResults?: ToolResultInfo[],
+  /** When true, advertise no tools and suppress MCP tool_calls (summary/compact). */
+  toolsDisabled: boolean = false,
 ): Response {
   const resolvedStallTimeoutMs = stallTimeoutMs ?? STALL_TIMEOUT_MS;
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
@@ -2580,6 +2667,13 @@ function createBridgeStreamResponse(
                 },
                 // onMcpExec — the model wants to execute a tool.
                 (exec) => {
+                  if (toolsDisabled) {
+                    // Defense in depth: summary/compact must never emit tool_calls SSE.
+                    log.warn(
+                      `[proxy] dropping tool_calls emission during summary: ${exec.toolName}`,
+                    );
+                    return;
+                  }
                   markProgress();
                   state.pendingExecs.push(exec);
                   mcpExecReceived = true;
@@ -2646,6 +2740,7 @@ function createBridgeStreamResponse(
                   }
                 },
                 workspaceRoot,
+                toolsDisabled,
               );
             } catch {
               // Skip unparseable messages
@@ -3041,6 +3136,7 @@ function handleStreamingResponse(
   release: () => void,
   retryCtx?: RetryContext,
   workspaceRoot?: string,
+  toolsDisabled: boolean = false,
 ): Response {
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
@@ -3051,6 +3147,10 @@ function handleStreamingResponse(
     accessToken,
     payload.requestBytes,
     workspaceRoot,
+    undefined,
+    true,
+    undefined,
+    toolsDisabled,
   );
 }
 
@@ -3138,11 +3238,18 @@ async function handleNonStreamingResponse(
   convKey: string,
   release: () => void,
   workspaceRoot?: string,
+  toolsDisabled: boolean = false,
 ): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
   try {
-    const { text, usage } = await collectFullResponse(payload, accessToken, convKey, workspaceRoot);
+    const { text, usage } = await collectFullResponse(
+      payload,
+      accessToken,
+      convKey,
+      workspaceRoot,
+      toolsDisabled,
+    );
     return new Response(
       JSON.stringify({
         id: completionId,
@@ -3288,6 +3395,7 @@ async function collectFullResponse(
   accessToken: string,
   convKey: string,
   workspaceRoot?: string,
+  toolsDisabled: boolean = false,
 ): Promise<CollectedResponse> {
   const { promise, resolve } = Promise.withResolvers<CollectedResponse>();
   let fullText = "";
@@ -3334,6 +3442,7 @@ async function collectFullResponse(
             }
           },
           workspaceRoot,
+          toolsDisabled,
         );
       } catch {
         // Skip
