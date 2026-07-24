@@ -1834,6 +1834,20 @@ function handleInteractionUpdate(
   // toolCallStarted, partialToolCall, toolCallDelta, toolCallCompleted
   // are intentionally ignored. MCP tool calls flow through the exec
   // message path (mcpArgs → mcpResult), not interaction updates.
+  // heartbeat is also ignored here — see isServerKeepaliveMessage().
+}
+
+/**
+ * Cursor keeps the Agent Run stream alive with periodic HeartbeatUpdate
+ * frames while the model is silently thinking ("weighing options").
+ * Those must NOT reset the stall watchdog: counting them as progress
+ * leaves OpenCode hung forever on Grok/long-thinking turns that never
+ * emit text/thinking deltas.
+ */
+export function isServerKeepaliveMessage(msg: AgentServerMessage): boolean {
+  if (msg.message.case !== "interactionUpdate") return false;
+  const update = msg.message.value as { message?: { case?: string } };
+  return update.message?.case === "heartbeat";
 }
 
 /** Send a KV client response back to Cursor. */
@@ -2641,12 +2655,15 @@ function createBridgeStreamResponse(
 
         const processChunk = createConnectFrameParser(
           (messageBytes) => {
-            markProgress();
             try {
               const serverMessage = fromBinary(
                 AgentServerMessageSchema,
                 messageBytes,
               );
+              // Heartbeats alone are not forward progress — see isServerKeepaliveMessage.
+              if (!isServerKeepaliveMessage(serverMessage)) {
+                markProgress();
+              }
               processServerMessage(
                 serverMessage,
                 attemptBlobStore,
