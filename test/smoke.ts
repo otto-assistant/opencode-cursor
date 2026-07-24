@@ -4,12 +4,15 @@ import type { AddressInfo } from "node:net";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
   AgentClientMessageSchema,
+  AgentServerMessageSchema,
   GetUsableModelsResponseSchema,
+  HeartbeatUpdateSchema,
+  InteractionUpdateSchema,
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
-type RunMode = "immediate-close" | "stall-once-then-close";
+type RunMode = "immediate-close" | "stall-once-then-close" | "heartbeat-only-stall";
 
 interface TestModules {
   startProxy: typeof import("../src/proxy").startProxy;
@@ -17,6 +20,7 @@ interface TestModules {
   getProxyPort: typeof import("../src/proxy").getProxyPort;
   resolveProxyModelId: typeof import("../src/proxy").resolveProxyModelId;
   computeUsage: typeof import("../src/proxy").computeUsage;
+  isServerKeepaliveMessage: typeof import("../src/proxy").isServerKeepaliveMessage;
   cursorSelectionHeader: typeof import("../src/model-selection").CURSOR_SELECTION_HEADER;
   encodeCursorModelSelection: typeof import("../src/model-selection").encodeCursorModelSelection;
   decodeCursorModelSelection: typeof import("../src/model-selection").decodeCursorModelSelection;
@@ -106,6 +110,25 @@ function frameConnectUnaryMessage(payload: Uint8Array): Buffer {
   frame.writeUInt32BE(payload.length, 1);
   frame.set(payload, 5);
   return frame;
+}
+
+/** Cursor heartbeat interaction update — keeps the stream alive with no content. */
+function frameHeartbeatServerMessage(): Buffer {
+  const payload = toBinary(
+    AgentServerMessageSchema,
+    create(AgentServerMessageSchema, {
+      message: {
+        case: "interactionUpdate",
+        value: create(InteractionUpdateSchema, {
+          message: {
+            case: "heartbeat",
+            value: create(HeartbeatUpdateSchema, {}),
+          },
+        }),
+      },
+    }),
+  );
+  return frameConnectUnaryMessage(payload);
 }
 
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
@@ -215,6 +238,27 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
             // ignore
           }
         }, 3_000);
+        return;
+      }
+      if (runMode === "heartbeat-only-stall" && !runStallConsumed) {
+        runStallConsumed = true;
+        // Simulate Grok "weighing options": periodic heartbeats, zero content.
+        // Without the keepalive exclusion these would falsely reset the stall timer.
+        const heartbeatTimer = setInterval(() => {
+          try {
+            stream.write(frameHeartbeatServerMessage());
+          } catch {
+            clearInterval(heartbeatTimer);
+          }
+        }, 200);
+        setTimeout(() => {
+          clearInterval(heartbeatTimer);
+          try {
+            stream.end();
+          } catch {
+            // ignore
+          }
+        }, 8_000);
         return;
       }
       stream.end();
@@ -359,6 +403,7 @@ async function loadModules(): Promise<TestModules> {
     getProxyPort: proxy.getProxyPort,
     resolveProxyModelId: proxy.resolveProxyModelId,
     computeUsage: proxy.computeUsage,
+    isServerKeepaliveMessage: proxy.isServerKeepaliveMessage,
     cursorSelectionHeader: modelSelection.CURSOR_SELECTION_HEADER,
     encodeCursorModelSelection: modelSelection.encodeCursorModelSelection,
     decodeCursorModelSelection: modelSelection.decodeCursorModelSelection,
@@ -2097,6 +2142,62 @@ async function testStallExhaustionIsHonest(modules: TestModules, backend: TestCu
   console.log("[test] Stall exhaustion honest error OK");
 }
 
+async function testHeartbeatKeepalivesDoNotBlockStallRecovery(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing heartbeat keepalives do not block stall recovery...");
+  modules.stopProxy();
+
+  // Unit: heartbeat interaction updates are classified as keepalives.
+  const heartbeatMsg = create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: create(InteractionUpdateSchema, {
+        message: {
+          case: "heartbeat",
+          value: create(HeartbeatUpdateSchema, {}),
+        },
+      }),
+    },
+  });
+  assert(
+    modules.isServerKeepaliveMessage(heartbeatMsg),
+    "Heartbeat interaction updates must be keepalives",
+  );
+
+  backend.setRunMode("heartbeat-only-stall");
+  const port = await modules.startProxy(async () => "test-token");
+  const res = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "composer-2",
+      stream: true,
+      messages: [{ role: "user", content: "weighing-options-heartbeat-probe" }],
+    }),
+  });
+
+  assertEqual(res.status, 200, "Expected streaming request to succeed");
+  const bodyText = await res.text();
+  assert(
+    bodyText.includes("data: [DONE]"),
+    `Expected SSE stream to terminate with [DONE], got: ${bodyText.slice(0, 200)}`,
+  );
+  assert(
+    backend.getRunRequestCount() >= 2,
+    `Heartbeats must not prevent stall recovery (>=2 Run attempts), got ${backend.getRunRequestCount()}`,
+  );
+  assert(
+    !bodyText.includes("stream stalled; retrying..."),
+    "Must not claim retrying when recovery actually ran",
+  );
+
+  backend.setRunMode("immediate-close");
+  modules.stopProxy();
+  console.log("[test] Heartbeat keepalive stall recovery OK");
+}
+
 async function testMutexAbortDoesNotBlockQueue() {
   console.log("[test] Testing mutex abort releases waiters without blocking queue...");
   const { Mutex, isAbortError } = await import("../src/promise-queue");
@@ -2257,6 +2358,7 @@ async function main() {
     await testProxyConsumesCursorModelHeader(modules, backend);
     await testStreamingWatchdogRecoversFromStalledRun(modules, backend);
     await testStallExhaustionIsHonest(modules, backend);
+    await testHeartbeatKeepalivesDoNotBlockStallRecovery(modules, backend);
     await testMutexAbortDoesNotBlockQueue();
     await testSummaryGenerationDetection(modules);
     await testComputeUsageFallback(modules);
