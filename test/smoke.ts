@@ -9,10 +9,16 @@ import {
   HeartbeatUpdateSchema,
   InteractionUpdateSchema,
   ModelDetailsSchema,
+  TextDeltaUpdateSchema,
+  TurnEndedUpdateSchema,
 } from "../src/proto/agent_pb";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
-type RunMode = "immediate-close" | "stall-once-then-close" | "heartbeat-only-stall";
+type RunMode =
+  | "immediate-close"
+  | "stall-once-then-close"
+  | "heartbeat-only-stall"
+  | "text-then-hang";
 
 interface TestModules {
   startProxy: typeof import("../src/proxy").startProxy;
@@ -52,6 +58,7 @@ interface TestCursorBackend {
   setRefreshResponseRefreshToken: (value: string | null | undefined) => void;
   setRunMode: (mode: RunMode) => void;
   getRunRequestCount: () => number;
+  getRunUserTexts: () => string[];
   getRunModelIds: () => string[];
   getRunSelections: () => Array<{
     publicId?: string;
@@ -131,11 +138,45 @@ function frameHeartbeatServerMessage(): Buffer {
   return frameConnectUnaryMessage(payload);
 }
 
+/** Minimal assistant text + turn_ended so the proxy finishes without empty-stream retries. */
+function frameTextThenEndServerMessages(text: string): Buffer[] {
+  const textPayload = toBinary(
+    AgentServerMessageSchema,
+    create(AgentServerMessageSchema, {
+      message: {
+        case: "interactionUpdate",
+        value: create(InteractionUpdateSchema, {
+          message: {
+            case: "textDelta",
+            value: create(TextDeltaUpdateSchema, { text }),
+          },
+        }),
+      },
+    }),
+  );
+  const endPayload = toBinary(
+    AgentServerMessageSchema,
+    create(AgentServerMessageSchema, {
+      message: {
+        case: "interactionUpdate",
+        value: create(InteractionUpdateSchema, {
+          message: {
+            case: "turnEnded",
+            value: create(TurnEndedUpdateSchema, {}),
+          },
+        }),
+      },
+    }),
+  );
+  return [frameConnectUnaryMessage(textPayload), frameConnectUnaryMessage(endPayload)];
+}
+
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let discoveryMode: DiscoveryMode = "success";
   let runMode: RunMode = "immediate-close";
   let runRequestCount = 0;
   const runModelIds: string[] = [];
+  const runUserTexts: string[] = [];
   let runStallConsumed = false;
   let discoveredModels: Array<{ id: string; name: string; reasoning?: boolean }> = [
     { id: "composer-2", name: "Composer 2", reasoning: true },
@@ -204,6 +245,11 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
               const runRequest = message.message.value;
               const modelId = runRequest.modelDetails?.modelId;
               if (modelId) runModelIds.push(modelId);
+              const action = runRequest.action?.action;
+              if (action?.case === "userMessageAction") {
+                const text = action.value.userMessage?.text;
+                if (typeof text === "string") runUserTexts.push(text);
+              }
               runSelections.push({
                 publicId: modelId,
                 displayName: runRequest.modelDetails?.displayName,
@@ -260,6 +306,29 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
           }
         }, 8_000);
         return;
+      }
+      if (runMode === "text-then-hang") {
+        try {
+          stream.write(frameTextThenEndServerMessages("partial...")[0]!);
+        } catch {
+          // ignore
+        }
+        // Keep the Run open (no turn_ended / end) until the client aborts.
+        setTimeout(() => {
+          try {
+            stream.end();
+          } catch {
+            // ignore
+          }
+        }, 8_000);
+        return;
+      }
+      for (const frame of frameTextThenEndServerMessages("ok")) {
+        try {
+          stream.write(frame);
+        } catch {
+          // ignore
+        }
       }
       stream.end();
       return;
@@ -364,10 +433,14 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       runStallConsumed = false;
       runRequestCount = 0;
       runModelIds.length = 0;
+      runUserTexts.length = 0;
       runSelections.length = 0;
     },
     getRunRequestCount() {
       return runRequestCount;
+    },
+    getRunUserTexts() {
+      return [...runUserTexts];
     },
     getRunModelIds() {
       return [...runModelIds];
@@ -2317,6 +2390,153 @@ async function testComputeUsageFallback(modules: TestModules) {
   console.log("[test] computeUsage context fallback OK");
 }
 
+async function testInterruptSteerHelpers() {
+  console.log("[test] Testing interrupt/steer helpers...");
+  const proxy = await import("../src/proxy");
+  const { create, toBinary, fromBinary } = await import("@bufbuild/protobuf");
+  const { ConversationStateStructureSchema } = await import("../src/proto/agent_pb");
+
+  assert(
+    !proxy.hasUserSteerAfterTools([
+      { role: "user", content: "do work" },
+      { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: "{}" } }] },
+      { role: "tool", content: "file contents", tool_call_id: "c1" },
+    ]),
+    "Normal tool resume must not look like a user steer",
+  );
+  assert(
+    proxy.hasUserSteerAfterTools([
+      { role: "user", content: "do work" },
+      { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: "{}" } }] },
+      { role: "tool", content: "file contents", tool_call_id: "c1" },
+      { role: "user", content: "stop, do this instead" },
+    ]),
+    "Trailing user message after tools must be detected as steer",
+  );
+
+  const framed = proxy.buildInterruptSteerUserText("stop, do this instead");
+  assert(
+    framed.includes("User interrupted the previous turn"),
+    "Steer framing must mention interruption",
+  );
+  assert(
+    framed.includes("stop, do this instead"),
+    "Steer framing must keep the latest user text",
+  );
+
+  const dirty = create(ConversationStateStructureSchema, {
+    rootPromptMessagesJson: [],
+    turns: [],
+    todos: [],
+    pendingToolCalls: ['{"id":"pending"}'],
+    previousWorkspaceUris: [],
+    fileStates: {},
+    fileStatesV2: {},
+    summaryArchives: [],
+    turnTimings: [],
+    subagentStates: {},
+    selfSummaryCount: 0,
+    readPaths: [],
+  });
+  const sanitized = proxy.sanitizeCheckpointAfterInterrupt(
+    toBinary(ConversationStateStructureSchema, dirty),
+  );
+  assert(sanitized, "sanitizeCheckpointAfterInterrupt must return bytes");
+  const cleaned = fromBinary(ConversationStateStructureSchema, sanitized!);
+  assertEqual(cleaned.pendingToolCalls.length, 0, "pending tool calls must be cleared");
+  console.log("[test] Interrupt/steer helpers OK");
+}
+
+async function testClientAbortReleasesMutexForSteer(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing client abort releases mutex so interrupt message can run...");
+  backend.setRunMode("text-then-hang");
+  const port = await modules.startProxy(async () => "test-token");
+
+  const controller = new AbortController();
+  const firstPromise = fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal: controller.signal,
+    body: JSON.stringify({
+      model: "default",
+      stream: true,
+      conversation_id: "interrupt-steer-session",
+      messages: [
+        { role: "system", content: "You are a helpful assistant." },
+        { role: "user", content: "start a long task" },
+      ],
+    }),
+  });
+
+  // Wait until headers + first SSE land so the proxy holds the conversation mutex.
+  const firstRes = await firstPromise;
+  assertEqual(firstRes.status, 200, "First streaming request should start");
+  assert(firstRes.body, "First response must have a body");
+  const reader = firstRes.body!.getReader();
+  await reader.read();
+  const runsAfterFirst = backend.getRunRequestCount();
+  assert(runsAfterFirst >= 1, "First turn must open a Cursor Run");
+
+  controller.abort();
+  await reader.cancel().catch(() => undefined);
+
+  // Follow-up must be able to acquire the mutex and start a new Run promptly.
+  backend.setRunMode("immediate-close");
+  const runsBeforeSteer = backend.getRunRequestCount();
+  const steerStarted = Date.now();
+  const steerPromise = fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "default",
+      stream: true,
+      conversation_id: "interrupt-steer-session",
+      messages: [
+        { role: "system", content: "You are a helpful assistant." },
+        { role: "user", content: "start a long task" },
+        { role: "assistant", content: "Working on it..." },
+        { role: "user", content: "stop, answer briefly instead" },
+      ],
+    }),
+  });
+
+  const deadline = Date.now() + 2_000;
+  while (backend.getRunRequestCount() <= runsBeforeSteer && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  const steerRunWaitMs = Date.now() - steerStarted;
+  assert(
+    backend.getRunRequestCount() > runsBeforeSteer,
+    `Steer must start a Cursor Run after interrupt (waited ${steerRunWaitMs}ms)`,
+  );
+  assert(
+    steerRunWaitMs < 2_000,
+    `Steer Run must not block on aborted turn mutex (waited ${steerRunWaitMs}ms)`,
+  );
+
+  const steerRes = await steerPromise;
+  assertEqual(steerRes.status, 200, "Steer request must succeed after abort");
+  const steerBody = await steerRes.text();
+  assert(steerBody.includes("data: [DONE]"), "Steer SSE must complete");
+  assert(
+    steerBody.includes("stop") || steerBody.includes("ok") || steerBody.includes("content"),
+    "Steer response should include assistant content",
+  );
+  const steeredTexts = backend.getRunUserTexts().filter((t) => t.includes("stop, answer briefly instead"));
+  assert(steeredTexts.length >= 1, "Steer Run must include the interrupt user text");
+  assert(
+    steeredTexts.some((t) => t.includes("User interrupted the previous turn")),
+    "Steer Run must frame the interrupt so the model follows the new message",
+  );
+
+  backend.setRunMode("immediate-close");
+  modules.stopProxy();
+  console.log("[test] Client abort releases mutex for steer OK");
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -2362,6 +2582,8 @@ async function main() {
     await testMutexAbortDoesNotBlockQueue();
     await testSummaryGenerationDetection(modules);
     await testComputeUsageFallback(modules);
+    await testInterruptSteerHelpers();
+    await testClientAbortReleasesMutexForSteer(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {
