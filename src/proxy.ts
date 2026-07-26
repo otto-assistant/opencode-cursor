@@ -19,6 +19,7 @@ import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
   AgentServerMessageSchema,
+  CancelActionSchema,
   ClientHeartbeatSchema,
   ConversationActionSchema,
   ConversationStateStructureSchema,
@@ -187,6 +188,12 @@ interface StoredConversation {
    * turn ends before a fresh checkpoint arrives.
    */
   lastPromptTokens: number;
+  /**
+   * True when the previous Cursor turn was aborted by the client (user interrupt)
+   * before a natural finish. The next user message should be framed as a steer
+   * so the model follows the new instruction instead of resuming cancelled work.
+   */
+  abortedTurn?: boolean;
 }
 
 const conversationStates = new Map<string, StoredConversation>();
@@ -195,11 +202,24 @@ const lastStallWaitNoticeMsByConv = new Map<string, number>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 const MUTEX_TTL_MS = 30 * 60 * 1000;
 /**
- * TTL for paused tool bridges. Kept generous so normal MCP/tool round-trip
- * latency (including user approvals) survives without the resume falling back
- * to a fresh Run; abandoned bridges are still reaped so they cannot leak.
+ * TTL for paused tool bridges waiting on OpenCode MCP results.
+ *
+ * Must cover long legitimate tool runs (installs, builds, systemd bring-up).
+ * The previous 5-minute default matched observed "Shell 300.0s" hangs: the
+ * bridge was reaped while the tool was still running, so resume could not
+ * deliver mcpResults and the agent looked stuck.
+ *
+ * Abandoned bridges are still reaped after this window so heartbeats/H2
+ * workers cannot leak forever. Override with OPENCODE_CURSOR_ACTIVE_BRIDGE_TTL_MS.
  */
-const ACTIVE_BRIDGE_TTL_MS = Number(process.env.OPENCODE_CURSOR_ACTIVE_BRIDGE_TTL_MS ?? 5 * 60 * 1000);
+const ACTIVE_BRIDGE_TTL_MS = Number(
+  process.env.OPENCODE_CURSOR_ACTIVE_BRIDGE_TTL_MS ?? 60 * 60 * 1000,
+);
+
+/** Default / configured TTL for paused tool bridges (exported for tests). */
+export function getActiveBridgeTtlMs(): number {
+  return ACTIVE_BRIDGE_TTL_MS;
+}
 const ADMISSION_BRIDGE_CULL_IDLE_MS = Number(process.env.OPENCODE_CURSOR_ADMISSION_BRIDGE_CULL_IDLE_MS ?? 30 * 1000);
 const MAX_ACTIVE_BRIDGES = 24;
 const MAX_CONVERSATION_BLOB_BYTES = Number(process.env.OPENCODE_CURSOR_MAX_CONV_BLOB_BYTES ?? 64 * 1024 * 1024);
@@ -261,6 +281,22 @@ function killActiveBridge(active: ActiveBridge): void {
   proxyTelemetry.forcedBridgeKills += 1;
   clearInterval(active.heartbeatTimer);
   active.bridge.kill();
+}
+
+/** Best-effort CancelAction so Cursor finalizes an interrupted turn cleanly. */
+function sendCancelAction(bridge: { alive: boolean; write: (data: Uint8Array) => void }): void {
+  if (!bridge.alive) return;
+  try {
+    const action = create(ConversationActionSchema, {
+      action: { case: "cancelAction", value: create(CancelActionSchema, {}) },
+    });
+    const clientMessage = create(AgentClientMessageSchema, {
+      message: { case: "conversationAction", value: action },
+    });
+    bridge.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+  } catch {
+    // Bridge may already be half-closed; ignore.
+  }
 }
 
 function isProxyUnderPressure(): boolean {
@@ -377,11 +413,14 @@ function evictStaleActiveBridges(): number {
   const now = Date.now();
   for (const [bridgeKey, active] of activeBridges) {
     // Active bridges are always paused awaiting MCP tool results (setActiveBridge
-    // is only called with pending execs). ACTIVE_BRIDGE_TTL_MS is generous so
-    // normal tool latency survives; only genuinely abandoned bridges are reaped
-    // (an abandoned bridge would otherwise keep its heartbeat + h2 subprocess
-    // alive indefinitely).
-    if (now - active.lastAccessMs > ACTIVE_BRIDGE_TTL_MS) {
+    // is only called with pending execs). Only reap after ACTIVE_BRIDGE_TTL_MS so
+    // long shells/builds can finish; an abandoned bridge would otherwise keep
+    // its heartbeat + h2 subprocess alive indefinitely.
+    const idleMs = now - active.lastAccessMs;
+    if (idleMs > ACTIVE_BRIDGE_TTL_MS) {
+      log.warn(
+        `[proxy] evicting stale tool bridge bridgeKey=${bridgeKey} idleMs=${idleMs} ttlMs=${ACTIVE_BRIDGE_TTL_MS} pendingExecs=${active.pendingExecs.length}`,
+      );
       killActiveBridge(active);
       deleteActiveBridge(bridgeKey);
       evicted += 1;
@@ -879,9 +918,24 @@ export async function startProxy(
               accessToken,
               release,
               selectedModel,
+              req.signal,
             );
             const resolvedResponse =
               rawResponse instanceof Promise ? await rawResponse : rawResponse;
+            // OpenCode/Bun may abort while we were awaiting setup (bridge spawn,
+            // etc.) before the stream's abort listener was attached — or after
+            // the Response is built but before the body is consumed. Cancel the
+            // body so createBridgeStreamResponse.abortFromClient releases the
+            // conversation mutex and the interrupt message can proceed.
+            if (req.signal.aborted) {
+              try {
+                await resolvedResponse.body?.cancel?.();
+              } catch {
+                // ignore
+              }
+              release?.();
+              return new Response(null, { status: 499, statusText: "Client Closed Request" });
+            }
             return resolvedResponse;
           } catch (err) {
             release?.();
@@ -1145,8 +1199,9 @@ function handleChatCompletion(
   accessToken: string,
   release: () => void,
   selectedModel?: CursorModelSelection,
+  abortSignal?: AbortSignal,
 ): Response | Promise<Response> {
-  return doHandleChatCompletion(body, accessToken, release, selectedModel);
+  return doHandleChatCompletion(body, accessToken, release, selectedModel, abortSignal);
 }
 
 async function doHandleChatCompletion(
@@ -1154,6 +1209,7 @@ async function doHandleChatCompletion(
   accessToken: string,
   release: () => void,
   selectedModel?: CursorModelSelection,
+  abortSignal?: AbortSignal,
 ): Promise<Response> {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
   const selection =
@@ -1207,17 +1263,22 @@ async function doHandleChatCompletion(
 
   // Mutex is already held by the fetch() handler — no need to acquire here.
 
+  // A trailing user message after tool results means the user interrupted /
+  // steered mid tool-loop. Do NOT resume pending MCP tools — that would ignore
+  // the new instruction and continue the aborted turn.
+  const userSteeredAfterTools = hasUserSteerAfterTools(body.messages);
+
   const activeBridge = activeBridges.get(bridgeKey);
   if (activeBridge) {
     activeBridge.lastAccessMs = Date.now();
   }
 
-  if (activeBridge && toolResults.length > 0) {
+  if (activeBridge && toolResults.length > 0 && !userSteeredAfterTools) {
     deleteActiveBridge(bridgeKey);
 
     if (activeBridge.bridge.alive) {
       // Resume the live bridge with tool results
-      return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, release, workspaceRoot);
+      return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, release, workspaceRoot, abortSignal);
     }
 
     // Bridge died (timeout, server disconnect, etc.).
@@ -1225,8 +1286,16 @@ async function doHandleChatCompletion(
     killActiveBridge(activeBridge);
   }
 
-  // Clean up stale bridge if present
+  // User steer (or any non-tool-resume hit on a parked bridge): cancel + drop it.
   if (activeBridge && activeBridges.has(bridgeKey)) {
+    if (userSteeredAfterTools) {
+      log.info(
+        `[proxy] user steer after tools — abandoning pending tool bridge bridgeKey=${bridgeKey}`,
+      );
+      sendCancelAction(activeBridge.bridge);
+      const steered = conversationStates.get(convKey);
+      if (steered) steered.abortedTurn = true;
+    }
     killActiveBridge(activeBridge);
     deleteActiveBridge(bridgeKey);
   }
@@ -1267,19 +1336,34 @@ async function doHandleChatCompletion(
   }
   runMaintenanceSweep();
 
-  // Build the request. When tool results are present but the bridge died,
-  // we must still include the last user text so Cursor has context.
+  // Build the request. When tool results are present but the live bridge is
+  // gone (TTL eviction during long shells/builds, crash, etc.), resume via
+  // checkpoint + continuation prompt — mcpResults cannot be replayed.
+  // Note: parseMessages may still surface the original user text alongside
+  // tool results; that must not win over the tool continuation.
   const mcpTools = buildMcpToolDefinitions(tools);
-  let effectiveUserText = userText || (toolResults.length > 0
-    ? toolResults.map((r) => r.content).join("\n")
-    : "");
+  const toolContinuationResume =
+    toolResults.length > 0 && !userSteeredAfterTools;
+  let effectiveUserText = "";
+  if (userSteeredAfterTools && userText) {
+    effectiveUserText = userText;
+  } else if (toolContinuationResume) {
+    effectiveUserText = buildPostToolBridgeLossContinuation(toolResults);
+    log.warn(
+      `[proxy] tool resume without live bridge — checkpoint continuation convKey=${convKey} tools=${toolResults.length}`,
+    );
+  } else {
+    effectiveUserText = userText || "";
+  }
 
   // For fresh conversations (no checkpoint), embed prior conversation turns
   // into the user message so the model has context of previous interactions.
   // When a checkpoint exists, Cursor already has the full conversation state.
   // Summary/compact already receives the history in the OpenAI messages that
   // parseMessages folded into turns — embed them so Cursor can summarize.
-  if (!stored.checkpoint && turns.length > 0) {
+  // Tool-continuation resumes already carry structured tool output — do not
+  // wrap them in the generic history template.
+  if (!stored.checkpoint && turns.length > 0 && !toolContinuationResume) {
     const historyLines: string[] = [];
     for (const turn of turns) {
       if (turn.userText) historyLines.push(`User: ${turn.userText}`);
@@ -1289,6 +1373,19 @@ async function doHandleChatCompletion(
       effectiveUserText = `[Previous conversation]\n${historyLines.join('\n')}\n\n[Current message]\n${effectiveUserText}`;
       log.info(`[proxy] embedded ${turns.length} prior turns in UserMessage (no checkpoint)`);
     }
+  }
+
+  // After a client abort / mid-tool steer, Cursor may still hold an incomplete
+  // turn. Clear pending tool calls and explicitly frame the new user message
+  // so the model follows the interrupt instead of "resuming" cancelled work.
+  const steerInterrupt = !isSummary && !!userText && (!!stored.abortedTurn || userSteeredAfterTools);
+  if (steerInterrupt) {
+    stored.checkpoint = sanitizeCheckpointAfterInterrupt(stored.checkpoint);
+    effectiveUserText = buildInterruptSteerUserText(effectiveUserText);
+    stored.abortedTurn = false;
+    log.info(
+      `[proxy] interrupt steer framed convKey=${convKey} afterTools=${userSteeredAfterTools}`,
+    );
   }
 
   const payload = buildCursorRequest(
@@ -1318,6 +1415,7 @@ async function doHandleChatCompletion(
     retryCtx,
     workspaceRoot,
     isSummary,
+    abortSignal,
   );
 }
 
@@ -2223,6 +2321,48 @@ function requestKeyNamespace(messages: OpenAIMessage[]): string {
   return "";
 }
 
+/**
+ * True when OpenAI history has a user message after one or more tool results.
+ * That pattern means the user interrupted/steered during a tool loop — the new
+ * text must win over resuming the parked MCP bridge.
+ */
+export function hasUserSteerAfterTools(messages: OpenAIMessage[]): boolean {
+  let sawTool = false;
+  for (const msg of messages) {
+    if (msg.role === "tool") {
+      sawTool = true;
+      continue;
+    }
+    if (msg.role === "user" && sawTool && textContent(msg.content).trim().length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const INTERRUPT_STEER_PREFIX =
+  "[User interrupted the previous turn. Do not continue the interrupted work unless the latest message asks you to. Follow the latest user message below.]";
+
+/** Frame a follow-up so Cursor treats it as a steer, not a bare cancel/resume. */
+export function buildInterruptSteerUserText(userText: string): string {
+  return `${INTERRUPT_STEER_PREFIX}\n\n${userText}`;
+}
+
+/** Drop unresolved pending tool calls from a checkpoint after user interrupt. */
+export function sanitizeCheckpointAfterInterrupt(
+  checkpoint: Uint8Array | null,
+): Uint8Array | null {
+  if (!checkpoint) return null;
+  try {
+    const state = fromBinary(ConversationStateStructureSchema, checkpoint);
+    if (!state.pendingToolCalls.length) return checkpoint;
+    state.pendingToolCalls = [];
+    return toBinary(ConversationStateStructureSchema, state);
+  } catch {
+    return checkpoint;
+  }
+}
+
 /** Derive a key for conversation state. Model-independent so context survives model switches.
  *
  * Priority:
@@ -2491,6 +2631,12 @@ function createBridgeStreamResponse(
   postedToolResults?: ToolResultInfo[],
   /** When true, advertise no tools and suppress MCP tool_calls (summary/compact). */
   toolsDisabled: boolean = false,
+  /**
+   * OpenCode/HTTP abort signal. Bun/OpenCode often abort via `req.signal` without
+   * reliably cancelling the response ReadableStream; honor the signal so the
+   * per-conversation mutex is released and the interrupt message can run.
+   */
+  abortSignal?: AbortSignal,
 ): Response {
   const resolvedStallTimeoutMs = stallTimeoutMs ?? STALL_TIMEOUT_MS;
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
@@ -2522,20 +2668,50 @@ function createBridgeStreamResponse(
   // Shared stream-lifecycle flag used by both `cancel()` and async bridge callbacks.
   // Must live outside `start()` so retries/enqueues stop immediately after client abort.
   let closed = false;
+  /** Set when the SSE stream finished with stop/tool_calls (not a user interrupt). */
+  let finishedNaturally = false;
+  let interruptMarked = false;
   /** At most one user-visible stall wait notice per streaming HTTP response (including internal stall recoveries). */
   let stallWaitUserNoticeEmittedThisResponse = false;
   /** Stall recovery schedules a backoff before restarting the bridge; abort must clear it. */
   let stallRecoveryBackoffTimer: ReturnType<typeof setTimeout> | undefined;
 
+  const abortFromClient = (reason: string) => {
+    // Distinguish user interrupt from OpenCode's normal abort-after-tool_calls.
+    if (!finishedNaturally && !interruptMarked) {
+      interruptMarked = true;
+      const stored = conversationStates.get(convKey);
+      if (stored) stored.abortedTurn = true;
+      const active = activeBridges.get(bridgeKey);
+      // Don't CancelAction a bridge that is parked awaiting tool results — that
+      // pause is a natural tool_calls finish, not a mid-turn interrupt.
+      if (currentAttemptBridge && active?.bridge !== currentAttemptBridge) {
+        sendCancelAction(currentAttemptBridge);
+      }
+      log.info(
+        `[proxy] client interrupt reason=${reason} convKey=${convKey} bridgeKey=${bridgeKey}`,
+      );
+    }
+    if (stallRecoveryBackoffTimer !== undefined) {
+      clearTimeout(stallRecoveryBackoffTimer);
+      stallRecoveryBackoffTimer = undefined;
+    }
+    closed = true;
+    cleanupCurrentAttempt();
+    safeRelease();
+  };
+
+  if (abortSignal) {
+    if (abortSignal.aborted) {
+      queueMicrotask(() => abortFromClient("req.signal-preabort"));
+    } else {
+      abortSignal.addEventListener("abort", () => abortFromClient("req.signal"), { once: true });
+    }
+  }
+
   const stream = new ReadableStream({
     cancel() {
-      closed = true;
-      if (stallRecoveryBackoffTimer !== undefined) {
-        clearTimeout(stallRecoveryBackoffTimer);
-        stallRecoveryBackoffTimer = undefined;
-      }
-      cleanupCurrentAttempt();
-      safeRelease();
+      abortFromClient("stream.cancel");
     },
     start(controller) {
       const encoder = new TextEncoder();
@@ -2646,6 +2822,7 @@ function createBridgeStreamResponse(
         };
 
         const finishStream = (finishReason: string) => {
+          finishedNaturally = true;
           sendSSE(makeChunk({}, finishReason));
           const usageChunk = makeUsageChunk();
           if (usageChunk) sendSSE(usageChunk);
@@ -3100,6 +3277,22 @@ function createBridgeStreamResponse(
   return new Response(stream, { headers: SSE_HEADERS });
 }
 
+/** Append tool-result payloads to an internal recovery continuation prompt. */
+function appendToolResultsToContinuation(
+  parts: string[],
+  toolResults?: ToolResultInfo[],
+): void {
+  if (!toolResults || toolResults.length === 0) return;
+  parts.push("Tool results already provided:");
+  for (const result of toolResults) {
+    const truncated =
+      result.content.length > 4_000
+        ? `${result.content.slice(0, 4_000)}…`
+        : result.content;
+    parts.push(`- ${result.toolCallId || "tool"}: ${truncated}`);
+  }
+}
+
 /** User-facing continuation prompt used when a post-tool stream stalls and we
  *  rebuild a fresh Run from the stored checkpoint (mcpResults cannot be replayed). */
 function buildPostToolStallContinuation(toolResults?: ToolResultInfo[]): string {
@@ -3108,16 +3301,23 @@ function buildPostToolStallContinuation(toolResults?: ToolResultInfo[]): string 
     "Continue your answer from the current conversation checkpoint.",
     "Do not repeat tool calls that already succeeded unless necessary.",
   ];
-  if (toolResults && toolResults.length > 0) {
-    parts.push("Tool results already provided:");
-    for (const result of toolResults) {
-      const truncated =
-        result.content.length > 4_000
-          ? `${result.content.slice(0, 4_000)}…`
-          : result.content;
-      parts.push(`- ${result.toolCallId || "tool"}: ${truncated}`);
-    }
-  }
+  appendToolResultsToContinuation(parts, toolResults);
+  return parts.join("\n");
+}
+
+/**
+ * Continuation when the parked tool bridge died/expired before OpenCode returned
+ * results (typical after long shells/builds that outlive the old 5m TTL).
+ */
+export function buildPostToolBridgeLossContinuation(
+  toolResults?: ToolResultInfo[],
+): string {
+  const parts = [
+    "[Internal stream recovery] The previous tool-call bridge expired while tools were still running.",
+    "Tool results are provided below. Continue from the current conversation checkpoint.",
+    "Do not repeat tool calls that already succeeded unless necessary.",
+  ];
+  appendToolResultsToContinuation(parts, toolResults);
   return parts.join("\n");
 }
 
@@ -3154,6 +3354,7 @@ function handleStreamingResponse(
   retryCtx?: RetryContext,
   workspaceRoot?: string,
   toolsDisabled: boolean = false,
+  abortSignal?: AbortSignal,
 ): Response {
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
@@ -3168,6 +3369,7 @@ function handleStreamingResponse(
     true,
     undefined,
     toolsDisabled,
+    abortSignal,
   );
 }
 
@@ -3180,6 +3382,7 @@ function handleToolResultResume(
   convKey: string,
   release: () => void,
   workspaceRoot?: string,
+  abortSignal?: AbortSignal,
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
   active.lastAccessMs = Date.now();
@@ -3245,6 +3448,8 @@ function handleToolResultResume(
     STALL_TIMEOUT_POST_TOOL_MS,
     false,
     toolResults,
+    false,
+    abortSignal,
   );
 }
 
