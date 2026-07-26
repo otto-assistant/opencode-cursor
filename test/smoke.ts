@@ -2447,6 +2447,34 @@ async function testInterruptSteerHelpers() {
   console.log("[test] Interrupt/steer helpers OK");
 }
 
+async function testLongToolBridgeTtlAndContinuation() {
+  console.log("[test] Testing long-tool bridge TTL and dead-bridge continuation...");
+  const proxy = await import("../src/proxy");
+
+  // Regression: 5-minute TTL killed bridges during long shells (UI showed 300.0s).
+  assert(
+    proxy.getActiveBridgeTtlMs() >= 30 * 60 * 1000,
+    `Active bridge TTL must cover long tool runs (>=30m), got ${proxy.getActiveBridgeTtlMs()}ms`,
+  );
+
+  const continuation = proxy.buildPostToolBridgeLossContinuation([
+    { toolCallId: "call_shell_1", content: "build finished successfully" },
+  ]);
+  assert(
+    continuation.includes("bridge expired while tools were still running"),
+    "Dead-bridge continuation must explain bridge loss during long tools",
+  );
+  assert(
+    continuation.includes("build finished successfully"),
+    "Dead-bridge continuation must include tool output",
+  );
+  assert(
+    continuation.includes("call_shell_1"),
+    "Dead-bridge continuation must include tool call id",
+  );
+  console.log("[test] Long-tool bridge TTL and continuation OK");
+}
+
 async function testClientAbortReleasesMutexForSteer(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -2583,6 +2611,7 @@ async function main() {
     await testSummaryGenerationDetection(modules);
     await testComputeUsageFallback(modules);
     await testInterruptSteerHelpers();
+    await testLongToolBridgeTtlAndContinuation();
     await testClientAbortReleasesMutexForSteer(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;

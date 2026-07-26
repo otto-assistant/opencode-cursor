@@ -202,11 +202,24 @@ const lastStallWaitNoticeMsByConv = new Map<string, number>();
 const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 const MUTEX_TTL_MS = 30 * 60 * 1000;
 /**
- * TTL for paused tool bridges. Kept generous so normal MCP/tool round-trip
- * latency (including user approvals) survives without the resume falling back
- * to a fresh Run; abandoned bridges are still reaped so they cannot leak.
+ * TTL for paused tool bridges waiting on OpenCode MCP results.
+ *
+ * Must cover long legitimate tool runs (installs, builds, systemd bring-up).
+ * The previous 5-minute default matched observed "Shell 300.0s" hangs: the
+ * bridge was reaped while the tool was still running, so resume could not
+ * deliver mcpResults and the agent looked stuck.
+ *
+ * Abandoned bridges are still reaped after this window so heartbeats/H2
+ * workers cannot leak forever. Override with OPENCODE_CURSOR_ACTIVE_BRIDGE_TTL_MS.
  */
-const ACTIVE_BRIDGE_TTL_MS = Number(process.env.OPENCODE_CURSOR_ACTIVE_BRIDGE_TTL_MS ?? 5 * 60 * 1000);
+const ACTIVE_BRIDGE_TTL_MS = Number(
+  process.env.OPENCODE_CURSOR_ACTIVE_BRIDGE_TTL_MS ?? 60 * 60 * 1000,
+);
+
+/** Default / configured TTL for paused tool bridges (exported for tests). */
+export function getActiveBridgeTtlMs(): number {
+  return ACTIVE_BRIDGE_TTL_MS;
+}
 const ADMISSION_BRIDGE_CULL_IDLE_MS = Number(process.env.OPENCODE_CURSOR_ADMISSION_BRIDGE_CULL_IDLE_MS ?? 30 * 1000);
 const MAX_ACTIVE_BRIDGES = 24;
 const MAX_CONVERSATION_BLOB_BYTES = Number(process.env.OPENCODE_CURSOR_MAX_CONV_BLOB_BYTES ?? 64 * 1024 * 1024);
@@ -400,11 +413,14 @@ function evictStaleActiveBridges(): number {
   const now = Date.now();
   for (const [bridgeKey, active] of activeBridges) {
     // Active bridges are always paused awaiting MCP tool results (setActiveBridge
-    // is only called with pending execs). ACTIVE_BRIDGE_TTL_MS is generous so
-    // normal tool latency survives; only genuinely abandoned bridges are reaped
-    // (an abandoned bridge would otherwise keep its heartbeat + h2 subprocess
-    // alive indefinitely).
-    if (now - active.lastAccessMs > ACTIVE_BRIDGE_TTL_MS) {
+    // is only called with pending execs). Only reap after ACTIVE_BRIDGE_TTL_MS so
+    // long shells/builds can finish; an abandoned bridge would otherwise keep
+    // its heartbeat + h2 subprocess alive indefinitely.
+    const idleMs = now - active.lastAccessMs;
+    if (idleMs > ACTIVE_BRIDGE_TTL_MS) {
+      log.warn(
+        `[proxy] evicting stale tool bridge bridgeKey=${bridgeKey} idleMs=${idleMs} ttlMs=${ACTIVE_BRIDGE_TTL_MS} pendingExecs=${active.pendingExecs.length}`,
+      );
       killActiveBridge(active);
       deleteActiveBridge(bridgeKey);
       evicted += 1;
@@ -1320,19 +1336,34 @@ async function doHandleChatCompletion(
   }
   runMaintenanceSweep();
 
-  // Build the request. When tool results are present but the bridge died,
-  // we must still include the last user text so Cursor has context.
+  // Build the request. When tool results are present but the live bridge is
+  // gone (TTL eviction during long shells/builds, crash, etc.), resume via
+  // checkpoint + continuation prompt — mcpResults cannot be replayed.
+  // Note: parseMessages may still surface the original user text alongside
+  // tool results; that must not win over the tool continuation.
   const mcpTools = buildMcpToolDefinitions(tools);
-  let effectiveUserText = userText || (toolResults.length > 0
-    ? toolResults.map((r) => r.content).join("\n")
-    : "");
+  const toolContinuationResume =
+    toolResults.length > 0 && !userSteeredAfterTools;
+  let effectiveUserText = "";
+  if (userSteeredAfterTools && userText) {
+    effectiveUserText = userText;
+  } else if (toolContinuationResume) {
+    effectiveUserText = buildPostToolBridgeLossContinuation(toolResults);
+    log.warn(
+      `[proxy] tool resume without live bridge — checkpoint continuation convKey=${convKey} tools=${toolResults.length}`,
+    );
+  } else {
+    effectiveUserText = userText || "";
+  }
 
   // For fresh conversations (no checkpoint), embed prior conversation turns
   // into the user message so the model has context of previous interactions.
   // When a checkpoint exists, Cursor already has the full conversation state.
   // Summary/compact already receives the history in the OpenAI messages that
   // parseMessages folded into turns — embed them so Cursor can summarize.
-  if (!stored.checkpoint && turns.length > 0) {
+  // Tool-continuation resumes already carry structured tool output — do not
+  // wrap them in the generic history template.
+  if (!stored.checkpoint && turns.length > 0 && !toolContinuationResume) {
     const historyLines: string[] = [];
     for (const turn of turns) {
       if (turn.userText) historyLines.push(`User: ${turn.userText}`);
@@ -3246,6 +3277,22 @@ function createBridgeStreamResponse(
   return new Response(stream, { headers: SSE_HEADERS });
 }
 
+/** Append tool-result payloads to an internal recovery continuation prompt. */
+function appendToolResultsToContinuation(
+  parts: string[],
+  toolResults?: ToolResultInfo[],
+): void {
+  if (!toolResults || toolResults.length === 0) return;
+  parts.push("Tool results already provided:");
+  for (const result of toolResults) {
+    const truncated =
+      result.content.length > 4_000
+        ? `${result.content.slice(0, 4_000)}…`
+        : result.content;
+    parts.push(`- ${result.toolCallId || "tool"}: ${truncated}`);
+  }
+}
+
 /** User-facing continuation prompt used when a post-tool stream stalls and we
  *  rebuild a fresh Run from the stored checkpoint (mcpResults cannot be replayed). */
 function buildPostToolStallContinuation(toolResults?: ToolResultInfo[]): string {
@@ -3254,16 +3301,23 @@ function buildPostToolStallContinuation(toolResults?: ToolResultInfo[]): string 
     "Continue your answer from the current conversation checkpoint.",
     "Do not repeat tool calls that already succeeded unless necessary.",
   ];
-  if (toolResults && toolResults.length > 0) {
-    parts.push("Tool results already provided:");
-    for (const result of toolResults) {
-      const truncated =
-        result.content.length > 4_000
-          ? `${result.content.slice(0, 4_000)}…`
-          : result.content;
-      parts.push(`- ${result.toolCallId || "tool"}: ${truncated}`);
-    }
-  }
+  appendToolResultsToContinuation(parts, toolResults);
+  return parts.join("\n");
+}
+
+/**
+ * Continuation when the parked tool bridge died/expired before OpenCode returned
+ * results (typical after long shells/builds that outlive the old 5m TTL).
+ */
+export function buildPostToolBridgeLossContinuation(
+  toolResults?: ToolResultInfo[],
+): string {
+  const parts = [
+    "[Internal stream recovery] The previous tool-call bridge expired while tools were still running.",
+    "Tool results are provided below. Continue from the current conversation checkpoint.",
+    "Do not repeat tool calls that already succeeded unless necessary.",
+  ];
+  appendToolResultsToContinuation(parts, toolResults);
   return parts.join("\n");
 }
 
