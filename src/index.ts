@@ -155,7 +155,7 @@ function isCursorOAuthAuth(auth: unknown): auth is CursorOAuthAuth {
 export const CursorAuthPlugin: Plugin = async (
   input: PluginInput,
 ): Promise<Hooks> => {
-  let modelCatalog = FALLBACK_MODELS;
+  let modelCatalog: CursorModel[] = [];
   const rememberModels = (models: CursorModel[]) => {
     modelCatalog = models;
   };
@@ -166,7 +166,8 @@ export const CursorAuthPlugin: Plugin = async (
     // longer surface a plugin's dynamic `provider.models()` hook there. Seed a
     // concrete `cursor` provider here so it always appears, without clobbering
     // any user-defined overrides. The dynamic hook + auth loader below still
-    // refine connection details and models at runtime.
+    // refine connection details and models at runtime. When logged out, seed
+    // the provider shell only — never inject hardcoded fallback models.
     async config(config) {
       const models = await resolveConfigModels();
       rememberModels(models);
@@ -443,12 +444,14 @@ function ensureCursorProviderConfig(
 /**
  * Resolve the model list used to seed the static provider config. Prefers the
  * full set discovered from Cursor (using the stored OAuth access token) so the
- * whole catalog shows up in the menu, and falls back to the bundled list when
- * no valid token is available or discovery is slow/unavailable. Never throws.
+ * whole catalog shows up in the menu. When logged out (no token), returns an
+ * empty list so hardcoded fallback models are never injected into OpenCode.
+ * When logged in but discovery is slow/unavailable, falls back to the bundled
+ * list. Never throws.
  */
 async function resolveConfigModels(): Promise<CursorModel[]> {
   const token = readStoredCursorAccessToken();
-  if (!token) return FALLBACK_MODELS;
+  if (!token) return [];
   try {
     const discovered = await withTimeout(getCursorModels(token), 4000);
     return discovered.length > 0 ? discovered : FALLBACK_MODELS;
