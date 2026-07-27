@@ -200,6 +200,17 @@ export const CursorAuthPlugin: Plugin = async (
       delete output.options[CURSOR_VARIANT_OPTION];
     },
 
+    "experimental.session.compacting": async (_hookInput, output) => {
+      // Discourage tool hallucination during session compaction.  Some models
+      // (particularly Claude) emit tool calls (bash, read, etc.) even when no
+      // tool definitions are provided.  The proxy fix in handleExecMessage
+      // rejects such calls at the transport level, but adding explicit
+      // instructions here further reduces the chance the model attempts them.
+      output.context.push(
+        "IMPORTANT: Do NOT call any tools. Only produce a summary as text. No tool calls are allowed.",
+      );
+    },
+
     provider: {
       id: CURSOR_PROVIDER_ID,
       async models(provider, ctx) {

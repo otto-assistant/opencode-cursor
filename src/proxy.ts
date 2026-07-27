@@ -45,6 +45,7 @@ import {
   McpSuccessSchema,
   McpTextContentSchema,
   McpToolDefinitionSchema,
+  McpToolNotFoundSchema,
   McpToolResultContentItemSchema,
   ModelDetailsSchema,
   RequestedModelSchema,
@@ -2068,6 +2069,36 @@ function handleExecMessage(
       return;
     }
     const mcpArgs = execMsg.message.value;
+    const toolName = mcpArgs.toolName || mcpArgs.name;
+
+    // Reject tool calls that were never advertised to the engine. Agentic
+    // models (Claude, Grok, ...) sometimes emit hallucinated tool calls
+    // (e.g. "bash") even when no tools were configured — the classic /compact
+    // failure, where OpenCode sends tools: [] and hard-throws "Tool call not
+    // allowed while generating summary" if the call is forwarded. Answering
+    // with toolNotFound lets the engine recover and produce plain text.
+    if (mcpTools.length === 0 || !mcpTools.some((t) => t.name === toolName || t.toolName === toolName)) {
+      log.warn(
+        `[proxy] rejecting unadvertised MCP tool call: ${toolName || "unknown"} (advertised tools: ${mcpTools.length})`,
+      );
+      const available = mcpTools.map((t) => t.name);
+      sendExecResult(
+        execMsg,
+        "mcpResult",
+        create(McpResultSchema, {
+          result: {
+            case: "toolNotFound",
+            value: create(McpToolNotFoundSchema, {
+              name: toolName,
+              availableTools: available,
+            }),
+          },
+        }),
+        sendFrame,
+      );
+      return;
+    }
+
     const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
     const cursorToolCallId = mcpArgs.toolCallId || crypto.randomUUID();
     // Generate a short external ID (≤64 chars) for OpenAI API compatibility.
@@ -2078,7 +2109,7 @@ function handleExecMessage(
       execMsgId: execMsg.id,
       toolCallId: shortToolCallId,
       cursorToolCallId,
-      toolName: mcpArgs.toolName || mcpArgs.name,
+      toolName,
       decodedArgs: JSON.stringify(decoded),
     });
     return;
@@ -2310,7 +2341,16 @@ export function isSummaryGenerationRequest(messages: OpenAIMessage[]): boolean {
   return (
     userText.includes("this summary will be the only context available when the conversation continues") ||
     userText.includes("create a detailed summary for continuing this coding session") ||
-    (userText.includes("<previous-summary>") && userText.includes("compact"))
+    // OpenCode 1.18+ compaction can send the anchored-summary instruction as a
+    // bare user message with no system prompt (and tools: []), e.g.:
+    //   "Create a new anchored summary from the conversation history."
+    //   "Update the anchored summary below using the conversation history above.\n<previous-summary>…"
+    // Missing these leaves tools enabled and Cursor's agentic engine emits tool
+    // calls that OpenCode rejects with "Tool call not allowed while generating
+    // summary".
+    userText.includes("anchored summary from the conversation history") ||
+    userText.includes("anchored summary below using the conversation history") ||
+    userText.includes("<previous-summary>")
   );
 }
 

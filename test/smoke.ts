@@ -2341,6 +2341,47 @@ async function testSummaryGenerationDetection(modules: TestModules) {
     ]),
     "Normal chat must not be treated as summary generation",
   );
+  // OpenCode 1.18+ compaction: anchored-summary instruction arrives as a bare
+  // user message with no system prompt and tools: []. Regression test for
+  // "Tool call not allowed while generating summary: bash".
+  assert(
+    proxy.isSummaryGenerationRequest([
+      {
+        role: "user",
+        content:
+          "Create a new anchored summary from the conversation history.\n\n<conversation>\nUser: hi\n</conversation>",
+      },
+    ]),
+    "Expected 1.18-style fresh compaction prompt (user-only) to be detected",
+  );
+  assert(
+    proxy.isSummaryGenerationRequest([
+      {
+        role: "user",
+        content:
+          "Update the anchored summary below using the conversation history above.\n\n<previous-summary>\nold summary\n</previous-summary>\n\n<conversation>\nUser: hi\n</conversation>",
+      },
+    ]),
+    "Expected 1.18-style update compaction prompt (previous-summary) to be detected",
+  );
+  assert(
+    !proxy.isSummaryGenerationRequest([
+      { role: "system", content: "You are a helpful coding agent." },
+      { role: "user", content: "can we compact the retry logic into one helper?" },
+    ]),
+    "Chat merely mentioning 'compact' must not be treated as summary generation",
+  );
+  assert(
+    !proxy.isSummaryGenerationRequest([
+      {
+        role: "user",
+        content:
+          "<conversation-checkpoint>\nThe following is a summary and serialized record of earlier conversation.\n<summary>\ndid work\n</summary>\n<recent-context>\nstuff\n</recent-context>\n</conversation-checkpoint>",
+      },
+      { role: "user", content: "continue the refactor" },
+    ]),
+    "Post-compaction continuation (conversation-checkpoint) must not be treated as summary generation",
+  );
   assert(
     !proxy.isTitleGenerationRequest([
       {
