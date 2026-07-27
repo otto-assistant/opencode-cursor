@@ -1,6 +1,8 @@
 import http from "node:http";
 import http2 from "node:http2";
+import { mkdir, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
+import { join } from "node:path";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
   AgentClientMessageSchema,
@@ -1442,13 +1444,18 @@ async function testProxyConsumesCursorModelHeader(
   console.log("[test] Proxy Cursor model header routing OK");
 }
 
-async function testConfigHookSeedsProvider(modules: TestModules) {
+async function testConfigHookSeedsProvider(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
   console.log("[test] Checking config hook seeds cursor provider...");
 
-  // Force the offline fallback path: point the auth store at an empty dir so
-  // the config hook does not perform real network discovery.
   const prevXdg = process.env.XDG_DATA_HOME;
-  process.env.XDG_DATA_HOME = "/tmp/opencode-cursor-smoke-empty";
+  const loggedOutDir = "/tmp/opencode-cursor-smoke-empty";
+  const loggedInDir = "/tmp/opencode-cursor-smoke-logged-in";
+
+  // Logged out: point the auth store at an empty dir so there is no token.
+  process.env.XDG_DATA_HOME = loggedOutDir;
 
   const fakeInput = {
     client: { auth: { set: async () => {} } },
@@ -1459,7 +1466,7 @@ async function testConfigHookSeedsProvider(modules: TestModules) {
     throw new Error("Plugin hooks.config is not a function");
   }
 
-  // Fresh config: provider + models should be seeded.
+  // Fresh config while logged out: provider shell only — no hardcoded models.
   const fresh: any = {};
   await hooks.config!(fresh);
   const cursor = fresh.provider?.cursor;
@@ -1467,41 +1474,17 @@ async function testConfigHookSeedsProvider(modules: TestModules) {
   assertEqual(cursor.name, "Cursor", "Expected seeded provider name");
   assertEqual(cursor.npm, "@ai-sdk/openai-compatible", "Expected seeded npm");
   assert(cursor.options?.baseURL, "Expected seeded options.baseURL");
+  assertEqual(
+    Object.keys(cursor.models ?? {}).length,
+    0,
+    "Expected no hardcoded models when logged out",
+  );
   assert(
-    Object.keys(cursor.models ?? {}).length > 0,
-    "Expected seeded provider to declare models",
-  );
-  assert(
-    "composer-1" in cursor.models,
-    "Expected fallback model composer-1 to be seeded",
-  );
-  assertEqual(
-    cursor.models["composer-1"].reasoning,
-    false,
-    "Expected Cursor config models to bypass OpenCode generic variant generation",
-  );
-  assertEqual(
-    cursor.models.default.reasoning,
-    false,
-    "Expected cursor/default not to generate misleading reasoning variants",
-  );
-  assertEqual(
-    cursor.models.default.variants.low.disabled,
-    true,
-    "Expected cursor/default low variant to be suppressed",
-  );
-  assertEqual(
-    cursor.models.default.variants.max.disabled,
-    true,
-    "Expected cursor/default max variant to be suppressed",
-  );
-  assertEqual(
-    cursor.models["composer-1"].variants.medium.disabled,
-    true,
-    "Expected unsupported generic variants to be suppressed on flat models",
+    !("composer-1" in (cursor.models ?? {})),
+    "Expected fallback model composer-1 not to be seeded when logged out",
   );
 
-  // User overrides must be preserved and win over seeded defaults.
+  // User overrides must be preserved; logged-out must not inject fallbacks.
   const custom: any = {
     provider: {
       cursor: {
@@ -1523,10 +1506,71 @@ async function testConfigHookSeedsProvider(modules: TestModules) {
   );
   assertEqual(c2.options.apiKey, "x", "Expected user option to be preserved");
   assert("my-model" in c2.models, "Expected user model to be preserved");
-  assert(
-    "composer-1" in c2.models,
-    "Expected seeded models to be merged alongside user models",
+  assertEqual(
+    Object.keys(c2.models).length,
+    1,
+    "Expected only user models when logged out (no hardcoded fallbacks)",
   );
+  assert(
+    !("composer-1" in c2.models),
+    "Expected fallback models not to be merged when logged out",
+  );
+
+  // Logged in with empty discovery: seed fallback models for degraded use.
+  await mkdir(join(loggedInDir, "opencode"), { recursive: true });
+  await writeFile(
+    join(loggedInDir, "opencode", "auth.json"),
+    JSON.stringify({
+      cursor: {
+        type: "oauth",
+        access: "smoke-test-access-token",
+        refresh: "smoke-test-refresh",
+        expires: Date.now() + 3_600_000,
+      },
+    }),
+  );
+  process.env.XDG_DATA_HOME = loggedInDir;
+  modules.clearModelCache();
+  backend.setAvailableModels(undefined);
+  backend.setDiscoveryMode("empty");
+
+  const loggedInHooks = await modules.CursorAuthPlugin(fakeInput);
+  const degraded: any = {};
+  await loggedInHooks.config!(degraded);
+  const degradedCursor = degraded.provider?.cursor;
+  assert(degradedCursor, "Expected config hook to create provider.cursor");
+  assert(
+    "composer-1" in degradedCursor.models,
+    "Expected fallback model composer-1 when logged in but discovery fails",
+  );
+  assertEqual(
+    degradedCursor.models["composer-1"].reasoning,
+    false,
+    "Expected Cursor config models to bypass OpenCode generic variant generation",
+  );
+  assertEqual(
+    degradedCursor.models.default.reasoning,
+    false,
+    "Expected cursor/default not to generate misleading reasoning variants",
+  );
+  assertEqual(
+    degradedCursor.models.default.variants.low.disabled,
+    true,
+    "Expected cursor/default low variant to be suppressed",
+  );
+  assertEqual(
+    degradedCursor.models.default.variants.max.disabled,
+    true,
+    "Expected cursor/default max variant to be suppressed",
+  );
+  assertEqual(
+    degradedCursor.models["composer-1"].variants.medium.disabled,
+    true,
+    "Expected unsupported generic variants to be suppressed on flat models",
+  );
+
+  backend.setDiscoveryMode("success");
+  modules.clearModelCache();
 
   if (prevXdg === undefined) {
     delete process.env.XDG_DATA_HOME;
@@ -2633,7 +2677,7 @@ async function main() {
     await testAvailableModelParameterGrouping(modules);
     await testCursorModelVariantGrouping(modules);
     await testCursorVariantHooks(modules, backend);
-    await testConfigHookSeedsProvider(modules);
+    await testConfigHookSeedsProvider(modules, backend);
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testRefreshFailureKeepsProviderListable(modules, backend);
