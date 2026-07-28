@@ -1,0 +1,11 @@
+{
+  "name": "opencode-cursor live test",
+  "install": "bash scripts/cloud-agent-setup.sh",
+  "agentCanUpdateSnapshot": true,
+  "ports": [
+    {
+      "name": "cursor-proxy",
+      "port": 8788
+    }
+  ]
+}
