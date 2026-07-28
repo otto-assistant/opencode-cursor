@@ -1548,6 +1548,16 @@ async function testConfigHookSeedsProvider(
     false,
     "Expected Cursor config models to bypass OpenCode generic variant generation",
   );
+  assert(
+    Array.isArray(degradedCursor.models["composer-1"].modalities?.input) &&
+      degradedCursor.models["composer-1"].modalities.input.includes("image"),
+    "Expected seeded Cursor models to declare modalities.input including image",
+  );
+  assert(
+    Array.isArray(degradedCursor.models["composer-1"].capabilities?.input) &&
+      degradedCursor.models["composer-1"].capabilities.input.includes("image"),
+    "Expected seeded Cursor models to declare capabilities.input including image",
+  );
   assertEqual(
     degradedCursor.models.default.reasoning,
     false,
@@ -2619,6 +2629,57 @@ async function testParseMessagesPreservesUserDuringToolLoop() {
   console.log("[test] parseMessages mid-tool-loop userText preservation OK");
 }
 
+async function testImageAttachmentParsingAndCapabilities() {
+  console.log("[test] Testing image attachment parsing...");
+  const proxy = await import("../src/proxy");
+
+  const tinyPngBase64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  const dataUrl = `data:image/png;base64,${tinyPngBase64}`;
+
+  const extracted = proxy.extractImagesFromContent([
+    { type: "text", text: "what is in this image?" },
+    { type: "image_url", image_url: { url: dataUrl } },
+  ]);
+  assertEqual(extracted.length, 1, "Expected one extracted image from image_url part");
+  assertEqual(extracted[0]?.mimeType, "image/png", "Expected png mime");
+  assert(extracted[0]!.bytes.byteLength > 0, "Expected non-empty image bytes");
+
+  const filePart = proxy.extractImagesFromContent([
+    {
+      type: "file",
+      filename: "IMG_3064.png",
+      mime: "image/png",
+      data: tinyPngBase64,
+    },
+  ]);
+  assertEqual(filePart.length, 1, "Expected one extracted image from file part");
+  assertEqual(filePart[0]?.filename, "IMG_3064.png", "Expected original filename");
+
+  const parsed = proxy.parseMessages([
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "describe this" },
+        { type: "image_url", image_url: dataUrl },
+      ],
+    },
+  ]);
+  assertEqual(parsed.userText, "describe this", "Expected text preserved alongside image");
+  assertEqual(parsed.images.length, 1, "Expected parseMessages to surface images");
+
+  const imageOnly = proxy.parseMessages([
+    {
+      role: "user",
+      content: [{ type: "image_url", image_url: { url: dataUrl } }],
+    },
+  ]);
+  assertEqual(imageOnly.userText.trim(), "", "Image-only turn may have empty text");
+  assertEqual(imageOnly.images.length, 1, "Image-only turn must still expose images");
+
+  console.log("[test] Image attachment parsing OK");
+}
+
 async function testLongToolBridgeTtlAndContinuation() {
   console.log("[test] Testing long-tool bridge TTL and dead-bridge continuation...");
   const proxy = await import("../src/proxy");
@@ -2863,6 +2924,7 @@ async function main() {
     await testComputeUsageFallback(modules);
     await testInterruptSteerHelpers();
     await testParseMessagesPreservesUserDuringToolLoop();
+    await testImageAttachmentParsingAndCapabilities();
     await testLongToolBridgeTtlAndContinuation();
     await testAwaitingToolResultsBridgeSurvivesEviction();
     await testClientAbortReleasesMutexForSteer(modules, backend);

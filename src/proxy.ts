@@ -60,6 +60,9 @@ import {
   ShellResultSchema,
   UserMessageActionSchema,
   UserMessageSchema,
+  SelectedContextSchema,
+  SelectedImageSchema,
+  SelectedImage_BlobIdWithDataSchema,
   WriteRejectedSchema,
   WriteResultSchema,
   WriteShellStdinErrorSchema,
@@ -101,6 +104,21 @@ interface OpenAIToolCall {
 interface ContentPart {
   type: string;
   text?: string;
+  /** OpenAI vision part: string URL or `{ url }`. */
+  image_url?: string | { url?: string; detail?: string };
+  /** Some OpenCode paths use explicit mime + data/url fields. */
+  mime?: string;
+  mime_type?: string;
+  data?: string;
+  url?: string;
+  filename?: string;
+  name?: string;
+}
+
+interface ExtractedImage {
+  bytes: Uint8Array;
+  mimeType: string;
+  filename: string;
 }
 
 interface OpenAIMessage {
@@ -1229,6 +1247,7 @@ async function doHandleChatCompletion(
   const userText = parsed.userText.trim();
   const turns = parsed.turns;
   const toolResults = parsed.toolResults;
+  const images = parsed.images;
   const selection =
     selectedModel ?? literalCursorModelSelection(resolveProxyModelId(body.model));
   const modelId = selection.publicId;
@@ -1240,10 +1259,10 @@ async function doHandleChatCompletion(
     : (body.tools ?? []).filter((tool) => !shouldBlockTool(tool));
   const workspaceRoot = extractWorkspaceRoot(systemPrompt);
   log.info(
-    `[proxy] bridge model input=${body.model} resolved=${modelId} server=${selection.modelId} max=${selection.maxMode}${isSummary ? " summary=1" : ""} userChars=${userText.length} tools=${toolResults.length}`,
+    `[proxy] bridge model input=${body.model} resolved=${modelId} server=${selection.modelId} max=${selection.maxMode}${isSummary ? " summary=1" : ""} userChars=${userText.length} images=${images.length} tools=${toolResults.length}`,
   );
 
-  if (!userText && toolResults.length === 0) {
+  if (!userText && toolResults.length === 0 && images.length === 0) {
     return new Response(
       JSON.stringify({
         error: {
@@ -1412,6 +1431,7 @@ async function doHandleChatCompletion(
 
   // Belt-and-suspenders: never send an empty UserMessage to Cursor. Empty
   // prompts reliably produce "user sent an empty message" hallucinations.
+  // Image-only turns are valid — Cursor reads attachments from selectedContext.
   if (!effectiveUserText.trim()) {
     if (toolResults.length > 0) {
       effectiveUserText = buildPostToolBridgeLossContinuation(toolResults);
@@ -1420,6 +1440,8 @@ async function doHandleChatCompletion(
       );
     } else if (userText) {
       effectiveUserText = userText;
+    } else if (images.length > 0) {
+      effectiveUserText = "";
     } else {
       release();
       return new Response(
@@ -1434,9 +1456,15 @@ async function doHandleChatCompletion(
     }
   }
 
+  // Attach images only on fresh user turns / steers — not on tool-continuation
+  // rebuilds where the original attachments already live in the checkpoint.
+  const requestImages =
+    toolContinuationResume && !userSteeredAfterTools ? [] : images;
+
   const payload = buildCursorRequest(
     selection, systemPrompt, effectiveUserText,
     stored.conversationId, stored.checkpoint, stored.blobStore,
+    requestImages,
   );
   payload.mcpTools = mcpTools;
 
@@ -1449,6 +1477,7 @@ async function doHandleChatCompletion(
     selection,
     systemPrompt,
     effectiveUserText,
+    images: requestImages,
     mcpTools,
     stallRecoveryCount: 0,
   };
@@ -1473,6 +1502,8 @@ interface ToolResultInfo {
 interface ParsedMessages {
   systemPrompt: string;
   userText: string;
+  /** Images attached to the current user turn (OpenAI vision / file parts). */
+  images: ExtractedImage[];
   turns: Array<{ userText: string; assistantText: string }>;
   toolResults: ToolResultInfo[];
 }
@@ -1485,6 +1516,146 @@ function textContent(content: OpenAIMessage["content"]): string {
     .filter((p) => p.type === "text" && p.text)
     .map((p) => p.text!)
     .join("\n");
+}
+
+function imageUrlFromPart(part: ContentPart): string | undefined {
+  if (typeof part.image_url === "string" && part.image_url.trim()) {
+    return part.image_url.trim();
+  }
+  if (
+    part.image_url &&
+    typeof part.image_url === "object" &&
+    typeof part.image_url.url === "string" &&
+    part.image_url.url.trim()
+  ) {
+    return part.image_url.url.trim();
+  }
+  if (typeof part.url === "string" && part.url.trim()) {
+    return part.url.trim();
+  }
+  return undefined;
+}
+
+function guessMimeFromName(name: string): string {
+  const lower = name.toLowerCase();
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".gif")) return "image/gif";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".bmp")) return "image/bmp";
+  if (lower.endsWith(".svg")) return "image/svg+xml";
+  return "application/octet-stream";
+}
+
+function decodeDataUrl(dataUrl: string): ExtractedImage | undefined {
+  const match = /^data:([^;,]+)?(?:;charset=[^;,]+)?;base64,([A-Za-z0-9+/=\s]+)$/i.exec(
+    dataUrl.trim(),
+  );
+  if (!match) return undefined;
+  const mimeType = (match[1] || "application/octet-stream").trim() || "application/octet-stream";
+  try {
+    const bytes = Buffer.from(match[2].replace(/\s+/g, ""), "base64");
+    if (bytes.byteLength === 0) return undefined;
+    const ext = mimeType.includes("png")
+      ? "png"
+      : mimeType.includes("jpeg") || mimeType.includes("jpg")
+        ? "jpg"
+        : mimeType.includes("gif")
+          ? "gif"
+          : mimeType.includes("webp")
+            ? "webp"
+            : "bin";
+    return {
+      bytes: new Uint8Array(bytes),
+      mimeType,
+      filename: `attachment.${ext}`,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Extract image attachments from an OpenAI / OpenCode content payload.
+ * Supports `image_url` parts (data URLs) and file-like parts with base64 `data`.
+ */
+export function extractImagesFromContent(
+  content: OpenAIMessage["content"],
+): ExtractedImage[] {
+  if (content == null || typeof content === "string") return [];
+  const images: ExtractedImage[] = [];
+  for (const part of content) {
+    const type = (part.type || "").toLowerCase();
+    const filename =
+      (typeof part.filename === "string" && part.filename) ||
+      (typeof part.name === "string" && part.name) ||
+      "attachment";
+
+    if (type === "image_url" || type === "image" || type === "input_image") {
+      const url = imageUrlFromPart(part);
+      if (url?.startsWith("data:")) {
+        const decoded = decodeDataUrl(url);
+        if (decoded) {
+          images.push({
+            ...decoded,
+            filename: filename.includes(".") ? filename : decoded.filename,
+          });
+        }
+      } else if (typeof part.data === "string" && part.data.trim()) {
+        try {
+          const bytes = new Uint8Array(
+            Buffer.from(part.data.replace(/^data:[^,]*,/, "").replace(/\s+/g, ""), "base64"),
+          );
+          if (bytes.byteLength > 0) {
+            const mimeType =
+              part.mime_type || part.mime || guessMimeFromName(filename) || "image/png";
+            images.push({ bytes, mimeType, filename });
+          }
+        } catch {
+          // skip undecodable
+        }
+      }
+      continue;
+    }
+
+    // OpenCode sometimes emits generic file parts for image attachments.
+    if (type === "file" || type === "input_file") {
+      const mime = (part.mime_type || part.mime || "").toLowerCase();
+      const looksImage =
+        mime.startsWith("image/") ||
+        /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(filename);
+      if (!looksImage) continue;
+      if (typeof part.data === "string" && part.data.trim()) {
+        try {
+          const bytes = new Uint8Array(
+            Buffer.from(part.data.replace(/^data:[^,]*,/, "").replace(/\s+/g, ""), "base64"),
+          );
+          if (bytes.byteLength > 0) {
+            images.push({
+              bytes,
+              mimeType: mime || guessMimeFromName(filename) || "image/png",
+              filename,
+            });
+          }
+        } catch {
+          // skip
+        }
+        continue;
+      }
+      const url = imageUrlFromPart(part);
+      if (url?.startsWith("data:")) {
+        const decoded = decodeDataUrl(url);
+        if (decoded) {
+          images.push({
+            ...decoded,
+            filename: filename.includes(".") ? filename : decoded.filename,
+            mimeType: mime || decoded.mimeType,
+          });
+        }
+      }
+    }
+  }
+  return images;
 }
 
 /** Extract the real workspace root from OpenCode's system prompt.
@@ -1528,8 +1699,10 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   // while tool_calls are still unresolved.
   const nonSystem = messages.filter((m) => m.role !== "system");
   let pendingUser = "";
+  let pendingUserContent: OpenAIMessage["content"] = null;
   let pendingAssistantTexts: string[] = [];
   let openToolCallBatch = false;
+  let currentImages: ExtractedImage[] = [];
 
   function flushPair() {
     if (pendingUser) {
@@ -1539,6 +1712,7 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
       });
     }
     pendingUser = "";
+    pendingUserContent = null;
     pendingAssistantTexts = [];
     openToolCallBatch = false;
   }
@@ -1558,6 +1732,8 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
       flushPair();
       trailingToolResults.length = 0;
       pendingUser = textContent(msg.content);
+      pendingUserContent = msg.content;
+      currentImages = extractImagesFromContent(msg.content);
       continue;
     }
 
@@ -1582,22 +1758,29 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
 
   // Determine the current user message to send to Cursor
   let lastUserText = "";
+  let lastUserImages: ExtractedImage[] = [];
   if (openToolCallBatch) {
     // Mid tool-loop: preserve the user text and only the unresolved tool results.
     lastUserText = pendingUser;
+    lastUserImages = currentImages;
   } else if (pendingUser && pendingAssistantTexts.length > 0) {
     pairs.push({
       userText: pendingUser,
       assistantText: pendingAssistantTexts.join("\n"),
     });
     pendingUser = "";
+    pendingUserContent = null;
     // Regeneration path: last completed turn without a newer user/tool payload.
     if (pairs.length > 0 && trailingToolResults.length === 0) {
       const last = pairs.pop()!;
       lastUserText = last.userText;
+      // Images from a completed turn are already in Cursor checkpoint history;
+      // only re-attach when we still hold the original content for this request.
+      lastUserImages = extractImagesFromContent(pendingUserContent);
     }
-  } else if (pendingUser) {
+  } else if (pendingUser || currentImages.length > 0) {
     lastUserText = pendingUser;
+    lastUserImages = currentImages;
   } else if (pairs.length > 0 && trailingToolResults.length === 0) {
     const last = pairs.pop()!;
     lastUserText = last.userText;
@@ -1606,6 +1789,7 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   return {
     systemPrompt,
     userText: lastUserText,
+    images: lastUserImages,
     turns: pairs,
     toolResults: trailingToolResults,
   };
@@ -1655,6 +1839,7 @@ function buildCursorRequest(
   conversationId: string,
   checkpoint: Uint8Array | null,
   existingBlobStore?: Map<string, Uint8Array>,
+  images: ExtractedImage[] = [],
 ): CursorRequestPayload {
   const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
 
@@ -1704,9 +1889,34 @@ function buildCursorRequest(
     });
   }
 
+  const selectedImages = images.map((image) => {
+    const blobId = new Uint8Array(createHash("sha256").update(image.bytes).digest());
+    const blobIdHex = Buffer.from(blobId).toString("hex");
+    blobStore.set(blobIdHex, image.bytes);
+    return create(SelectedImageSchema, {
+      uuid: crypto.randomUUID(),
+      path: image.filename,
+      mimeType: image.mimeType,
+      dataOrBlobId: {
+        case: "blobIdWithData",
+        value: create(SelectedImage_BlobIdWithDataSchema, {
+          blobId,
+          data: image.bytes,
+        }),
+      },
+    });
+  });
+
   const userMessage = create(UserMessageSchema, {
     text: userText,
     messageId: crypto.randomUUID(),
+    ...(selectedImages.length > 0
+      ? {
+          selectedContext: create(SelectedContextSchema, {
+            selectedImages,
+          }),
+        }
+      : {}),
   });
 
   // Store the user message protobuf in blobStore so Cursor can look it up via getBlob.
@@ -1714,6 +1924,14 @@ function buildCursorRequest(
   const userMsgBytes = toBinary(UserMessageSchema, userMessage);
   const userMsgBlobId = Buffer.from(userMsgBytes).toString("hex");
   blobStore.set(userMsgBlobId, userMsgBytes);
+
+  if (selectedImages.length > 0) {
+    log.info(
+      `[proxy] attached ${selectedImages.length} image(s) to UserMessage (${selectedImages
+        .map((img) => `${img.path}:${img.mimeType}`)
+        .join(", ")})`,
+    );
+  }
 
   const action = create(ConversationActionSchema, {
     action: {
@@ -2539,6 +2757,8 @@ interface RetryContext {
   selection: CursorModelSelection;
   systemPrompt: string;
   effectiveUserText: string;
+  /** Images from the originating user turn — preserved across Run rebuilds. */
+  images?: ExtractedImage[];
   mcpTools: McpToolDefinition[];
   /** Consecutive internal stall recoveries without forward progress (reset on progress). */
   stallRecoveryCount: number;
@@ -3276,6 +3496,7 @@ function createBridgeStreamResponse(
                 retryCtx.stored.conversationId,
                 retryCtx.stored.checkpoint,
                 retryCtx.stored.blobStore,
+                // Images already live in the checkpoint; don't re-attach on stall rebuild.
               );
               freshPayload.mcpTools = retryCtx.mcpTools;
               liveAccessToken = retryCtx.accessToken;
@@ -3345,6 +3566,7 @@ function createBridgeStreamResponse(
               retryCtx.stored.conversationId,
               null, // no checkpoint
               retryCtx.stored.blobStore,
+              retryCtx.images ?? [],
             );
             freshPayload.mcpTools = retryCtx.mcpTools;
             liveAccessToken = retryCtx.accessToken;
@@ -3412,6 +3634,7 @@ function createBridgeStreamResponse(
                   retryCtx.stored.conversationId,
                   null, // no checkpoint
                   retryCtx.stored.blobStore,
+                  retryCtx.images ?? [],
                 );
                 freshPayload.mcpTools = retryCtx.mcpTools;
                 effectiveRequestBytes = freshPayload.requestBytes;
