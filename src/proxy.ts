@@ -2727,6 +2727,8 @@ function createBridgeStreamResponse(
   let stallWaitUserNoticeEmittedThisResponse = false;
   /** Stall recovery schedules a backoff before restarting the bridge; abort must clear it. */
   let stallRecoveryBackoffTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Debounce timer for collecting multiple tool calls before finishing the stream. */
+  let toolCallDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 
   const abortFromClient = (reason: string) => {
     // Distinguish user interrupt from OpenCode's normal abort-after-tool_calls.
@@ -2747,6 +2749,10 @@ function createBridgeStreamResponse(
     if (stallRecoveryBackoffTimer !== undefined) {
       clearTimeout(stallRecoveryBackoffTimer);
       stallRecoveryBackoffTimer = undefined;
+    }
+    if (toolCallDebounceTimer !== undefined) {
+      clearTimeout(toolCallDebounceTimer);
+      toolCallDebounceTimer = undefined;
     }
     closed = true;
     cleanupCurrentAttempt();
@@ -2911,45 +2917,74 @@ function createBridgeStreamResponse(
                     if (content) sendSSE(makeChunk({ content }));
                   }
                 },
-                // onMcpExec — the model wants to execute a tool.
-                (exec) => {
-                  if (toolsDisabled) {
-                    // Defense in depth: summary/compact must never emit tool_calls SSE.
-                    log.warn(
-                      `[proxy] dropping tool_calls emission during summary: ${exec.toolName}`,
-                    );
-                    return;
-                  }
-                  markProgress();
-                  state.pendingExecs.push(exec);
-                  mcpExecReceived = true;
-                  anyContentSent = true;
-                  resetStallRecovery();
+                  // onMcpExec — the model wants to execute a tool.
+                  (exec) => {
+                    if (toolsDisabled) {
+                      // Defense in depth: summary/compact must never emit tool_calls SSE.
+                      log.warn(
+                        `[proxy] dropping tool_calls emission during summary: ${exec.toolName}`,
+                      );
+                      return;
+                    }
+                    markProgress();
+                    state.pendingExecs.push(exec);
+                    mcpExecReceived = true;
+                    anyContentSent = true;
+                    resetStallRecovery();
 
-                  const flushed = tagFilter.flush();
-                  if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-                  if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+                    const flushed = tagFilter.flush();
+                    if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+                    if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
 
-                  const toolCallIndex = state.toolCallIndex++;
-                  sendSSE(makeChunk({
-                    tool_calls: [{
-                      index: toolCallIndex,
-                      id: exec.toolCallId,
-                      type: "function",
-                      function: {
-                        name: exec.toolName,
-                        arguments: exec.decodedArgs,
-                      },
-                    }],
-                  }));
+                    const toolCallIndex = state.toolCallIndex++;
+                    sendSSE(makeChunk({
+                      tool_calls: [{
+                        index: toolCallIndex,
+                        id: exec.toolCallId,
+                        type: "function",
+                        function: {
+                          name: exec.toolName,
+                          arguments: exec.decodedArgs,
+                        },
+                      }],
+                    }));
 
-                  // Keep the bridge alive for tool result continuation.
-                  // Deferred to onClose so multiple tool calls in the same
-                  // turn are all collected before OpenCode starts executing
-                  // them.  Previously finishStream("tool_calls") ran here
-                  // after the first exec, which closed the SSE stream and
-                  // dropped any subsequent tool calls the model emitted.
-                },
+                    // Debounce: wait 500ms after the LAST tool call before
+                    // parking the bridge and finishing the stream.  When the
+                    // model emits multiple tool calls in quick succession
+                    // they are all collected first; when it emits tool calls
+                    // then sits in reasoning, the debounce fires and
+                    // OpenCode can start executing without waiting forever.
+                    if (toolCallDebounceTimer !== undefined) {
+                      clearTimeout(toolCallDebounceTimer);
+                    }
+                    toolCallDebounceTimer = setTimeout(() => {
+                      toolCallDebounceTimer = undefined;
+                      const attached = setActiveBridge(bridgeKey, {
+                        bridge: attemptBridge,
+                        heartbeatTimer: attemptHeartbeat,
+                        blobStore: attemptBlobStore,
+                        mcpTools: attemptMcpTools,
+                        pendingExecs: state.pendingExecs,
+                        lastAccessMs: Date.now(),
+                        ...(retryCtx && liveAccessToken && liveRequestBytes
+                          ? {
+                            resumeRetryCtx: retryCtx,
+                            accessToken: liveAccessToken,
+                            requestBytes: liveRequestBytes,
+                          }
+                          : {}),
+                      });
+                      if (!attached) {
+                        if (!isTitleGenStream) {
+                          sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
+                        }
+                        finishStream("stop");
+                        return;
+                      }
+                      finishStream("tool_calls");
+                    }, 500);
+                  },
                 (checkpointBytes) => {
                   const stored = conversationStates.get(convKey);
                   if (stored) {
@@ -3283,9 +3318,12 @@ function createBridgeStreamResponse(
             deleteActiveBridge(bridgeKey);
           } else {
             // Bridge closed after model finished a tool-calling turn.
-            // Park the bridge so OpenCode can send mcpResults and we can
-            // resume.  When the bridge died (code ≠ 0) or was already
-            // parked by a retry/stall recovery, detach and error.
+            // Clear the debounce (if it hasn't fired yet) and park the bridge
+            // so OpenCode can execute the tools and return mcpResults.
+            if (toolCallDebounceTimer !== undefined) {
+              clearTimeout(toolCallDebounceTimer);
+              toolCallDebounceTimer = undefined;
+            }
             if (code === 0 && currentAttemptIsActive) {
               const attached = setActiveBridge(bridgeKey, {
                 bridge: attemptBridge,
