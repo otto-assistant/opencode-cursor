@@ -2944,33 +2944,11 @@ function createBridgeStreamResponse(
                   }));
 
                   // Keep the bridge alive for tool result continuation.
-                  const attached = setActiveBridge(bridgeKey, {
-                    bridge: attemptBridge,
-                    heartbeatTimer: attemptHeartbeat,
-                    blobStore: attemptBlobStore,
-                    mcpTools: attemptMcpTools,
-                    pendingExecs: state.pendingExecs,
-                    lastAccessMs: Date.now(),
-                    ...(retryCtx && liveAccessToken && liveRequestBytes
-                      ? {
-                        resumeRetryCtx: retryCtx,
-                        accessToken: liveAccessToken,
-                        requestBytes: liveRequestBytes,
-                      }
-                      : {}),
-                  });
-                  if (!attached) {
-                    if (!isTitleGenStream) {
-                      sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
-                    }
-                    finishStream("stop");
-                    return;
-                  }
-
-                  // Always emit usage before [DONE]. OpenCode overwrites the
-                  // assistant message token meter per step; omitting usage on
-                  // tool_calls finishes zeros out context % mid-loop.
-                  finishStream("tool_calls");
+                  // Deferred to onClose so multiple tool calls in the same
+                  // turn are all collected before OpenCode starts executing
+                  // them.  Previously finishStream("tool_calls") ran here
+                  // after the first exec, which closed the SSE stream and
+                  // dropped any subsequent tool calls the model emitted.
                 },
                 (checkpointBytes) => {
                   const stored = conversationStates.get(convKey);
@@ -3304,18 +3282,49 @@ function createBridgeStreamResponse(
             attemptBridge.kill();
             deleteActiveBridge(bridgeKey);
           } else {
-            // If a bridge closes while waiting for tool-results continuation,
-            // always detach it from activeBridges to avoid stale saturation.
-            if (currentAttemptIsActive) {
-              deleteActiveBridge(bridgeKey);
-            }
-            if (code !== 0) {
-              // Bridge died while tool calls are pending (timeout, crash, etc.).
-              // Suppress for title-gen to avoid polluting Discord thread names.
-              if (!isTitleGenStream) {
-                sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
+            // Bridge closed after model finished a tool-calling turn.
+            // Park the bridge so OpenCode can send mcpResults and we can
+            // resume.  When the bridge died (code ≠ 0) or was already
+            // parked by a retry/stall recovery, detach and error.
+            if (code === 0 && currentAttemptIsActive) {
+              const attached = setActiveBridge(bridgeKey, {
+                bridge: attemptBridge,
+                heartbeatTimer: attemptHeartbeat,
+                blobStore: attemptBlobStore,
+                mcpTools: attemptMcpTools,
+                pendingExecs: state.pendingExecs,
+                lastAccessMs: Date.now(),
+                ...(retryCtx && liveAccessToken && liveRequestBytes
+                  ? {
+                    resumeRetryCtx: retryCtx,
+                    accessToken: liveAccessToken,
+                    requestBytes: liveRequestBytes,
+                  }
+                  : {}),
+              });
+              if (!attached) {
+                if (!isTitleGenStream) {
+                  sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
+                }
+                finishStream("stop");
+                clearInterval(attemptHeartbeat);
+                attemptBridge.kill();
+              } else {
+                finishStream("tool_calls");
               }
-              finishStream("stop");
+            } else {
+              // Bridge died or was already parked — detach and signal error.
+              if (currentAttemptIsActive) {
+                deleteActiveBridge(bridgeKey);
+              }
+              if (code !== 0) {
+                if (!isTitleGenStream) {
+                  sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
+                }
+                finishStream("stop");
+                clearInterval(attemptHeartbeat);
+                attemptBridge.kill();
+              }
             }
           }
         });
