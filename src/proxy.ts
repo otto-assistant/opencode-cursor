@@ -895,19 +895,15 @@ export async function startProxy(
 
             // Serialize per-conversation requests to prevent race conditions
             // that cause "Blob not found" errors from concurrent state mutations.
-            // Pass req.signal so cancelled queue waiters never take the lock and
-            // block later real turns (common OpenCode multi-message queue failure).
+            // Intentionally does NOT pass req.signal: like v0.1.39 the mutex
+            // waits until released so the queued message is not lost. Passing
+            // req.signal (added in 59a2cf9, v0.1.40) caused OpenCode's HTTP
+            // timeout to abort the waiter and return 499, making the queued
+            // user message silently disappear ("running turn was stopped").
             const convKey = deriveConversationKey(body);
             const mutex = getOrCreateMutex(convKey);
             let acquired: () => void;
-            try {
-              acquired = await mutex.acquire(req.signal);
-            } catch (err) {
-              if (isAbortError(err) || req.signal.aborted) {
-                return new Response(null, { status: 499, statusText: "Client Closed Request" });
-              }
-              throw err;
-            }
+            acquired = await mutex.acquire();
             if (req.signal.aborted) {
               acquired();
               return new Response(null, { status: 499, statusText: "Client Closed Request" });
