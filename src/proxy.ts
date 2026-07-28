@@ -2395,9 +2395,11 @@ export function hasUserSteerAfterTools(messages: OpenAIMessage[]): boolean {
 }
 
 const INTERRUPT_STEER_PREFIX =
-  "[User interrupted the previous turn. Do not continue the interrupted work unless the latest message asks you to. Follow the latest user message below.]";
+  "Please follow this new instruction:";
 
-/** Frame a follow-up so Cursor treats it as a steer, not a bare cancel/resume. */
+/** Frame a follow-up so Cursor treats it as a steer, not a bare cancel/resume.
+ *  Kept natural — the previous "[User interrupted the previous turn...]" prefix
+ *  made the model hallucinate "previous run was interrupted" responses. */
 export function buildInterruptSteerUserText(userText: string): string {
   return `${INTERRUPT_STEER_PREFIX}\n\n${userText}`;
 }

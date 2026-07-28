@@ -2501,8 +2501,12 @@ async function testInterruptSteerHelpers() {
 
   const framed = proxy.buildInterruptSteerUserText("stop, do this instead");
   assert(
-    framed.includes("User interrupted the previous turn"),
-    "Steer framing must mention interruption",
+    framed.includes("new instruction"),
+    "Steer framing must use natural prefix (no technical 'interrupted' jargon)",
+  );
+  assert(
+    !framed.includes("interrupted the previous turn"),
+    "Steer framing must NOT use technical 'interrupted' prefix (causes hallucinations)",
   );
   assert(
     framed.includes("stop, do this instead"),
@@ -2720,8 +2724,8 @@ async function testClientAbortReleasesMutexForSteer(
   const steeredTexts = backend.getRunUserTexts().filter((t) => t.includes("stop, answer briefly instead"));
   assert(steeredTexts.length >= 1, "Steer Run must include the interrupt user text");
   assert(
-    steeredTexts.some((t) => t.includes("User interrupted the previous turn")),
-    "Steer Run must frame the interrupt so the model follows the new message",
+    steeredTexts.some((t) => t.includes("new instruction")),
+    "Steer Run must use natural prefix so the model follows the new message",
   );
 
   backend.setRunMode("immediate-close");
