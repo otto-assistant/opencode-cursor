@@ -2560,6 +2560,81 @@ async function testLongToolBridgeTtlAndContinuation() {
   console.log("[test] Long-tool bridge TTL and continuation OK");
 }
 
+async function testAwaitingToolResultsBridgeSurvivesEviction() {
+  console.log("[test] Testing awaiting-tool bridges survive eviction and admission culls...");
+  const proxy = await import("../src/proxy");
+  const hooks = proxy.__bridgeEvictionTestHooks;
+
+  const makeFakeActive = (pendingExecs: number, lastAccessMs: number) => {
+    const heartbeatTimer = setInterval(() => undefined, 60_000);
+    return {
+      bridge: { alive: false, write: () => undefined, kill: () => undefined } as never,
+      heartbeatTimer,
+      blobStore: new Map(),
+      mcpTools: [],
+      pendingExecs: Array.from({ length: pendingExecs }, (_, i) => ({
+        execId: `e${i}`,
+        execMsgId: i,
+        toolCallId: `call_${i}`,
+        cursorToolCallId: `cur_${i}`,
+        toolName: "bash",
+        decodedArgs: "{}",
+      })),
+      lastAccessMs,
+    };
+  };
+
+  const cleanup = (key: string) => {
+    const active = hooks.activeBridges.get(key);
+    if (active) clearInterval(active.heartbeatTimer);
+    hooks.activeBridges.delete(key);
+  };
+
+  const awaitingKey = "test-awaiting-bridge";
+  const idleKey = "test-idle-bridge";
+  const staleMs = Date.now() - 365 * 24 * 60 * 60 * 1000; // ancient: past any TTL
+  try {
+    // 1) A bridge awaiting tool results must survive TTL eviction even when ancient.
+    hooks.activeBridges.set(awaitingKey, makeFakeActive(1, staleMs) as never);
+    assert(
+      hooks.isAwaitingToolResults(hooks.activeBridges.get(awaitingKey) as never),
+      "Bridge with pendingExecs must be awaiting tool results",
+    );
+    hooks.evictStaleActiveBridges();
+    assert(
+      hooks.activeBridges.has(awaitingKey),
+      "Awaiting bridge must NOT be evicted by TTL sweep (regression: 13d0164 removed the exemption)",
+    );
+
+    // 2) A bridge with no pending execs is still reaped normally.
+    hooks.activeBridges.set(idleKey, makeFakeActive(0, staleMs) as never);
+    hooks.evictStaleActiveBridges();
+    assert(
+      !hooks.activeBridges.has(idleKey),
+      "Non-awaiting ancient bridge must be evicted by TTL sweep",
+    );
+
+    // 3) Admission culls must skip awaiting bridges even when they are the oldest.
+    hooks.activeBridges.set(awaitingKey, makeFakeActive(2, staleMs) as never);
+    // Idle bridge is older than the 30s admission-cull threshold but not ancient.
+    hooks.activeBridges.set(idleKey, makeFakeActive(0, Date.now() - 60_000) as never);
+    const culled = hooks.cullOldestIdleBridgesForAdmission(1);
+    assert(
+      hooks.activeBridges.has(awaitingKey),
+      "Awaiting bridge must NOT be culled by admission pressure",
+    );
+    assertEqual(culled, 1, "Exactly one non-awaiting bridge should be culled");
+    assert(
+      !hooks.activeBridges.has(idleKey),
+      "Non-awaiting bridge should be culled under admission pressure",
+    );
+  } finally {
+    cleanup(awaitingKey);
+    cleanup(idleKey);
+  }
+  console.log("[test] Awaiting-tool bridge eviction/cull exemption OK");
+}
+
 async function testClientAbortReleasesMutexForSteer(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -2697,12 +2772,13 @@ async function main() {
     await testComputeUsageFallback(modules);
     await testInterruptSteerHelpers();
     await testLongToolBridgeTtlAndContinuation();
+    await testAwaitingToolResultsBridgeSurvivesEviction();
     await testClientAbortReleasesMutexForSteer(modules, backend);
     console.log("\n✓ All smoke tests passed");
-    process.exitCode = 0;
+    process.exit(0);
   } catch (err) {
     console.error("\n✗ Smoke test failed:", err);
-    process.exitCode = 1;
+    process.exit(1);
   } finally {
     modules.stopProxy();
     await backend.close();

@@ -221,6 +221,15 @@ const ACTIVE_BRIDGE_TTL_MS = Number(
 export function getActiveBridgeTtlMs(): number {
   return ACTIVE_BRIDGE_TTL_MS;
 }
+
+/** Test-only hooks for bridge eviction/cull regression tests. */
+export const __bridgeEvictionTestHooks = {
+  activeBridges,
+  evictStaleActiveBridges: () => evictStaleActiveBridges(),
+  cullOldestIdleBridgesForAdmission: (maxBridges: number) =>
+    cullOldestIdleBridgesForAdmission(maxBridges),
+  isAwaitingToolResults: (active: ActiveBridge) => isAwaitingToolResults(active),
+};
 const ADMISSION_BRIDGE_CULL_IDLE_MS = Number(process.env.OPENCODE_CURSOR_ADMISSION_BRIDGE_CULL_IDLE_MS ?? 30 * 1000);
 const MAX_ACTIVE_BRIDGES = 24;
 const MAX_CONVERSATION_BLOB_BYTES = Number(process.env.OPENCODE_CURSOR_MAX_CONV_BLOB_BYTES ?? 64 * 1024 * 1024);
@@ -409,14 +418,19 @@ function evictStaleMutexes(): number {
   return evicted;
 }
 
+/** True while OpenCode still owes tool results for this paused bridge. */
+function isAwaitingToolResults(active: ActiveBridge): boolean {
+  return active.pendingExecs.length > 0;
+}
+
 function evictStaleActiveBridges(): number {
   let evicted = 0;
   const now = Date.now();
   for (const [bridgeKey, active] of activeBridges) {
-    // Active bridges are always paused awaiting MCP tool results (setActiveBridge
-    // is only called with pending execs). Only reap after ACTIVE_BRIDGE_TTL_MS so
-    // long shells/builds can finish; an abandoned bridge would otherwise keep
-    // its heartbeat + h2 subprocess alive indefinitely.
+    // Never kill bridges waiting on MCP/tool round-trips — Discord/OpenCode
+    // tool latency routinely exceeds the idle TTL, and eviction makes resume
+    // fall back to a fresh Run that drops mcpResult protocol state.
+    if (isAwaitingToolResults(active)) continue;
     const idleMs = now - active.lastAccessMs;
     if (idleMs > ACTIVE_BRIDGE_TTL_MS) {
       log.warn(
@@ -435,9 +449,9 @@ function cullOldestIdleBridgesForAdmission(maxBridges: number): number {
   const now = Date.now();
   const candidates: Array<[string, ActiveBridge]> = [];
   for (const [key, active] of activeBridges) {
-    // Under admission pressure, sacrifice the oldest paused tool bridges. Resume
-    // then falls back to a fresh Run with the persisted checkpoint (context is
-    // preserved), which is acceptable degradation when the proxy is saturated.
+    // Never cull bridges waiting on MCP/tool round-trips — the resume would
+    // fall back to a fresh Run that drops mcpResult protocol state.
+    if (isAwaitingToolResults(active)) continue;
     if (now - active.lastAccessMs >= ADMISSION_BRIDGE_CULL_IDLE_MS) {
       candidates.push([key, active]);
     }
@@ -3377,9 +3391,9 @@ function startBridge(
         rpcPath: "/agent.v1.AgentService/Run",
       });
   bridge.write(frameConnectMessage(requestBytes));
-  // Heartbeats keep the H2 stream (and pooled subprocess) alive while a bridge
-  // is paused awaiting tool results. Eviction is driven by ACTIVE_BRIDGE_TTL_MS
-  // against the pause time, so the heartbeat must NOT bump lastAccessMs.
+  // Heartbeats keep the H2 stream alive. Bridges awaiting tool results are
+  // protected from eviction/culling by isAwaitingToolResults(), not by bumping
+  // lastAccessMs — which avoids holding JS references that can stall CI tests.
   const heartbeatTimer = setInterval(() => bridge.write(makeHeartbeatBytes()), 5_000);
   return { bridge, heartbeatTimer };
 }
