@@ -3337,23 +3337,23 @@ function appendToolResultsToContinuation(
   toolResults?: ToolResultInfo[],
 ): void {
   if (!toolResults || toolResults.length === 0) return;
-  parts.push("Tool results already provided:");
   for (const result of toolResults) {
+    const content = result.content.trim() || "(no output)";
     const truncated =
-      result.content.length > 4_000
-        ? `${result.content.slice(0, 4_000)}…`
-        : result.content;
-    parts.push(`- ${result.toolCallId || "tool"}: ${truncated}`);
+      content.length > 4_000
+        ? `${content.slice(0, 4_000)}…`
+        : content;
+    parts.push(truncated);
   }
 }
 
 /** User-facing continuation prompt used when a post-tool stream stalls and we
- *  rebuild a fresh Run from the stored checkpoint (mcpResults cannot be replayed). */
+ *  rebuild a fresh Run from the stored checkpoint (mcpResults cannot be replayed).
+ *  Kept natural — technical "[Internal stream recovery]" prefixes confused the
+ *  model into hallucinating "empty message" responses. */
 function buildPostToolStallContinuation(toolResults?: ToolResultInfo[]): string {
-  const parts = [
-    "[Internal stream recovery] The previous model stream stalled after tool results were delivered.",
-    "Continue your answer from the current conversation checkpoint.",
-    "Do not repeat tool calls that already succeeded unless necessary.",
+  const parts: string[] = [
+    "Continue from the current conversation checkpoint.",
   ];
   appendToolResultsToContinuation(parts, toolResults);
   return parts.join("\n");
@@ -3362,16 +3362,17 @@ function buildPostToolStallContinuation(toolResults?: ToolResultInfo[]): string 
 /**
  * Continuation when the parked tool bridge died/expired before OpenCode returned
  * results (typical after long shells/builds that outlive the old 5m TTL).
+ * Kept natural — the model must see tool output as a normal follow-up message,
+ * not as a technical recovery notice it can misread as an empty prompt.
  */
 export function buildPostToolBridgeLossContinuation(
   toolResults?: ToolResultInfo[],
 ): string {
-  const parts = [
-    "[Internal stream recovery] The previous tool-call bridge expired while tools were still running.",
-    "Tool results are provided below. Continue from the current conversation checkpoint.",
-    "Do not repeat tool calls that already succeeded unless necessary.",
-  ];
+  const parts: string[] = [];
   appendToolResultsToContinuation(parts, toolResults);
+  if (parts.length === 0) {
+    return "Continue from the current conversation checkpoint.";
+  }
   return parts.join("\n");
 }
 

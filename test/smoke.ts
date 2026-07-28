@@ -2546,16 +2546,20 @@ async function testLongToolBridgeTtlAndContinuation() {
     { toolCallId: "call_shell_1", content: "build finished successfully" },
   ]);
   assert(
-    continuation.includes("bridge expired while tools were still running"),
-    "Dead-bridge continuation must explain bridge loss during long tools",
-  );
-  assert(
     continuation.includes("build finished successfully"),
     "Dead-bridge continuation must include tool output",
   );
   assert(
-    continuation.includes("call_shell_1"),
-    "Dead-bridge continuation must include tool call id",
+    !continuation.includes("[Internal stream recovery]"),
+    "Dead-bridge continuation must NOT use technical recovery prefix (confuses model into empty-message hallucinations)",
+  );
+
+  const emptyContinuation = proxy.buildPostToolBridgeLossContinuation([
+    { toolCallId: "call_shell_2", content: "" },
+  ]);
+  assert(
+    emptyContinuation.includes("(no output)"),
+    "Empty tool output must be replaced with a placeholder",
   );
   console.log("[test] Long-tool bridge TTL and continuation OK");
 }
