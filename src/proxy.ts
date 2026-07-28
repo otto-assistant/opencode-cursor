@@ -1222,7 +1222,13 @@ async function doHandleChatCompletion(
   selectedModel?: CursorModelSelection,
   abortSignal?: AbortSignal,
 ): Promise<Response> {
-  const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
+  const parsed = parseMessages(body.messages);
+  const systemPrompt = parsed.systemPrompt;
+  // Treat whitespace-only user payloads as empty — Cursor models otherwise
+  // hallucinate "the user sent an empty message" and stop working.
+  const userText = parsed.userText.trim();
+  const turns = parsed.turns;
+  const toolResults = parsed.toolResults;
   const selection =
     selectedModel ?? literalCursorModelSelection(resolveProxyModelId(body.model));
   const modelId = selection.publicId;
@@ -1234,7 +1240,7 @@ async function doHandleChatCompletion(
     : (body.tools ?? []).filter((tool) => !shouldBlockTool(tool));
   const workspaceRoot = extractWorkspaceRoot(systemPrompt);
   log.info(
-    `[proxy] bridge model input=${body.model} resolved=${modelId} server=${selection.modelId} max=${selection.maxMode}${isSummary ? " summary=1" : ""}`,
+    `[proxy] bridge model input=${body.model} resolved=${modelId} server=${selection.modelId} max=${selection.maxMode}${isSummary ? " summary=1" : ""} userChars=${userText.length} tools=${toolResults.length}`,
   );
 
   if (!userText && toolResults.length === 0) {
@@ -1286,6 +1292,11 @@ async function doHandleChatCompletion(
 
   if (activeBridge && toolResults.length > 0 && !userSteeredAfterTools) {
     deleteActiveBridge(bridgeKey);
+    // Tool-result follow-ups are the normal agent loop, not an interrupt.
+    // Clear any abort flag left by OpenCode closing the previous SSE stream
+    // so the next user turn is not incorrectly framed as a steer.
+    const resumedState = conversationStates.get(convKey);
+    if (resumedState) resumedState.abortedTurn = false;
 
     if (activeBridge.bridge.alive) {
       // Resume the live bridge with tool results
@@ -1361,10 +1372,10 @@ async function doHandleChatCompletion(
   } else if (toolContinuationResume) {
     effectiveUserText = buildPostToolBridgeLossContinuation(toolResults);
     log.warn(
-      `[proxy] tool resume without live bridge — checkpoint continuation convKey=${convKey} tools=${toolResults.length}`,
+      `[proxy] tool resume without live bridge — checkpoint continuation convKey=${convKey} tools=${toolResults.length} userChars=${userText.length}`,
     );
   } else {
-    effectiveUserText = userText || "";
+    effectiveUserText = userText;
   }
 
   // For fresh conversations (no checkpoint), embed prior conversation turns
@@ -1397,6 +1408,30 @@ async function doHandleChatCompletion(
     log.info(
       `[proxy] interrupt steer framed convKey=${convKey} afterTools=${userSteeredAfterTools}`,
     );
+  }
+
+  // Belt-and-suspenders: never send an empty UserMessage to Cursor. Empty
+  // prompts reliably produce "user sent an empty message" hallucinations.
+  if (!effectiveUserText.trim()) {
+    if (toolResults.length > 0) {
+      effectiveUserText = buildPostToolBridgeLossContinuation(toolResults);
+      log.warn(
+        `[proxy] empty effectiveUserText recovered via tool continuation convKey=${convKey}`,
+      );
+    } else if (userText) {
+      effectiveUserText = userText;
+    } else {
+      release();
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: "No user message found",
+            type: "invalid_request_error",
+          },
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+    }
   }
 
   const payload = buildCursorRequest(
@@ -1464,10 +1499,20 @@ function extractWorkspaceRoot(systemPrompt: string): string | undefined {
   return undefined;
 }
 
-function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
+/**
+ * Parse OpenAI chat messages into Cursor request inputs.
+ *
+ * Critical invariant for tool loops: when the latest assistant message still
+ * has open `tool_calls` (results are trailing `tool` messages), keep that user
+ * text as `userText` and return ONLY those trailing tool results. Flushing the
+ * turn early made `userText` empty mid-loop; if the parked bridge was also
+ * missing, Cursor then received an empty/continuation UserMessage and models
+ * hallucinated "the user sent an empty message".
+ */
+export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
   const pairs: Array<{ userText: string; assistantText: string }> = [];
-  const toolResults: ToolResultInfo[] = [];
+  const trailingToolResults: ToolResultInfo[] = [];
 
   // Collect system messages
   const systemParts = messages
@@ -1477,14 +1522,14 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     systemPrompt = systemParts.join("\n");
   }
 
-  // Separate tool results from conversation turns.
   // OpenAI tool-call pattern interleaves assistant(tool_calls) → tool → assistant(text):
   //   user → assistant(tool_calls) → tool → assistant(text+tool_calls) → tool → assistant(text) → user
-  // We accumulate ALL assistant text after each user message until the next user message,
-  // so each turn pair captures the full assistant response across tool-call cycles.
+  // Accumulate assistant text after each user message, but do NOT close the turn
+  // while tool_calls are still unresolved.
   const nonSystem = messages.filter((m) => m.role !== "system");
   let pendingUser = "";
   let pendingAssistantTexts: string[] = [];
+  let openToolCallBatch = false;
 
   function flushPair() {
     if (pendingUser) {
@@ -1495,44 +1540,75 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     }
     pendingUser = "";
     pendingAssistantTexts = [];
+    openToolCallBatch = false;
   }
 
   for (const msg of nonSystem) {
     if (msg.role === "tool") {
-      toolResults.push({
-        toolCallId: msg.tool_call_id ?? "",
-        content: textContent(msg.content),
-      });
-    } else if (msg.role === "user") {
+      if (openToolCallBatch) {
+        trailingToolResults.push({
+          toolCallId: msg.tool_call_id ?? "",
+          content: textContent(msg.content),
+        });
+      }
+      continue;
+    }
+
+    if (msg.role === "user") {
       flushPair();
+      trailingToolResults.length = 0;
       pendingUser = textContent(msg.content);
-    } else if (msg.role === "assistant") {
+      continue;
+    }
+
+    if (msg.role === "assistant") {
       const text = textContent(msg.content);
+      const hasToolCalls =
+        Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
       if (text) {
         pendingAssistantTexts.push(text);
+      }
+      if (hasToolCalls) {
+        // New open batch — older tool results are already historical.
+        trailingToolResults.length = 0;
+        openToolCallBatch = true;
+      } else if (openToolCallBatch) {
+        // Assistant completed the tool loop without further tool_calls.
+        openToolCallBatch = false;
+        trailingToolResults.length = 0;
       }
     }
   }
 
-  // If accumulated assistant text for pending user, it's a completed turn
-  if (pendingUser && pendingAssistantTexts.length > 0) {
+  // Determine the current user message to send to Cursor
+  let lastUserText = "";
+  if (openToolCallBatch) {
+    // Mid tool-loop: preserve the user text and only the unresolved tool results.
+    lastUserText = pendingUser;
+  } else if (pendingUser && pendingAssistantTexts.length > 0) {
     pairs.push({
       userText: pendingUser,
       assistantText: pendingAssistantTexts.join("\n"),
     });
     pendingUser = "";
-  }
-
-  // Determine the current user message to send to Cursor
-  let lastUserText = "";
-  if (pendingUser) {
+    // Regeneration path: last completed turn without a newer user/tool payload.
+    if (pairs.length > 0 && trailingToolResults.length === 0) {
+      const last = pairs.pop()!;
+      lastUserText = last.userText;
+    }
+  } else if (pendingUser) {
     lastUserText = pendingUser;
-  } else if (pairs.length > 0 && toolResults.length === 0) {
+  } else if (pairs.length > 0 && trailingToolResults.length === 0) {
     const last = pairs.pop()!;
     lastUserText = last.userText;
   }
 
-  return { systemPrompt, userText: lastUserText, turns: pairs, toolResults };
+  return {
+    systemPrompt,
+    userText: lastUserText,
+    turns: pairs,
+    toolResults: trailingToolResults,
+  };
 }
 
 /** Convert OpenAI tool definitions to Cursor's MCP tool protobuf format. */
@@ -2702,6 +2778,10 @@ function createBridgeStreamResponse(
 
   let currentAttemptBridge: ReturnType<typeof spawnBridge> | BridgeHandle | undefined = bridge;
   let currentAttemptHeartbeat: NodeJS.Timeout | undefined = heartbeatTimer;
+  // Mutable so post-tool checkpoint rebuilds / connect-error retries update these,
+  // and abort-time bridge parking can attach the latest resume context.
+  let liveAccessToken = accessToken;
+  let liveRequestBytes = requestBytes;
 
   const cleanupCurrentAttempt = () => {
     if (!currentAttemptBridge) return;
@@ -2729,8 +2809,70 @@ function createBridgeStreamResponse(
   let stallRecoveryBackoffTimer: ReturnType<typeof setTimeout> | undefined;
   /** Debounce timer for collecting multiple tool calls before finishing the stream. */
   let toolCallDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * Snapshot of the in-flight attempt so abort-during-debounce can still park
+   * the bridge after tool_calls SSE was already sent. OpenCode often aborts the
+   * HTTP request as soon as it sees tool_calls, before our 500ms debounce fires.
+   */
+  let parkableToolAttempt:
+    | {
+        bridge: ReturnType<typeof spawnBridge> | BridgeHandle;
+        heartbeatTimer: NodeJS.Timeout;
+        blobStore: Map<string, Uint8Array>;
+        mcpTools: McpToolDefinition[];
+        pendingExecs: PendingExec[];
+      }
+    | undefined;
+
+  const parkBridgeForToolCalls = (reason: string): boolean => {
+    if (!parkableToolAttempt || parkableToolAttempt.pendingExecs.length === 0) {
+      return false;
+    }
+    if (toolCallDebounceTimer !== undefined) {
+      clearTimeout(toolCallDebounceTimer);
+      toolCallDebounceTimer = undefined;
+    }
+    const attempt = parkableToolAttempt;
+    const attached = setActiveBridge(bridgeKey, {
+      bridge: attempt.bridge,
+      heartbeatTimer: attempt.heartbeatTimer,
+      blobStore: attempt.blobStore,
+      mcpTools: attempt.mcpTools,
+      pendingExecs: [...attempt.pendingExecs],
+      lastAccessMs: Date.now(),
+      ...(retryCtx && liveAccessToken && liveRequestBytes
+        ? {
+            resumeRetryCtx: retryCtx,
+            accessToken: liveAccessToken,
+            requestBytes: liveRequestBytes,
+          }
+        : {}),
+    });
+    if (!attached) {
+      log.warn(
+        `[proxy] failed to park bridge for tool_calls (${reason}) bridgeKey=${bridgeKey}`,
+      );
+      return false;
+    }
+    log.info(
+      `[proxy] parked bridge for tool_calls (${reason}) bridgeKey=${bridgeKey} pending=${attempt.pendingExecs.length}`,
+    );
+    // Once parked, this attempt must not be killed by abort cleanup.
+    currentAttemptBridge = undefined;
+    currentAttemptHeartbeat = undefined;
+    parkableToolAttempt = undefined;
+    return true;
+  };
 
   const abortFromClient = (reason: string) => {
+    // If tool_calls were already streamed but the debounce has not parked the
+    // bridge yet, park now. Otherwise OpenCode's tool-result follow-up finds no
+    // live bridge and we fall back to a continuation UserMessage — which, with
+    // empty parsed userText, previously looked like an empty user prompt.
+    if (!finishedNaturally && parkBridgeForToolCalls(`abort:${reason}`)) {
+      finishedNaturally = true;
+    }
+
     // Distinguish user interrupt from OpenCode's normal abort-after-tool_calls.
     if (!finishedNaturally && !interruptMarked) {
       interruptMarked = true;
@@ -2773,9 +2915,6 @@ function createBridgeStreamResponse(
     },
     start(controller) {
       const encoder = new TextEncoder();
-      // Mutable so post-tool checkpoint rebuilds update connect-error / stall retries.
-      let liveAccessToken = accessToken;
-      let liveRequestBytes = requestBytes;
       const sendSSE = (data: object) => {
         if (closed) return;
         try {
@@ -2931,6 +3070,13 @@ function createBridgeStreamResponse(
                     mcpExecReceived = true;
                     anyContentSent = true;
                     resetStallRecovery();
+                    parkableToolAttempt = {
+                      bridge: attemptBridge,
+                      heartbeatTimer: attemptHeartbeat,
+                      blobStore: attemptBlobStore,
+                      mcpTools: attemptMcpTools,
+                      pendingExecs: state.pendingExecs,
+                    };
 
                     const flushed = tagFilter.flush();
                     if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
@@ -2955,27 +3101,15 @@ function createBridgeStreamResponse(
                     // they are all collected first; when it emits tool calls
                     // then sits in reasoning, the debounce fires and
                     // OpenCode can start executing without waiting forever.
+                    // If OpenCode aborts during this window, abortFromClient
+                    // parks via parkBridgeForToolCalls instead of killing the bridge.
                     if (toolCallDebounceTimer !== undefined) {
                       clearTimeout(toolCallDebounceTimer);
                     }
                     toolCallDebounceTimer = setTimeout(() => {
                       toolCallDebounceTimer = undefined;
-                      const attached = setActiveBridge(bridgeKey, {
-                        bridge: attemptBridge,
-                        heartbeatTimer: attemptHeartbeat,
-                        blobStore: attemptBlobStore,
-                        mcpTools: attemptMcpTools,
-                        pendingExecs: state.pendingExecs,
-                        lastAccessMs: Date.now(),
-                        ...(retryCtx && liveAccessToken && liveRequestBytes
-                          ? {
-                            resumeRetryCtx: retryCtx,
-                            accessToken: liveAccessToken,
-                            requestBytes: liveRequestBytes,
-                          }
-                          : {}),
-                      });
-                      if (!attached) {
+                      if (closed) return;
+                      if (!parkBridgeForToolCalls("debounce")) {
                         if (!isTitleGenStream) {
                           sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
                         }
@@ -3318,29 +3452,20 @@ function createBridgeStreamResponse(
             deleteActiveBridge(bridgeKey);
           } else {
             // Bridge closed after model finished a tool-calling turn.
-            // Clear the debounce (if it hasn't fired yet) and park the bridge
-            // so OpenCode can execute the tools and return mcpResults.
-            if (toolCallDebounceTimer !== undefined) {
-              clearTimeout(toolCallDebounceTimer);
-              toolCallDebounceTimer = undefined;
+            // Park (or no-op if debounce/abort already parked) so OpenCode can
+            // execute tools and return mcpResults.
+            if (closed || finishedNaturally) {
+              return;
             }
-            if (code === 0 && currentAttemptIsActive) {
-              const attached = setActiveBridge(bridgeKey, {
+            if (code === 0) {
+              parkableToolAttempt = {
                 bridge: attemptBridge,
                 heartbeatTimer: attemptHeartbeat,
                 blobStore: attemptBlobStore,
                 mcpTools: attemptMcpTools,
                 pendingExecs: state.pendingExecs,
-                lastAccessMs: Date.now(),
-                ...(retryCtx && liveAccessToken && liveRequestBytes
-                  ? {
-                    resumeRetryCtx: retryCtx,
-                    accessToken: liveAccessToken,
-                    requestBytes: liveRequestBytes,
-                  }
-                  : {}),
-              });
-              if (!attached) {
+              };
+              if (!parkBridgeForToolCalls("bridge-close")) {
                 if (!isTitleGenStream) {
                   sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
                 }
@@ -3351,18 +3476,16 @@ function createBridgeStreamResponse(
                 finishStream("tool_calls");
               }
             } else {
-              // Bridge died or was already parked — detach and signal error.
+              // Bridge died before we could hand tool calls to OpenCode.
               if (currentAttemptIsActive) {
                 deleteActiveBridge(bridgeKey);
               }
-              if (code !== 0) {
-                if (!isTitleGenStream) {
-                  sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
-                }
-                finishStream("stop");
-                clearInterval(attemptHeartbeat);
-                attemptBridge.kill();
+              if (!isTitleGenStream) {
+                sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
               }
+              finishStream("stop");
+              clearInterval(attemptHeartbeat);
+              attemptBridge.kill();
             }
           }
         });
