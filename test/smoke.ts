@@ -2536,6 +2536,89 @@ async function testInterruptSteerHelpers() {
   console.log("[test] Interrupt/steer helpers OK");
 }
 
+async function testParseMessagesPreservesUserDuringToolLoop() {
+  console.log("[test] Testing parseMessages mid-tool-loop userText preservation...");
+  const proxy = await import("../src/proxy");
+
+  // Regression: assistant text + tool_calls used to flush the turn early, leaving
+  // userText="" on the tool-result follow-up. Cursor then saw an empty UserMessage
+  // (when the parked bridge was also missing) and hallucinated "empty message".
+  const midLoop = proxy.parseMessages([
+    { role: "system", content: "You are opencode." },
+    { role: "user", content: "Create todos then run pwd" },
+    {
+      role: "assistant",
+      content: "Creating the two todos, then running pwd.",
+      tool_calls: [
+        { id: "call_todo", type: "function", function: { name: "todowrite", arguments: "{}" } },
+        { id: "call_bash", type: "function", function: { name: "bash", arguments: "{\"command\":\"pwd\"}" } },
+      ],
+    },
+    { role: "tool", content: "todos updated", tool_call_id: "call_todo" },
+    { role: "tool", content: "/workspace", tool_call_id: "call_bash" },
+  ]);
+  assertEqual(
+    midLoop.userText,
+    "Create todos then run pwd",
+    "Mid-tool-loop must preserve the original user text (not empty)",
+  );
+  assertEqual(midLoop.turns.length, 0, "Open tool loop must not flush into completed turns");
+  assertEqual(midLoop.toolResults.length, 2, "Only trailing unresolved tool results");
+  assertEqual(midLoop.toolResults[0]?.toolCallId, "call_todo", "First trailing tool id");
+  assertEqual(midLoop.toolResults[1]?.content, "/workspace", "Second trailing tool content");
+
+  // Completed tool loop + final assistant: no trailing tools, regeneration pops last user.
+  const completed = proxy.parseMessages([
+    { role: "user", content: "do work" },
+    {
+      role: "assistant",
+      content: "Working...",
+      tool_calls: [{ id: "c1", type: "function", function: { name: "bash", arguments: "{}" } }],
+    },
+    { role: "tool", content: "ok", tool_call_id: "c1" },
+    { role: "assistant", content: "Done." },
+  ]);
+  assertEqual(completed.toolResults.length, 0, "Completed loop has no trailing tool results");
+  assertEqual(completed.userText, "do work", "Completed history regenerates last user text");
+
+  // Multi-round tools: only the latest open batch is trailing.
+  const multiRound = proxy.parseMessages([
+    { role: "user", content: "inspect repo" },
+    {
+      role: "assistant",
+      content: "First lookup",
+      tool_calls: [{ id: "c1", type: "function", function: { name: "bash", arguments: "{}" } }],
+    },
+    { role: "tool", content: "old result", tool_call_id: "c1" },
+    {
+      role: "assistant",
+      content: "Second lookup",
+      tool_calls: [{ id: "c2", type: "function", function: { name: "read", arguments: "{}" } }],
+    },
+    { role: "tool", content: "new result", tool_call_id: "c2" },
+  ]);
+  assertEqual(multiRound.userText, "inspect repo", "Multi-round preserves user text");
+  assertEqual(multiRound.toolResults.length, 1, "Only latest open batch tool results");
+  assertEqual(multiRound.toolResults[0]?.content, "new result", "Latest tool result content");
+  assertEqual(multiRound.turns.length, 0, "Still-open loop is not a completed turn");
+
+  // Historical tools must not be treated as resumable after a new user steer.
+  const steered = proxy.parseMessages([
+    { role: "user", content: "do work" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "c1", type: "function", function: { name: "bash", arguments: "{}" } }],
+    },
+    { role: "tool", content: "partial", tool_call_id: "c1" },
+    { role: "user", content: "stop, do this instead" },
+  ]);
+  assertEqual(steered.userText, "stop, do this instead", "Steer user text wins");
+  assertEqual(steered.toolResults.length, 0, "Steer must not resume historical tool results");
+
+  console.log("[test] parseMessages mid-tool-loop userText preservation OK");
+}
+
 async function testLongToolBridgeTtlAndContinuation() {
   console.log("[test] Testing long-tool bridge TTL and dead-bridge continuation...");
   const proxy = await import("../src/proxy");
@@ -2779,6 +2862,7 @@ async function main() {
     await testSummaryGenerationDetection(modules);
     await testComputeUsageFallback(modules);
     await testInterruptSteerHelpers();
+    await testParseMessagesPreservesUserDuringToolLoop();
     await testLongToolBridgeTtlAndContinuation();
     await testAwaitingToolResultsBridgeSurvivesEviction();
     await testClientAbortReleasesMutexForSteer(modules, backend);
