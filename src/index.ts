@@ -349,18 +349,21 @@ function buildProviderModel(
       npm: "@ai-sdk/openai-compatible",
     },
     name: id === DEFAULT_MODEL_ID ? `Default (${model.name})` : model.name,
+    // Cursor agent models accept image attachments (vision). OpenCode gates
+    // file/image parts client-side on these flags — leaving image:false made
+    // every Cursor model report "does not support Image input".
     capabilities: {
       temperature: true,
       reasoning:
         id === DEFAULT_MODEL_ID
           ? false
           : model.reasoning && Object.keys(model.variants).length > 0,
-      attachment: false,
+      attachment: true,
       toolcall: true,
       input: {
         text: true,
         audio: false,
-        image: false,
+        image: true,
         video: false,
         pdf: false,
       },
@@ -372,6 +375,10 @@ function buildProviderModel(
         pdf: false,
       },
       interleaved: false,
+    },
+    modalities: {
+      input: ["text", "image"],
+      output: ["text"],
     },
     cost: estimateModelCost(model.id),
     limit: {
@@ -526,6 +533,17 @@ function buildConfigModelEntries(
       // reasoning output and routing are handled by the local proxy.
       reasoning: false,
       tool_call: true,
+      // Required for OpenCode's static config path: without modalities.input
+      // including "image", attachments are stripped before they reach the proxy.
+      modalities: {
+        input: ["text", "image"],
+        output: ["text"],
+      },
+      capabilities: {
+        tools: true,
+        input: ["text", "image"],
+        output: ["text"],
+      },
       cost: estimateModelCost(model.id),
       limit: {
         context: contextWindow,
@@ -550,6 +568,15 @@ function buildConfigModelEntries(
       name: `Default (${defaultModel.name})`,
       reasoning: false,
       tool_call: true,
+      modalities: {
+        input: ["text", "image"],
+        output: ["text"],
+      },
+      capabilities: {
+        tools: true,
+        input: ["text", "image"],
+        output: ["text"],
+      },
       cost: estimateModelCost(defaultModel.id),
       limit: {
         context: contextWindow,
