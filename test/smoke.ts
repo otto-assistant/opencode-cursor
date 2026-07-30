@@ -2629,6 +2629,104 @@ async function testParseMessagesPreservesUserDuringToolLoop() {
   console.log("[test] parseMessages mid-tool-loop userText preservation OK");
 }
 
+async function testParseMessagesOrphanedToolResultsDoNotReplan() {
+  console.log("[test] Testing orphaned tool results (OpenCode drops assistant.tool_calls)...");
+  const proxy = await import("../src/proxy");
+
+  // Reproduction of the OpenCode↔Cursor re-plan loop:
+  // OpenCode history replay omits assistant.tool_calls but keeps role:tool
+  // (anomalyco/opencode#24090). Previously parseMessages returned toolResults=[]
+  // and regenerated the original userText, so the proxy killed the parked bridge
+  // and re-sent the same task — the agent restated its plan forever.
+  const orphaned = proxy.parseMessages([
+    { role: "system", content: "You are opencode." },
+    {
+      role: "user",
+      content: "Hide harness switcher when Claude is missing-cli/needs-login",
+    },
+    {
+      role: "assistant",
+      content:
+        "Приховаю перемикач harness, коли Claude Code у стані missing CLI / needs login.",
+      // tool_calls intentionally omitted — OpenCode replay bug
+    },
+    {
+      role: "tool",
+      content:
+        "Total: 2 In Progress: 1 Pending: 1 In Progress Hide harness switcher Pending Update tests",
+      tool_call_id: "call_todo",
+    },
+  ]);
+  assertEqual(
+    orphaned.toolResults.length,
+    1,
+    "Orphaned role:tool must still open a tool batch",
+  );
+  assertEqual(
+    orphaned.toolResults[0]?.toolCallId,
+    "call_todo",
+    "Orphaned tool id must be preserved",
+  );
+  assertEqual(
+    orphaned.userText,
+    "Hide harness switcher when Claude is missing-cli/needs-login",
+    "Orphaned mid-loop must preserve original user text",
+  );
+  assertEqual(
+    orphaned.turns.length,
+    0,
+    "Orphaned mid-loop must not flush into completed turns (would re-prompt the task)",
+  );
+
+  // Multi-round with every assistant missing tool_calls: only the latest
+  // orphaned batch is trailing (same invariant as normal multi-round).
+  const multiOrphaned = proxy.parseMessages([
+    { role: "user", content: "Hide harness switcher when Claude is missing-cli/needs-login" },
+    { role: "assistant", content: "Checking buildHarnessOptions." },
+    {
+      role: "tool",
+      content: "Found 14 matches in modelPickerData.ts",
+      tool_call_id: "call_grep",
+    },
+    { role: "assistant", content: "Приховую перемикач harness, коли Claude Code недоступний." },
+    {
+      role: "tool",
+      content: "Total: 2 In Progress: 1 Pending: 1",
+      tool_call_id: "call_todo2",
+    },
+  ]);
+  assertEqual(multiOrphaned.toolResults.length, 1, "Only latest orphaned batch");
+  assertEqual(
+    multiOrphaned.toolResults[0]?.toolCallId,
+    "call_todo2",
+    "Latest orphaned tool id",
+  );
+  assertEqual(
+    multiOrphaned.userText,
+    "Hide harness switcher when Claude is missing-cli/needs-login",
+    "Multi-round orphaned loop preserves user text",
+  );
+  assertEqual(multiOrphaned.turns.length, 0, "Multi-round orphaned stays mid-loop");
+
+  // Mixing: historical assistant kept tool_calls, latest lost them.
+  const mixed = proxy.parseMessages([
+    { role: "user", content: "inspect repo" },
+    {
+      role: "assistant",
+      content: "First lookup",
+      tool_calls: [{ id: "c1", type: "function", function: { name: "bash", arguments: "{}" } }],
+    },
+    { role: "tool", content: "old result", tool_call_id: "c1" },
+    { role: "assistant", content: "Second lookup without tool_calls field" },
+    { role: "tool", content: "new result", tool_call_id: "c2" },
+  ]);
+  assertEqual(mixed.toolResults.length, 1, "Mixed history keeps only latest orphaned batch");
+  assertEqual(mixed.toolResults[0]?.content, "new result", "Latest orphaned content");
+  assertEqual(mixed.turns.length, 0, "Mixed orphaned history stays mid-loop");
+
+  console.log("[test] Orphaned tool results (no re-plan) OK");
+}
+
 async function testImageAttachmentParsingAndCapabilities() {
   console.log("[test] Testing image attachment parsing...");
   const proxy = await import("../src/proxy");
@@ -2698,6 +2796,10 @@ async function testLongToolBridgeTtlAndContinuation() {
     "Dead-bridge continuation must include tool output",
   );
   assert(
+    continuation.includes("Continue from the current conversation checkpoint."),
+    "Dead-bridge continuation must lead with an explicit continue cue (raw tool output alone restarts planning)",
+  );
+  assert(
     !continuation.includes("[Internal stream recovery]"),
     "Dead-bridge continuation must NOT use technical recovery prefix (confuses model into empty-message hallucinations)",
   );
@@ -2708,6 +2810,10 @@ async function testLongToolBridgeTtlAndContinuation() {
   assert(
     emptyContinuation.includes("(no output)"),
     "Empty tool output must be replaced with a placeholder",
+  );
+  assert(
+    emptyContinuation.includes("Continue from the current conversation checkpoint."),
+    "Empty tool output continuation must still include continue cue",
   );
   console.log("[test] Long-tool bridge TTL and continuation OK");
 }
@@ -2924,6 +3030,7 @@ async function main() {
     await testComputeUsageFallback(modules);
     await testInterruptSteerHelpers();
     await testParseMessagesPreservesUserDuringToolLoop();
+    await testParseMessagesOrphanedToolResultsDoNotReplan();
     await testImageAttachmentParsingAndCapabilities();
     await testLongToolBridgeTtlAndContinuation();
     await testAwaitingToolResultsBridgeSurvivesEviction();

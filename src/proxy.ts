@@ -1390,6 +1390,14 @@ async function doHandleChatCompletion(
     effectiveUserText = userText;
   } else if (toolContinuationResume) {
     effectiveUserText = buildPostToolBridgeLossContinuation(toolResults);
+    // Stale abort flags from a prior SSE close must not reframe tool output as
+    // a brand-new user instruction — that restarts planning every tool hop.
+    if (stored.abortedTurn) {
+      stored.abortedTurn = false;
+      log.info(
+        `[proxy] cleared stale abortedTurn on tool continuation convKey=${convKey}`,
+      );
+    }
     log.warn(
       `[proxy] tool resume without live bridge — checkpoint continuation convKey=${convKey} tools=${toolResults.length} userChars=${userText.length}`,
     );
@@ -1419,7 +1427,13 @@ async function doHandleChatCompletion(
   // After a client abort / mid-tool steer, Cursor may still hold an incomplete
   // turn. Clear pending tool calls and explicitly frame the new user message
   // so the model follows the interrupt instead of "resuming" cancelled work.
-  const steerInterrupt = !isSummary && !!userText && (!!stored.abortedTurn || userSteeredAfterTools);
+  // Never apply this to tool-continuation resumes — those carry tool output,
+  // not a new user instruction.
+  const steerInterrupt =
+    !isSummary &&
+    !toolContinuationResume &&
+    !!userText &&
+    (!!stored.abortedTurn || userSteeredAfterTools);
   if (steerInterrupt) {
     stored.checkpoint = sanitizeCheckpointAfterInterrupt(stored.checkpoint);
     effectiveUserText = buildInterruptSteerUserText(effectiveUserText);
@@ -1679,6 +1693,12 @@ function extractWorkspaceRoot(systemPrompt: string): string | undefined {
  * turn early made `userText` empty mid-loop; if the parked bridge was also
  * missing, Cursor then received an empty/continuation UserMessage and models
  * hallucinated "the user sent an empty message".
+ *
+ * OpenCode history replay sometimes omits `assistant.tool_calls` while still
+ * sending the matching `role:tool` results (anomalyco/opencode#24090). Those
+ * orphaned tool messages must still open a tool batch — otherwise we return
+ * `toolResults=[]` + the original `userText`, kill the parked bridge, and
+ * re-prompt Cursor with the same task (infinite re-plan loop).
  */
 export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
@@ -1719,12 +1739,15 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
 
   for (const msg of nonSystem) {
     if (msg.role === "tool") {
-      if (openToolCallBatch) {
-        trailingToolResults.push({
-          toolCallId: msg.tool_call_id ?? "",
-          content: textContent(msg.content),
-        });
+      // Infer an open batch when OpenCode dropped assistant.tool_calls on replay.
+      if (!openToolCallBatch) {
+        openToolCallBatch = true;
+        trailingToolResults.length = 0;
       }
+      trailingToolResults.push({
+        toolCallId: msg.tool_call_id ?? "",
+        content: textContent(msg.content),
+      });
       continue;
     }
 
@@ -1750,6 +1773,8 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
         openToolCallBatch = true;
       } else if (openToolCallBatch) {
         // Assistant completed the tool loop without further tool_calls.
+        // Subsequent orphaned tool messages (missing tool_calls on the next
+        // assistant) will reopen a fresh trailing batch.
         openToolCallBatch = false;
         trailingToolResults.length = 0;
       }
@@ -3753,17 +3778,17 @@ function buildPostToolStallContinuation(toolResults?: ToolResultInfo[]): string 
 /**
  * Continuation when the parked tool bridge died/expired before OpenCode returned
  * results (typical after long shells/builds that outlive the old 5m TTL).
- * Kept natural — the model must see tool output as a normal follow-up message,
- * not as a technical recovery notice it can misread as an empty prompt.
+ * Always lead with an explicit continue cue — raw tool payloads alone (e.g.
+ * TodoWrite status lines) were being misread as a brand-new user task, which
+ * restarted planning every hop.
  */
 export function buildPostToolBridgeLossContinuation(
   toolResults?: ToolResultInfo[],
 ): string {
-  const parts: string[] = [];
+  const parts: string[] = [
+    "Continue from the current conversation checkpoint.",
+  ];
   appendToolResultsToContinuation(parts, toolResults);
-  if (parts.length === 0) {
-    return "Continue from the current conversation checkpoint.";
-  }
   return parts.join("\n");
 }
 
@@ -3833,7 +3858,9 @@ function handleToolResultResume(
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
   active.lastAccessMs = Date.now();
 
-  // Send mcpResult for each pending exec that has a matching tool result
+  // Send mcpResult for each pending exec that has a matching tool result.
+  // Unmatched pending execs get an explicit error so Cursor does not hang
+  // waiting for mcpResults that will never arrive (OpenCode returns full batches).
   for (const exec of pendingExecs) {
     const result = toolResults.find(
       (r) => r.toolCallId === exec.toolCallId,
