@@ -210,6 +210,12 @@ export const CursorAuthPlugin: Plugin = async (
       output.context.push(
         "IMPORTANT: Do NOT call any tools. Only produce a summary as text. No tool calls are allowed.",
       );
+      // After compact, OpenCode continues with a synthetic "Continue if you have
+      // next steps…" turn. Summaries that restart from "read AGENTS.md / fill
+      // context" cause an infinite re-plan loop — prefer DONE vs REMAINING.
+      output.context.push(
+        "Structure the summary with clear DONE vs REMAINING sections. Record concrete findings already discovered (routes, files, answers). Do NOT tell the next turn to restart from scratch or re-read every large file. Remaining work must be only unfinished items.",
+      );
     },
 
     provider: {

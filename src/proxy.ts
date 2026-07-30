@@ -1385,8 +1385,15 @@ async function doHandleChatCompletion(
   const mcpTools = buildMcpToolDefinitions(tools);
   const toolContinuationResume =
     toolResults.length > 0 && !userSteeredAfterTools;
+  // OpenCode auto-compact injects a synthetic "Continue if you have next steps…"
+  // user message. Left bare, Cursor models re-read the compaction objective and
+  // restart the plan from step 1 forever (AGENTS.md → todowrite → same plan).
+  const compactionContinue =
+    !isSummary &&
+    !toolContinuationResume &&
+    isCompactionContinueUserText(userText);
   let effectiveUserText = "";
-  if (userSteeredAfterTools && userText) {
+  if (userSteeredAfterTools && userText && !compactionContinue) {
     effectiveUserText = userText;
   } else if (toolContinuationResume) {
     effectiveUserText = buildPostToolBridgeLossContinuation(toolResults);
@@ -1401,6 +1408,12 @@ async function doHandleChatCompletion(
     log.warn(
       `[proxy] tool resume without live bridge — checkpoint continuation convKey=${convKey} tools=${toolResults.length} userChars=${userText.length}`,
     );
+  } else if (compactionContinue) {
+    effectiveUserText = buildCompactionContinueUserText();
+    if (stored.abortedTurn) {
+      stored.abortedTurn = false;
+    }
+    log.info(`[proxy] compaction-continue framed convKey=${convKey}`);
   } else {
     effectiveUserText = userText;
   }
@@ -1412,7 +1425,14 @@ async function doHandleChatCompletion(
   // parseMessages folded into turns — embed them so Cursor can summarize.
   // Tool-continuation resumes already carry structured tool output — do not
   // wrap them in the generic history template.
-  if (!stored.checkpoint && turns.length > 0 && !toolContinuationResume) {
+  // Compaction-continue already carries an explicit anti-restart instruction;
+  // embedding the pre-compact objective text would recreate the re-plan loop.
+  if (
+    !stored.checkpoint &&
+    turns.length > 0 &&
+    !toolContinuationResume &&
+    !compactionContinue
+  ) {
     const historyLines: string[] = [];
     for (const turn of turns) {
       if (turn.userText) historyLines.push(`User: ${turn.userText}`);
@@ -1427,11 +1447,12 @@ async function doHandleChatCompletion(
   // After a client abort / mid-tool steer, Cursor may still hold an incomplete
   // turn. Clear pending tool calls and explicitly frame the new user message
   // so the model follows the interrupt instead of "resuming" cancelled work.
-  // Never apply this to tool-continuation resumes — those carry tool output,
-  // not a new user instruction.
+  // Never apply this to tool-continuation or compaction-continue resumes —
+  // those are not a user interrupt.
   const steerInterrupt =
     !isSummary &&
     !toolContinuationResume &&
+    !compactionContinue &&
     !!userText &&
     (!!stored.abortedTurn || userSteeredAfterTools);
   if (steerInterrupt) {
@@ -2717,6 +2738,39 @@ const INTERRUPT_STEER_PREFIX =
  *  made the model hallucinate "previous run was interrupted" responses. */
 export function buildInterruptSteerUserText(userText: string): string {
   return `${INTERRUPT_STEER_PREFIX}\n\n${userText}`;
+}
+
+/**
+ * OpenCode auto-compact injects this synthetic user turn after writing the
+ * anchored summary. Detect it so we can replace the weak prompt with an
+ * explicit anti-restart resume instruction.
+ */
+export function isCompactionContinueUserText(userText: string): boolean {
+  const text = userText.trim().toLowerCase();
+  if (!text) return false;
+  return (
+    text.startsWith("continue if you have next steps") ||
+    text.includes(
+      "continue if you have next steps, or stop and ask for clarification",
+    )
+  );
+}
+
+/**
+ * Replacement for OpenCode's post-compact "Continue if you have next steps…".
+ * Without this, Cursor models re-enter the compaction objective from step 1
+ * (often "read AGENTS.md" + TodoWrite) and loop forever.
+ */
+export function buildCompactionContinueUserText(): string {
+  return [
+    "The conversation was just compacted.",
+    "Resume only unfinished work from the current state.",
+    "Do NOT restart the original plan from step one.",
+    "Do NOT re-read files already examined unless you need one specific missing detail.",
+    "Do NOT recreate the same todos from scratch — update them only for remaining work.",
+    "If you already have enough information to answer the user's objective, give the final answer now and stop.",
+    "Otherwise take the single next concrete action that advances unfinished work.",
+  ].join(" ");
 }
 
 /** Drop unresolved pending tool calls from a checkpoint after user interrupt. */

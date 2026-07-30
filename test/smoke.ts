@@ -2523,6 +2523,36 @@ async function testInterruptSteerHelpers() {
     "Steer framing must keep the latest user text",
   );
 
+  assert(
+    proxy.isCompactionContinueUserText(
+      "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+    ),
+    "OpenCode synthetic compaction-continue must be detected",
+  );
+  assert(
+    proxy.isCompactionContinueUserText(
+      "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.\n",
+    ),
+    "Compaction-continue detection must tolerate trailing whitespace",
+  );
+  assert(
+    !proxy.isCompactionContinueUserText("continue the refactor of next steps helper"),
+    "Normal chat mentioning next steps must not look like compaction-continue",
+  );
+  const compactContinue = proxy.buildCompactionContinueUserText();
+  assert(
+    compactContinue.toLowerCase().includes("do not restart"),
+    "Compaction-continue framing must forbid restarting the plan",
+  );
+  assert(
+    compactContinue.toLowerCase().includes("do not re-read"),
+    "Compaction-continue framing must forbid re-reading finished context",
+  );
+  assert(
+    !compactContinue.toLowerCase().includes("continue if you have next steps"),
+    "Compaction-continue framing must replace the weak OpenCode prompt",
+  );
+
   const dirty = create(ConversationStateStructureSchema, {
     rootPromptMessagesJson: [],
     turns: [],
