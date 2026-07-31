@@ -2387,6 +2387,44 @@ export function isServerKeepaliveMessage(msg: AgentServerMessage): boolean {
   return update.message?.case === "heartbeat";
 }
 
+/**
+ * Detect "stated a plan then stopped" completions: short assistant text that
+ * announces next steps / checks / todos but does not deliver an answer and
+ * never issued a tool call. OpenCode treats this as a finished turn, so the
+ * agent appears to freeze mid-work.
+ */
+export function looksLikeUnfinishedPlan(text: string): boolean {
+  const t = text.trim();
+  if (!t) return false;
+  // Long write-ups are usually real answers — do not nudge those.
+  if (t.length > 900) return false;
+  const lower = t.toLowerCase();
+  const announcesPlan =
+    /\b(i('ll| will)|let me|next[, ]|going to|plan:|checking|читаю|перевір|наступн)\b/i.test(
+      t,
+    ) ||
+    /\b(todo|todowrite|agents\.md)\b/i.test(lower);
+  const looksLikeAnswer =
+    /\b(done\.|completed\.|here (is|are)|final answer|access steps|summary:|висновок|готово)\b/i.test(
+      lower,
+    ) ||
+    (/^#{1,3}\s+\S+/m.test(t) && t.length > 220) ||
+    (t.includes("```") && t.length > 160);
+  return announcesPlan && !looksLikeAnswer;
+}
+
+/** One-shot nudge after an unfinished plan-with-no-tools completion. */
+export function buildUnfinishedPlanNudgeUserText(priorText: string): string {
+  const clipped = priorText.trim().slice(0, 500);
+  return [
+    "You announced a next step but stopped without taking action (no tool call and no final answer).",
+    "Do not restate the whole plan. Either call the next concrete tool now, or give the final answer now.",
+    clipped ? `Your last text was:\n"""${clipped}"""` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 /** Send a KV client response back to Cursor. */
 function sendKvResponse(
   kvMsg: KvServerMessage,
@@ -3265,6 +3303,11 @@ interface RetryContext {
   mcpTools: McpToolDefinition[];
   /** Consecutive internal stall recoveries without forward progress (reset on progress). */
   stallRecoveryCount: number;
+  /**
+   * How many times we already nudged after a "plan then stop" completion for
+   * this conversation turn. Caps auto-continue so we cannot loop forever.
+   */
+  unfinishedPlanNudges?: number;
   // Cursor's server still handles the literal default model's auto-selection
   // and rate-limit routing internally.
 }
@@ -3699,9 +3742,14 @@ function createBridgeStreamResponse(
         const isTitleGenStream = convKey.startsWith("title:");
         let mcpExecReceived = false;
         let anyContentSent = false;
+        /** Visible assistant text (not thinking/reasoning). Thinking-only
+         *  closes must still count as empty so we retry instead of freezing. */
+        let anyVisibleTextSent = false;
+        let visibleTextAccum = "";
         let blobNotFound = false;
         let connectError = false;
         let emptyCloseRetry = false;
+        let unfinishedPlanNudge = false;
         let watchdogHandled = false;
         let attemptSuperseded = false;
         let lastProgressAt = Date.now();
@@ -3776,7 +3824,11 @@ function createBridgeStreamResponse(
                   } else {
                     const { content, reasoning } = tagFilter.process(text);
                     if (reasoning) sendSSE(makeChunk({ reasoning_content: reasoning }));
-                    if (content) sendSSE(makeChunk({ content }));
+                    if (content) {
+                      anyVisibleTextSent = true;
+                      visibleTextAccum += content;
+                      sendSSE(makeChunk({ content }));
+                    }
                   }
                 },
                   // onMcpExec — the model wants to execute a tool.
@@ -4102,13 +4154,36 @@ function createBridgeStreamResponse(
             return;
           }
 
+          // Flush any buffered visible text before empty / unfinished-plan checks
+          // so we do not miss a trailing plan sentence still sitting in the filter.
+          {
+            const flushedEarly = tagFilter.flush();
+            if (flushedEarly.reasoning) {
+              sendSSE(makeChunk({ reasoning_content: flushedEarly.reasoning }));
+            }
+            if (flushedEarly.content) {
+              anyVisibleTextSent = true;
+              anyContentSent = true;
+              visibleTextAccum += flushedEarly.content;
+              sendSSE(makeChunk({ content: flushedEarly.content }));
+            }
+          }
+
           // Guard against silent empty completions: stream closed before any usable
           // content or tool call reached SSE, but no explicit Connect error surfaced.
           // This happens when Cursor silently rejects large conversation states.
+          // Also treat thinking-only closes as empty — OpenCode shows nothing and
+          // the agent looks frozen.
           // Strategy: retry once with the same request, then retry once more with
           // a cleared checkpoint (fresh conversation state).
-          if (!mcpExecReceived && !anyContentSent && attempt < maxConnectRetries && liveAccessToken && liveRequestBytes) {
+          const usableOutput = mcpExecReceived || anyVisibleTextSent;
+          if (!usableOutput && attempt < maxConnectRetries && liveAccessToken && liveRequestBytes) {
             emptyCloseRetry = true;
+            if (anyContentSent && !anyVisibleTextSent) {
+              log.warn(
+                `[proxy] thinking-only stream close — treating as empty (bridgeKey=${bridgeKey})`,
+              );
+            }
           }
           if (emptyCloseRetry) {
             deleteActiveBridge(bridgeKey);
@@ -4157,17 +4232,55 @@ function createBridgeStreamResponse(
             }
           }
 
+          // Model wrote a short "I'll do X…" plan then stopped with no tool call.
+          // OpenCode ends the turn → looks like the agent froze. Nudge once.
+          if (
+            !mcpExecReceived &&
+            anyVisibleTextSent &&
+            retryCtx &&
+            liveAccessToken &&
+            (retryCtx.unfinishedPlanNudges ?? 0) < 1 &&
+            looksLikeUnfinishedPlan(visibleTextAccum)
+          ) {
+            unfinishedPlanNudge = true;
+          }
+          if (unfinishedPlanNudge && retryCtx && liveAccessToken) {
+            retryCtx.unfinishedPlanNudges = (retryCtx.unfinishedPlanNudges ?? 0) + 1;
+            const nudgeText = buildUnfinishedPlanNudgeUserText(visibleTextAccum);
+            log.warn(
+              `[proxy] unfinished-plan stop — nudging once convKey=${convKey} bridgeKey=${bridgeKey} priorChars=${visibleTextAccum.length}`,
+            );
+            deleteActiveBridge(bridgeKey);
+            attemptBridge.kill();
+            const freshPayload = buildCursorRequest(
+              retryCtx.selection,
+              retryCtx.systemPrompt,
+              nudgeText,
+              retryCtx.stored.conversationId,
+              retryCtx.stored.checkpoint,
+              retryCtx.stored.blobStore,
+              [],
+            );
+            freshPayload.mcpTools = retryCtx.mcpTools;
+            liveRequestBytes = freshPayload.requestBytes;
+            retryCtx.effectiveUserText = nudgeText;
+            setTimeout(() => {
+              if (closed) return;
+              const { bridge: retryBridge, heartbeatTimer: retryTimer } =
+                startBridge(liveAccessToken!, liveRequestBytes!);
+              runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
+            }, 200);
+            return;
+          }
+
           const active = activeBridges.get(bridgeKey);
           const currentAttemptIsActive = active?.bridge === attemptBridge;
 
           if (!mcpExecReceived) {
-            const flushed = tagFilter.flush();
-            if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-            if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
-            // If no content was ever sent, surface an explicit error instead of
+            // If no visible content was ever sent, surface an explicit error instead of
             // a silent empty completion that looks like "instant empty reply" in Discord.
             // Suppress for title-gen to avoid polluting Discord thread names.
-            if (!anyContentSent && !isTitleGenStream) {
+            if (!anyVisibleTextSent && !isTitleGenStream) {
               log.warn(`[proxy] All retries exhausted; sending empty-stream error (bridgeKey=${bridgeKey})`);
               sendSSE(makeChunk({ content: "\n[Error: Cursor returned empty response. Try sending your message again.]" }));
             }

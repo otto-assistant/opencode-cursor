@@ -2766,6 +2766,26 @@ async function testInterruptSteerHelpers() {
     "Compaction-continue framing must forbid context refill",
   );
 
+  assert(
+    proxy.looksLikeUnfinishedPlan(
+      "I'll check AGENTS.md and git status, then push.",
+    ),
+    "Short plan-with-no-answer must look unfinished",
+  );
+  assert(
+    !proxy.looksLikeUnfinishedPlan(
+      "## Auth-gate flow\n\n- Redirect: /login\n- Flags: FEATURE_AUTH_GATE\n- Refresh: POST /api/auth/refresh\n\nDone.",
+    ),
+    "Concrete final answers must not look like unfinished plans",
+  );
+  assert(
+    proxy
+      .buildUnfinishedPlanNudgeUserText("I'll read AGENTS.md next.")
+      .toLowerCase()
+      .includes("without taking action"),
+    "Unfinished-plan nudge must demand a tool call or final answer",
+  );
+
   const dirty = create(ConversationStateStructureSchema, {
     rootPromptMessagesJson: [],
     turns: [],
