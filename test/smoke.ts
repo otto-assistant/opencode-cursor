@@ -2539,18 +2539,231 @@ async function testInterruptSteerHelpers() {
     !proxy.isCompactionContinueUserText("continue the refactor of next steps helper"),
     "Normal chat mentioning next steps must not look like compaction-continue",
   );
-  const compactContinue = proxy.buildCompactionContinueUserText();
+  const compactContinue = proxy.buildCompactionContinueUserText(
+    "## Objective\nDeliver access steps\n## Work State\n### Completed\nroute=/issues",
+  );
   assert(
-    compactContinue.toLowerCase().includes("do not restart"),
+    /do not restart|never restart/i.test(compactContinue),
     "Compaction-continue framing must forbid restarting the plan",
   );
   assert(
-    compactContinue.toLowerCase().includes("do not re-read"),
+    /do not re-read|refill is forbidden|context refill is forbidden/i.test(
+      compactContinue,
+    ),
     "Compaction-continue framing must forbid re-reading finished context",
   );
   assert(
     !compactContinue.toLowerCase().includes("continue if you have next steps"),
     "Compaction-continue framing must replace the weak OpenCode prompt",
+  );
+  assert(
+    compactContinue.toLowerCase().includes("agents.md"),
+    "Compaction-continue framing must explicitly forbid AGENTS.md restart thrash",
+  );
+  assert(
+    compactContinue.includes("route=/issues"),
+    "Compaction-continue framing must embed the anchored summary for Cursor",
+  );
+  assert(
+    proxy
+      .extractAnchoredSummary([
+        { role: "user", content: "What did we do so far?" },
+        {
+          role: "assistant",
+          content:
+            "## Objective\nFind X\n## Important Details\nok\n## Work State\n### Completed\ndone",
+        },
+      ])
+      .includes("Find X"),
+    "extractAnchoredSummary must return the Objective summary",
+  );
+
+  assert(
+    !proxy.detectAgentsMdReplanLoop([
+      { role: "user", content: "push all changes" },
+      { role: "assistant", content: "I'll read AGENTS.md then push." },
+    ]),
+    "Single AGENTS.md mention must not trip the re-plan detector",
+  );
+  assert(
+    !proxy.detectAgentsMdReplanLoop([
+      { role: "user", content: "fill context" },
+      { role: "assistant", content: "I'll read AGENTS.md then update todos." },
+      { role: "assistant", content: "Next I'll check AGENTS.md and continue the todo checklist." },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: "{\"filePath\":\"AGENTS.md\"}" } }],
+      },
+      { role: "tool", content: "# AGENTS\nUse TodoWrite", tool_call_id: "c1" },
+    ]),
+    "Normal AGENTS.md + TodoWrite context fill must not trip the re-plan detector",
+  );
+  assert(
+    proxy.detectAgentsMdReplanLoop([
+      { role: "user", content: "push all changes" },
+      { role: "assistant", content: "I'll read AGENTS.md, then check git and push." },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: "{\"filePath\":\"/repo/AGENTS.md\"}" } }],
+      },
+      { role: "tool", content: "File not found: /repo/AGENTS.md", tool_call_id: "c1" },
+      { role: "assistant", content: "The last request was to push all changes. I'll check AGENTS.md and git status." },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: "c2", type: "function", function: { name: "bash", arguments: "{\"command\":\"git status\"}" } }],
+      },
+      { role: "tool", content: "On branch main\nnothing to commit", tool_call_id: "c2" },
+      { role: "assistant", content: "The remaining step is pushing. Checking AGENTS.md and git status first." },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id: "c3", type: "function", function: { name: "read", arguments: "{\"filePath\":\"AGENTS.md\"}" } },
+          { id: "c4", type: "function", function: { name: "bash", arguments: "{\"command\":\"git status && git log\"}" } },
+        ],
+      },
+      { role: "tool", content: "File not found: AGENTS.md", tool_call_id: "c3" },
+      { role: "tool", content: "On branch main", tool_call_id: "c4" },
+      { role: "assistant", content: "I'll read AGENTS.md, then check git status and push." },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id: "c5", type: "function", function: { name: "read", arguments: "{\"filePath\":\"/x/AGENTS.md\"}" } },
+          { id: "c6", type: "function", function: { name: "bash", arguments: "{\"command\":\"git status\"}" } },
+        ],
+      },
+      { role: "tool", content: "File not found: /x/AGENTS.md", tool_call_id: "c5" },
+      { role: "tool", content: "On branch main", tool_call_id: "c6" },
+    ]),
+    "Repeated AGENTS.md + git status restarts must be detected as a re-plan loop",
+  );
+  assert(
+    proxy.buildReplanLoopBreakNote().toLowerCase().includes("do not read agents.md again"),
+    "Loop-break note must forbid another AGENTS.md read",
+  );
+
+  assert(
+    proxy.isFreshCompactionContinue(
+      [
+        { role: "user", content: "What did we do so far?" },
+        { role: "assistant", content: "## Objective\n\n## Work State\n### Completed\nok" },
+        {
+          role: "user",
+          content:
+            "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+        },
+      ],
+      "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+    ),
+    "Fresh post-compact continue must be detected",
+  );
+  assert(
+    !proxy.isFreshCompactionContinue(
+      [
+        { role: "user", content: "What did we do so far?" },
+        { role: "assistant", content: "## Objective\n\n## Work State\n### Completed\nok" },
+        {
+          role: "user",
+          content:
+            "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+        },
+        { role: "assistant", content: "Giving the final access steps now." },
+      ],
+      "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+    ),
+    "Continue text after an assistant reply must NOT re-frame as fresh compaction-continue",
+  );
+
+  const summaryAssistant = [
+    "## Objective",
+    "- Find access steps; follow encyclopedia checklist.",
+    "## Important Details",
+    "- Required reads: encyclopedia, repeat-a, big.json, AGENTS.md",
+    "## Work State",
+    "### Completed",
+    "- encyclopedia fully read; route is /issues?view=queue",
+    "### Active",
+    "- deliver final access steps",
+  ].join("\n");
+  assert(
+    proxy.isPostCompactHistory([
+      { role: "user", content: "What did we do so far?" },
+      { role: "assistant", content: summaryAssistant },
+      {
+        role: "user",
+        content:
+          "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+      },
+    ]),
+    "OpenCode post-compact history shape must be detected",
+  );
+  assert(
+    !proxy.detectPostCompactRefillLoop([
+      { role: "user", content: "What did we do so far?" },
+      { role: "assistant", content: summaryAssistant },
+      {
+        role: "user",
+        content:
+          "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+      },
+    ]),
+    "Anchored summary alone must not look like a refill loop",
+  );
+  assert(
+    proxy.detectPostCompactRefillLoop([
+      { role: "user", content: "What did we do so far?" },
+      { role: "assistant", content: summaryAssistant },
+      {
+        role: "user",
+        content:
+          "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+      },
+      {
+        role: "assistant",
+        content: "I'll check AGENTS.md and resume unfinished context filling.",
+        tool_calls: [
+          {
+            id: "c1",
+            type: "function",
+            function: {
+              name: "read",
+              arguments: "{\"filePath\":\"/tmp/ctx/AGENTS.md\"}",
+            },
+          },
+        ],
+      },
+    ]),
+    "Post-compact AGENTS.md re-read must be detected as a refill loop",
+  );
+  assert(
+    proxy
+      .buildPostCompactRefillBreakNote()
+      .toLowerCase()
+      .includes("refilling context is forbidden"),
+    "Post-compact break note must forbid context refill",
+  );
+  assert(
+    proxy.isPostCompactRefillToolCall(
+      "todowrite",
+      JSON.stringify({ todos: [{ content: "deliver final answer" }] }),
+    ),
+    "Post-compact TodoWrite must be refused as refill/planning thrash",
+  );
+  assert(
+    proxy
+      .buildPostCompactRefillRefusal()
+      .toLowerCase()
+      .includes("refill refused"),
+    "Post-compact refusal text must be explicit",
+  );
+  assert(
+    compactContinue.toLowerCase().includes("context refill is forbidden") ||
+      compactContinue.toLowerCase().includes("refill is forbidden"),
+    "Compaction-continue framing must forbid context refill",
   );
 
   const dirty = create(ConversationStateStructureSchema, {

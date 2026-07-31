@@ -201,7 +201,7 @@ export const CursorAuthPlugin: Plugin = async (
       delete output.options[CURSOR_VARIANT_OPTION];
     },
 
-    "experimental.session.compacting": async (_hookInput, output) => {
+    "experimental.session.compacting": async (hookInput, output) => {
       // Discourage tool hallucination during session compaction.  Some models
       // (particularly Claude) emit tool calls (bash, read, etc.) even when no
       // tool definitions are provided.  The proxy fix in handleExecMessage
@@ -211,11 +211,72 @@ export const CursorAuthPlugin: Plugin = async (
         "IMPORTANT: Do NOT call any tools. Only produce a summary as text. No tool calls are allowed.",
       );
       // After compact, OpenCode continues with a synthetic "Continue if you have
-      // next steps…" turn. Summaries that restart from "read AGENTS.md / fill
-      // context" cause an infinite re-plan loop — prefer DONE vs REMAINING.
+      // next steps…" turn. Summaries that keep "fill context / re-read every
+      // large file / read AGENTS.md" as Active work cause an infinite refill loop.
+      // Also: if concrete facts are omitted from DONE, the next turn cannot
+      // finish without re-reading — which we forbid — so it stalls or thrashs.
       output.context.push(
-        "Structure the summary with clear DONE vs REMAINING sections. Record concrete findings already discovered (routes, files, answers). Do NOT tell the next turn to restart from scratch or re-read every large file. Remaining work must be only unfinished items.",
+        [
+          "CRITICAL for the next turn after compaction:",
+          "Structure the summary with DONE (concrete findings already discovered) and REMAINING (only unfinished user deliverables).",
+          "PRESERVE VERBATIM in DONE: routes, URLs, query strings, flag names, redirects, refresh endpoints, commands, error codes, and any CONFIRMED/authoritative header values.",
+          "If those concrete values are missing from DONE, the next turn cannot finish — copy them now.",
+          "Do NOT list context-filling checklists as remaining work.",
+          "Do NOT tell the next turn to re-read AGENTS.md, encyclopedias, repeat-*.md, big.json, or other large docs already examined.",
+          "Do NOT say the next turn must follow a mandatory mass-Read checklist.",
+          "If the user objective is answerable from DONE findings, REMAINING must be only: deliver the final answer (no more discovery).",
+        ].join(" "),
       );
+
+      // Pull already-seen CONFIRMED / authoritative facts from the session and
+      // force them into the summary context so the next turn can finish without
+      // re-reading the corpus.
+      try {
+        const result = await input.client.session.messages({
+          path: { id: hookInput.sessionID },
+        });
+        const payload = (result as { data?: unknown }).data ?? result;
+        // Unescape JSON string noise so patterns like "/login" are not cut at "n"
+        // by a mistaken [^\\n] character class.
+        const blob = JSON.stringify(payload ?? "")
+          .replace(/\\n/g, "\n")
+          .replace(/\\t/g, "\t")
+          .replace(/\\"/g, '"')
+          .replace(/\\\\/g, "\\")
+          .slice(0, 900_000);
+        const facts: string[] = [];
+        for (const match of blob.matchAll(
+          /#\s*CONFIRMED[^\n]*\n(?:[^\n]*\n){0,10}/gi,
+        )) {
+          const block = match[0].trim();
+          if (block.length > 40 && !facts.includes(block)) facts.push(block);
+          if (facts.length >= 4) break;
+        }
+        for (const match of blob.matchAll(
+          /(?:Primary route|Redirect|Flags|Refresh|Canonical access|Recovery|Deep links?):\s*[^\n]{3,220}/gi,
+        )) {
+          const line = match[0].trim();
+          if (line.length > 12 && !facts.includes(line)) facts.push(line);
+          if (facts.length >= 12) break;
+        }
+        if (facts.length > 0) {
+          output.context.push(
+            [
+              "MUST copy these already-seen CONFIRMED/authoritative facts VERBATIM into DONE.",
+              "Do not paraphrase away the concrete values:",
+              ...facts.slice(0, 12).map((f, i) => `${i + 1}. ${f}`),
+            ].join("\n"),
+          );
+          log.info(
+            `[opencode-cursor] compacting injected ${Math.min(facts.length, 12)} verbatim facts session=${hookInput.sessionID}`,
+          );
+        }
+      } catch (err) {
+        const summary = err instanceof Error ? err.message : String(err);
+        log.warn(
+          `[opencode-cursor] compacting fact extraction failed: ${summary}`,
+        );
+      }
     },
 
     provider: {
