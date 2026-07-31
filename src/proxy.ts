@@ -213,6 +213,12 @@ interface StoredConversation {
    * so the model follows the new instruction instead of resuming cancelled work.
    */
   abortedTurn?: boolean;
+  /**
+   * Set when OpenCode's post-compaction "Continue if you have next steps…"
+   * resume is framed. Cleared after a natural finish. While set, tool resumes
+   * keep anti-refill guidance so the model does not restart mass context reads.
+   */
+  postCompactActive?: boolean;
 }
 
 const conversationStates = new Map<string, StoredConversation>();
@@ -1319,7 +1325,17 @@ async function doHandleChatCompletion(
 
     if (activeBridge.bridge.alive) {
       // Resume the live bridge with tool results
-      return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey, release, workspaceRoot, abortSignal);
+      return handleToolResultResume(
+        activeBridge,
+        toolResults,
+        modelId,
+        bridgeKey,
+        convKey,
+        release,
+        workspaceRoot,
+        abortSignal,
+        body.messages,
+      );
     }
 
     // Bridge died (timeout, server disconnect, etc.).
@@ -1385,11 +1401,48 @@ async function doHandleChatCompletion(
   const mcpTools = buildMcpToolDefinitions(tools);
   const toolContinuationResume =
     toolResults.length > 0 && !userSteeredAfterTools;
+  // OpenCode auto-compact injects a synthetic "Continue if you have next steps…"
+  // user message. Left bare, Cursor models re-read the compaction objective and
+  // restart the plan from step 1 forever (AGENTS.md → todowrite → same plan).
+  // Only the FRESH continue turn (continue still the latest message) may be
+  // reframed — later steps still contain that user text in history.
+  const compactionContinue =
+    !isSummary &&
+    !toolContinuationResume &&
+    isFreshCompactionContinue(body.messages, userText);
+  const staleCompactionContinue =
+    !isSummary &&
+    !toolContinuationResume &&
+    !compactionContinue &&
+    isCompactionContinueUserText(userText);
   let effectiveUserText = "";
-  if (userSteeredAfterTools && userText) {
+  if (userSteeredAfterTools && userText && !compactionContinue) {
     effectiveUserText = userText;
   } else if (toolContinuationResume) {
-    effectiveUserText = buildPostToolBridgeLossContinuation(toolResults);
+    let continuationResults = toolResults;
+    if (
+      stored.postCompactActive ||
+      isPostCompactHistory(body.messages)
+    ) {
+      continuationResults = toolResults.map((r) => {
+        // Best-effort: refuse AGENTS.md / corpus paths visible in content/id.
+        const blob = `${r.toolCallId}\n${r.content.slice(0, 500)}`;
+        if (
+          /AGENTS\.md/i.test(blob) ||
+          /encyclopedia|repeat-[abc]\.md|big\.json/i.test(blob)
+        ) {
+          return { ...r, content: buildPostCompactRefillRefusal() };
+        }
+        return r;
+      });
+    }
+    effectiveUserText = buildPostToolBridgeLossContinuation(continuationResults);
+    if (detectPostCompactRefillLoop(body.messages) || detectAgentsMdReplanLoop(body.messages)) {
+      const note = buildLoopBreakNoteForMessages(body.messages);
+      if (note && !effectiveUserText.includes("[Post-compact") && !effectiveUserText.includes("[Loop break]")) {
+        effectiveUserText = `${effectiveUserText}\n${note}`;
+      }
+    }
     // Stale abort flags from a prior SSE close must not reframe tool output as
     // a brand-new user instruction — that restarts planning every tool hop.
     if (stored.abortedTurn) {
@@ -1401,8 +1454,56 @@ async function doHandleChatCompletion(
     log.warn(
       `[proxy] tool resume without live bridge — checkpoint continuation convKey=${convKey} tools=${toolResults.length} userChars=${userText.length}`,
     );
+  } else if (compactionContinue) {
+    effectiveUserText = buildCompactionContinueUserText(
+      extractAnchoredSummary(body.messages),
+    );
+    if (stored.abortedTurn) {
+      stored.abortedTurn = false;
+    }
+    stored.postCompactActive = true;
+    log.info(
+      `[proxy] compaction-continue framed convKey=${convKey} effectiveChars=${effectiveUserText.length} summaryChars=${extractAnchoredSummary(body.messages).length}`,
+    );
+  } else if (staleCompactionContinue) {
+    // History still ends with OpenCode's continue string, but the model already
+    // acted after it. Do not re-apply the full anti-restart preamble (that
+    // caused task switches / double framing); keep a short on-objective nudge.
+    const summary = extractAnchoredSummary(body.messages);
+    effectiveUserText = [
+      "Keep going on the user's original objective from the anchored summary.",
+      "Do not refill context. Do not restart from step one. Do not switch to unrelated work.",
+      summary ? `Anchored summary:\n---\n${summary}\n---` : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    stored.postCompactActive = true;
+    log.info(`[proxy] stale compaction-continue softened convKey=${convKey}`);
   } else {
     effectiveUserText = userText;
+  }
+
+  if (!isSummary && isPostCompactHistory(body.messages)) {
+    stored.postCompactActive = true;
+  }
+
+  // Post-compact refill / AGENTS.md thrash can appear on any resume path (live
+  // bridge is handled in handleToolResultResume; this covers dead-bridge /
+  // compact / re-issued user turns that keep restating the same plan).
+  // Skip on the fresh continue turn itself — framing already carries anti-refill.
+  if (
+    !isSummary &&
+    !compactionContinue &&
+    !effectiveUserText.includes("[Post-compact loop break]") &&
+    !effectiveUserText.includes("[Loop break]")
+  ) {
+    const breakNote = buildLoopBreakNoteForMessages(body.messages);
+    if (breakNote) {
+      effectiveUserText = `${effectiveUserText}\n${breakNote}`;
+      log.warn(
+        `[proxy] loop-break note on user prompt convKey=${convKey} postCompact=${!!stored.postCompactActive}`,
+      );
+    }
   }
 
   // For fresh conversations (no checkpoint), embed prior conversation turns
@@ -1412,7 +1513,14 @@ async function doHandleChatCompletion(
   // parseMessages folded into turns — embed them so Cursor can summarize.
   // Tool-continuation resumes already carry structured tool output — do not
   // wrap them in the generic history template.
-  if (!stored.checkpoint && turns.length > 0 && !toolContinuationResume) {
+  // Compaction-continue already carries an explicit anti-restart instruction;
+  // embedding the pre-compact objective text would recreate the re-plan loop.
+  if (
+    !stored.checkpoint &&
+    turns.length > 0 &&
+    !toolContinuationResume &&
+    !compactionContinue
+  ) {
     const historyLines: string[] = [];
     for (const turn of turns) {
       if (turn.userText) historyLines.push(`User: ${turn.userText}`);
@@ -1427,11 +1535,12 @@ async function doHandleChatCompletion(
   // After a client abort / mid-tool steer, Cursor may still hold an incomplete
   // turn. Clear pending tool calls and explicitly frame the new user message
   // so the model follows the interrupt instead of "resuming" cancelled work.
-  // Never apply this to tool-continuation resumes — those carry tool output,
-  // not a new user instruction.
+  // Never apply this to tool-continuation or compaction-continue resumes —
+  // those are not a user interrupt.
   const steerInterrupt =
     !isSummary &&
     !toolContinuationResume &&
+    !compactionContinue &&
     !!userText &&
     (!!stored.abortedTurn || userSteeredAfterTools);
   if (steerInterrupt) {
@@ -2278,6 +2387,44 @@ export function isServerKeepaliveMessage(msg: AgentServerMessage): boolean {
   return update.message?.case === "heartbeat";
 }
 
+/**
+ * Detect "stated a plan then stopped" completions: short assistant text that
+ * announces next steps / checks / todos but does not deliver an answer and
+ * never issued a tool call. OpenCode treats this as a finished turn, so the
+ * agent appears to freeze mid-work.
+ */
+export function looksLikeUnfinishedPlan(text: string): boolean {
+  const t = text.trim();
+  if (!t) return false;
+  // Long write-ups are usually real answers — do not nudge those.
+  if (t.length > 900) return false;
+  const lower = t.toLowerCase();
+  const announcesPlan =
+    /\b(i('ll| will)|let me|next[, ]|going to|plan:|checking|читаю|перевір|наступн)\b/i.test(
+      t,
+    ) ||
+    /\b(todo|todowrite|agents\.md)\b/i.test(lower);
+  const looksLikeAnswer =
+    /\b(done\.|completed\.|here (is|are)|final answer|access steps|summary:|висновок|готово)\b/i.test(
+      lower,
+    ) ||
+    (/^#{1,3}\s+\S+/m.test(t) && t.length > 220) ||
+    (t.includes("```") && t.length > 160);
+  return announcesPlan && !looksLikeAnswer;
+}
+
+/** One-shot nudge after an unfinished plan-with-no-tools completion. */
+export function buildUnfinishedPlanNudgeUserText(priorText: string): string {
+  const clipped = priorText.trim().slice(0, 500);
+  return [
+    "You announced a next step but stopped without taking action (no tool call and no final answer).",
+    "Do not restate the whole plan. Either call the next concrete tool now, or give the final answer now.",
+    clipped ? `Your last text was:\n"""${clipped}"""` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 /** Send a KV client response back to Cursor. */
 function sendKvResponse(
   kvMsg: KvServerMessage,
@@ -2622,7 +2769,15 @@ function deriveBridgeKey(modelId: string, body: ChatCompletionRequest): string {
   const firstUserMsg = body.messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   const ns = requestKeyNamespace(body.messages);
-  const base = identity ? `${ns}${identity}` : `fallback:${ns}${firstUserText}`;
+  let base = identity ? `${ns}${identity}` : `fallback:${ns}${firstUserText}`;
+  if (!identity && isPostCompactHistory(body.messages)) {
+    const summary = extractAnchoredSummary(body.messages);
+    const fingerprint = createHash("sha256")
+      .update(summary || `user:${firstUserText}`)
+      .digest("hex")
+      .slice(0, 16);
+    base = `${ns}postcompact:${fingerprint}:fallback:${firstUserText}`;
+  }
   return createHash("sha256")
     .update(`bridge:${modelId}:${base}`)
     .digest("hex")
@@ -2719,6 +2874,356 @@ export function buildInterruptSteerUserText(userText: string): string {
   return `${INTERRUPT_STEER_PREFIX}\n\n${userText}`;
 }
 
+/**
+ * OpenCode auto-compact injects this synthetic user turn after writing the
+ * anchored summary. Detect it so we can replace the weak prompt with an
+ * explicit anti-restart resume instruction.
+ */
+export function isCompactionContinueUserText(userText: string): boolean {
+  const text = userText.trim().toLowerCase();
+  if (!text) return false;
+  return (
+    text.startsWith("continue if you have next steps") ||
+    text.includes(
+      "continue if you have next steps, or stop and ask for clarification",
+    )
+  );
+}
+
+/**
+ * True only for the fresh post-compact continue turn — the continue user
+ * message must still be the latest message. Once the model has answered (or
+ * called tools) after continue, OpenCode history still contains that user
+ * text, but re-framing it as a brand-new compaction-continue restarts the
+ * wrong objective (and can double-inject loop-break notes).
+ */
+export function isFreshCompactionContinue(
+  messages: OpenAIMessage[],
+  userText: string,
+): boolean {
+  if (!isCompactionContinueUserText(userText)) return false;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role === "assistant" || msg.role === "tool") return false;
+    if (msg.role === "user") {
+      return isCompactionContinueUserText(textContent(msg.content));
+    }
+  }
+  return false;
+}
+
+/**
+ * Pull OpenCode's anchored compaction summary from history (assistant
+ * "## Objective" …), if present.
+ */
+export function extractAnchoredSummary(messages: OpenAIMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role !== "assistant") continue;
+    const text = textContent(msg.content).trim();
+    if (
+      /^##\s*objective\b/im.test(text) &&
+      (/##\s*work state\b/im.test(text) ||
+        /\bimportant details\b/i.test(text) ||
+        /\bcompleted\b/i.test(text))
+    ) {
+      return text;
+    }
+  }
+  return "";
+}
+
+/**
+ * Replacement for OpenCode's post-compact "Continue if you have next steps…".
+ * Without this, Cursor models re-enter the compaction objective from step 1
+ * (often "read AGENTS.md" + TodoWrite + mass file reads) and loop forever.
+ *
+ * The anchored summary MUST be embedded: after compact, convKey rotates and
+ * Cursor starts a fresh conversation — without the summary text the model has
+ * no DONE findings and hallucinates a different task.
+ */
+export function buildCompactionContinueUserText(
+  anchoredSummary: string = "",
+): string {
+  const summary = anchoredSummary.trim();
+  const parts = [
+    "The conversation was just compacted.",
+    summary
+      ? `Here is the anchored summary — your ONLY context. Use it. Do not invent a different workspace or objective.\n---\n${summary}\n---`
+      : "The anchored summary above is your only context.",
+    "Your job now: deliver the Objective from that summary.",
+    "Resume ONLY unfinished user deliverables from REMAINING / Active / Next Move — never restart the original plan from step one.",
+    "Context refill is forbidden: Do NOT read AGENTS.md again, Do NOT re-read encyclopedias / repeat-*.md / big.json / other large docs already covered in DONE, Do NOT recreate a mass-Read or fill-context todo checklist.",
+    "Do NOT call TodoWrite / todo tools now — write the final answer as plain text immediately.",
+    "Do NOT re-run broad discovery just to restart planning.",
+    "Stay on the user's original objective from the summary — do not switch to unrelated git/PR/push work unless that was the objective.",
+    "If DONE already has enough findings to satisfy the Objective, write the final answer NOW using those findings (routes, flags, steps) and stop.",
+    "Otherwise take the single next concrete action that finishes that deliverable — not another context-fill pass.",
+  ];
+  return parts.join("\n\n");
+}
+
+/**
+ * True when OpenCode history is in the post-compaction shape:
+ * either the synthetic continue prompt appears, or the session was rewritten
+ * to "What did we do so far?" + anchored summary (OpenCode 1.18+).
+ */
+export function isPostCompactHistory(messages: OpenAIMessage[]): boolean {
+  let sawContinue = false;
+  let sawWhatDidWeDo = false;
+  let sawObjectiveSummary = false;
+
+  for (const msg of messages) {
+    const text = textContent(msg.content).trim();
+    if (!text) continue;
+    if (msg.role === "user") {
+      if (isCompactionContinueUserText(text)) sawContinue = true;
+      if (/^what did we do so far\??$/i.test(text)) sawWhatDidWeDo = true;
+    }
+    if (msg.role === "assistant") {
+      // Anchored summaries from the compaction agent.
+      if (
+        /^##\s*objective\b/im.test(text) &&
+        (/##\s*work state\b/im.test(text) ||
+          /\bcompleted\b/i.test(text) ||
+          /\bremaining\b/i.test(text) ||
+          /\bimportant details\b/i.test(text))
+      ) {
+        sawObjectiveSummary = true;
+      }
+    }
+  }
+
+  return sawContinue || (sawWhatDidWeDo && sawObjectiveSummary);
+}
+
+/**
+ * After compaction, models often thrash by re-reading AGENTS.md / large docs
+ * and recreating fill-context todos even when DONE already has the answer.
+ *
+ * Only counts assistant turns AFTER the compaction summary / continue prompt —
+ * the anchored summary itself mentions encyclopedia/AGENTS.md and must not trip.
+ */
+export function detectPostCompactRefillLoop(messages: OpenAIMessage[]): boolean {
+  if (!isPostCompactHistory(messages)) return false;
+
+  let counting = false;
+  let agentsReads = 0;
+  let largeDocReads = 0;
+  let fillContextTodos = 0;
+  let restartPlans = 0;
+
+  for (const msg of messages) {
+    const text = textContent(msg.content);
+    if (msg.role === "user" && isCompactionContinueUserText(text)) {
+      counting = true;
+      continue;
+    }
+    if (
+      msg.role === "assistant" &&
+      /^##\s*objective\b/im.test(text) &&
+      (/##\s*work state\b/im.test(text) || /\bimportant details\b/i.test(text))
+    ) {
+      // Anchored summary — skip, but the next assistant turn is post-compact work.
+      counting = true;
+      continue;
+    }
+    if (!counting || msg.role !== "assistant") continue;
+
+    const lower = text.toLowerCase();
+    if (
+      (lower.includes("agents.md") ||
+        lower.includes("encyclopedia") ||
+        lower.includes("fill context") ||
+        lower.includes("заповн") ||
+        lower.includes("repeat-a") ||
+        lower.includes("big.json")) &&
+      (lower.includes("read") ||
+        lower.includes("check") ||
+        lower.includes("перевір") ||
+        lower.includes("читаю") ||
+        lower.includes("todo") ||
+        lower.includes("resume"))
+    ) {
+      restartPlans += 1;
+    }
+    if (!Array.isArray(msg.tool_calls)) continue;
+    for (const call of msg.tool_calls) {
+      const args = call.function?.arguments ?? "";
+      const name = (call.function?.name ?? "").toLowerCase();
+      if (/AGENTS\.md/i.test(args)) agentsReads += 1;
+      if (
+        /workqueue-encyclopedia|repeat-[abc]\.md|big\.json/i.test(args) ||
+        (/encyclopedia|repeat-[abc]/i.test(args) && /\.md/i.test(args))
+      ) {
+        largeDocReads += 1;
+      }
+      if (
+        name.includes("todo") &&
+        /fill context|mass.?read|encyclopedia|repeat-[abc]|big\.json|AGENTS\.md|заповн/i.test(
+          args,
+        )
+      ) {
+        fillContextTodos += 1;
+      }
+    }
+  }
+
+  return (
+    agentsReads >= 1 ||
+    largeDocReads >= 1 ||
+    fillContextTodos >= 1 ||
+    restartPlans >= 1
+  );
+}
+
+export function buildPostCompactRefillBreakNote(): string {
+  return [
+    "",
+    "[Post-compact loop break] Context was compacted. Refilling context is forbidden.",
+    "Do NOT read AGENTS.md again. Do NOT re-read large docs already covered in the summary DONE section.",
+    "Do NOT recreate fill-context / mass-Read todos.",
+    "Use DONE findings to finish the user deliverable now, or take one concrete finishing action — then stop.",
+  ].join(" ");
+}
+
+/** Hard refusal text replacing corpus-refill tool output after compaction. */
+export function buildPostCompactRefillRefusal(): string {
+  return [
+    "[Post-compact refill refused]",
+    "Context was compacted. Re-reading AGENTS.md / large corpus files / TodoWrite / fill-context work is forbidden.",
+    "Do NOT call more tools.",
+    "Write the final answer as plain text NOW from the anchored summary DONE findings (routes, flags, redirects, refresh, steps).",
+    "If a concrete value is missing from the summary, state that single gap in plain text and stop.",
+  ].join(" ");
+}
+
+/**
+ * True when a tool call is attempting post-compact context refill
+ * (AGENTS.md, encyclopedia/repeat/big.json, or fill-context todos).
+ */
+export function isPostCompactRefillToolCall(
+  toolName: string,
+  decodedArgs: string,
+): boolean {
+  const name = (toolName || "").toLowerCase();
+  const args = decodedArgs || "";
+  if (/AGENTS\.md/i.test(args)) return true;
+  if (
+    /encyclopedia|repeat-[abc]\.md|big\.json|workqueue-encyclopedia/i.test(args)
+  ) {
+    return true;
+  }
+  // After compact, TodoWrite almost always restarts planning instead of
+  // producing the plain-text final answer — refuse it.
+  if (name.includes("todo")) return true;
+  if (
+    /fill context|mass.?read|encyclopedia|repeat-[abc]|big\.json|AGENTS\.md|заповн/i.test(
+      args,
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** Choose the strongest applicable loop-break note for the current history. */
+export function buildLoopBreakNoteForMessages(
+  messages: OpenAIMessage[],
+): string {
+  if (detectPostCompactRefillLoop(messages)) {
+    return buildPostCompactRefillBreakNote();
+  }
+  if (detectAgentsMdReplanLoop(messages)) {
+    return buildReplanLoopBreakNote();
+  }
+  return "";
+}
+
+/**
+ * Detect the common OpenCode↔Cursor thrash: assistant keeps restating
+ * "read AGENTS.md then …" and re-invokes AGENTS.md / the same discovery
+ * without finishing. Used to inject a loop-break note into mcpResults / prompts.
+ *
+ * Intentionally strict: normal first-pass context fill mentions AGENTS.md +
+ * TodoWrite often and must NOT trip this.
+ */
+export function detectAgentsMdReplanLoop(messages: OpenAIMessage[]): boolean {
+  let agentsReadAttempts = 0;
+  let gitStatusAttempts = 0;
+  let restartPlans = 0;
+  let agentsMissingResults = 0;
+
+  for (const msg of messages) {
+    if (msg.role === "assistant") {
+      const text = textContent(msg.content);
+      // Skip anchored compaction summaries — they mention AGENTS.md / reads.
+      if (
+        /^##\s*objective\b/im.test(text) &&
+        (/##\s*work state\b/im.test(text) || /\bimportant details\b/i.test(text))
+      ) {
+        continue;
+      }
+      const lower = text.toLowerCase();
+      const mentionsAgents = lower.includes("agents.md");
+      const mentionsRead =
+        lower.includes("read") ||
+        lower.includes("check") ||
+        lower.includes("перевір") ||
+        lower.includes("читаю") ||
+        lower.includes("прочит");
+      // Require real VCS/finishing language — NOT mere "todo", which fires on
+      // every legitimate TodoWrite planning turn during context fill.
+      const mentionsGitWork =
+        lower.includes("push") ||
+        lower.includes("git status") ||
+        lower.includes("commit") ||
+        lower.includes("коміт") ||
+        lower.includes("запуш");
+      if (mentionsAgents && mentionsRead && mentionsGitWork) {
+        restartPlans += 1;
+      }
+      if (Array.isArray(msg.tool_calls)) {
+        for (const call of msg.tool_calls) {
+          const args = call.function?.arguments ?? "";
+          if (/AGENTS\.md/i.test(args)) agentsReadAttempts += 1;
+          if (/git\s+status/i.test(args)) gitStatusAttempts += 1;
+        }
+      }
+      continue;
+    }
+    if (msg.role === "tool") {
+      const content = textContent(msg.content);
+      if (
+        /File not found:.*AGENTS\.md/i.test(content) ||
+        /AGENTS\.md.*not found/i.test(content) ||
+        /cannot access .*AGENTS\.md/i.test(content) ||
+        /ENOENT.*AGENTS\.md/i.test(content)
+      ) {
+        agentsMissingResults += 1;
+        agentsReadAttempts += 1;
+      }
+    }
+  }
+
+  return (
+    restartPlans >= 3 ||
+    (agentsReadAttempts >= 3 && gitStatusAttempts >= 2) ||
+    (agentsMissingResults >= 2 && restartPlans >= 2) ||
+    (agentsReadAttempts >= 4 && restartPlans >= 2)
+  );
+}
+
+/** Appended to tool output / prompts when detectAgentsMdReplanLoop trips. */
+export function buildReplanLoopBreakNote(): string {
+  return [
+    "",
+    "[Loop break] You already checked AGENTS.md and/or repeated the same discovery plan without finishing.",
+    "Do NOT read AGENTS.md again. Do NOT restart the whole plan from scratch.",
+    "Take the next concrete finishing action for the user's actual objective now, or stop and state the blocker.",
+  ].join(" ");
+}
+
 /** Drop unresolved pending tool calls from a checkpoint after user interrupt. */
 export function sanitizeCheckpointAfterInterrupt(
   checkpoint: Uint8Array | null,
@@ -2750,7 +3255,18 @@ function deriveConversationKey(body: ChatCompletionRequest): string {
   // cause convKey to rotate and lose the stored conversation checkpoint.
   // Only firstUserText is used — it's the stable initial user message.
   // Always apply ns so /compact and title-gen never reuse the live agent checkpoint.
-  const fallbackSeed = `${ns}user:${firstUserText}`;
+  let fallbackSeed = `${ns}user:${firstUserText}`;
+  // After compact, OpenCode rewrites history so every session starts with the
+  // same synthetic user ("What did we do so far?"). Without a fingerprint,
+  // concurrent sessions collide on one Cursor conversationId and cross-talk.
+  if (!identity && isPostCompactHistory(body.messages)) {
+    const summary = extractAnchoredSummary(body.messages);
+    const fingerprint = createHash("sha256")
+      .update(summary || `user:${firstUserText}`)
+      .digest("hex")
+      .slice(0, 16);
+    fallbackSeed = `${ns}postcompact:${fingerprint}:user:${firstUserText}`;
+  }
   const seed = identity ? `${ns}${identity}` : `fallback:${fallbackSeed}`;
   return createHash("sha256")
     .update(`conv:${seed}`)
@@ -2787,6 +3303,11 @@ interface RetryContext {
   mcpTools: McpToolDefinition[];
   /** Consecutive internal stall recoveries without forward progress (reset on progress). */
   stallRecoveryCount: number;
+  /**
+   * How many times we already nudged after a "plan then stop" completion for
+   * this conversation turn. Caps auto-continue so we cannot loop forever.
+   */
+  unfinishedPlanNudges?: number;
   // Cursor's server still handles the literal default model's auto-selection
   // and rate-limit routing internally.
 }
@@ -3221,9 +3742,14 @@ function createBridgeStreamResponse(
         const isTitleGenStream = convKey.startsWith("title:");
         let mcpExecReceived = false;
         let anyContentSent = false;
+        /** Visible assistant text (not thinking/reasoning). Thinking-only
+         *  closes must still count as empty so we retry instead of freezing. */
+        let anyVisibleTextSent = false;
+        let visibleTextAccum = "";
         let blobNotFound = false;
         let connectError = false;
         let emptyCloseRetry = false;
+        let unfinishedPlanNudge = false;
         let watchdogHandled = false;
         let attemptSuperseded = false;
         let lastProgressAt = Date.now();
@@ -3298,7 +3824,11 @@ function createBridgeStreamResponse(
                   } else {
                     const { content, reasoning } = tagFilter.process(text);
                     if (reasoning) sendSSE(makeChunk({ reasoning_content: reasoning }));
-                    if (content) sendSSE(makeChunk({ content }));
+                    if (content) {
+                      anyVisibleTextSent = true;
+                      visibleTextAccum += content;
+                      sendSSE(makeChunk({ content }));
+                    }
                   }
                 },
                   // onMcpExec — the model wants to execute a tool.
@@ -3624,13 +4154,36 @@ function createBridgeStreamResponse(
             return;
           }
 
+          // Flush any buffered visible text before empty / unfinished-plan checks
+          // so we do not miss a trailing plan sentence still sitting in the filter.
+          {
+            const flushedEarly = tagFilter.flush();
+            if (flushedEarly.reasoning) {
+              sendSSE(makeChunk({ reasoning_content: flushedEarly.reasoning }));
+            }
+            if (flushedEarly.content) {
+              anyVisibleTextSent = true;
+              anyContentSent = true;
+              visibleTextAccum += flushedEarly.content;
+              sendSSE(makeChunk({ content: flushedEarly.content }));
+            }
+          }
+
           // Guard against silent empty completions: stream closed before any usable
           // content or tool call reached SSE, but no explicit Connect error surfaced.
           // This happens when Cursor silently rejects large conversation states.
+          // Also treat thinking-only closes as empty — OpenCode shows nothing and
+          // the agent looks frozen.
           // Strategy: retry once with the same request, then retry once more with
           // a cleared checkpoint (fresh conversation state).
-          if (!mcpExecReceived && !anyContentSent && attempt < maxConnectRetries && liveAccessToken && liveRequestBytes) {
+          const usableOutput = mcpExecReceived || anyVisibleTextSent;
+          if (!usableOutput && attempt < maxConnectRetries && liveAccessToken && liveRequestBytes) {
             emptyCloseRetry = true;
+            if (anyContentSent && !anyVisibleTextSent) {
+              log.warn(
+                `[proxy] thinking-only stream close — treating as empty (bridgeKey=${bridgeKey})`,
+              );
+            }
           }
           if (emptyCloseRetry) {
             deleteActiveBridge(bridgeKey);
@@ -3679,17 +4232,55 @@ function createBridgeStreamResponse(
             }
           }
 
+          // Model wrote a short "I'll do X…" plan then stopped with no tool call.
+          // OpenCode ends the turn → looks like the agent froze. Nudge once.
+          if (
+            !mcpExecReceived &&
+            anyVisibleTextSent &&
+            retryCtx &&
+            liveAccessToken &&
+            (retryCtx.unfinishedPlanNudges ?? 0) < 1 &&
+            looksLikeUnfinishedPlan(visibleTextAccum)
+          ) {
+            unfinishedPlanNudge = true;
+          }
+          if (unfinishedPlanNudge && retryCtx && liveAccessToken) {
+            retryCtx.unfinishedPlanNudges = (retryCtx.unfinishedPlanNudges ?? 0) + 1;
+            const nudgeText = buildUnfinishedPlanNudgeUserText(visibleTextAccum);
+            log.warn(
+              `[proxy] unfinished-plan stop — nudging once convKey=${convKey} bridgeKey=${bridgeKey} priorChars=${visibleTextAccum.length}`,
+            );
+            deleteActiveBridge(bridgeKey);
+            attemptBridge.kill();
+            const freshPayload = buildCursorRequest(
+              retryCtx.selection,
+              retryCtx.systemPrompt,
+              nudgeText,
+              retryCtx.stored.conversationId,
+              retryCtx.stored.checkpoint,
+              retryCtx.stored.blobStore,
+              [],
+            );
+            freshPayload.mcpTools = retryCtx.mcpTools;
+            liveRequestBytes = freshPayload.requestBytes;
+            retryCtx.effectiveUserText = nudgeText;
+            setTimeout(() => {
+              if (closed) return;
+              const { bridge: retryBridge, heartbeatTimer: retryTimer } =
+                startBridge(liveAccessToken!, liveRequestBytes!);
+              runAttempt(retryBridge, retryTimer, attemptBlobStore, attemptMcpTools, attempt + 1);
+            }, 200);
+            return;
+          }
+
           const active = activeBridges.get(bridgeKey);
           const currentAttemptIsActive = active?.bridge === attemptBridge;
 
           if (!mcpExecReceived) {
-            const flushed = tagFilter.flush();
-            if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-            if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
-            // If no content was ever sent, surface an explicit error instead of
+            // If no visible content was ever sent, surface an explicit error instead of
             // a silent empty completion that looks like "instant empty reply" in Discord.
             // Suppress for title-gen to avoid polluting Discord thread names.
-            if (!anyContentSent && !isTitleGenStream) {
+            if (!anyVisibleTextSent && !isTitleGenStream) {
               log.warn(`[proxy] All retries exhausted; sending empty-stream error (bridgeKey=${bridgeKey})`);
               sendSSE(makeChunk({ content: "\n[Error: Cursor returned empty response. Try sending your message again.]" }));
             }
@@ -3854,9 +4445,22 @@ function handleToolResultResume(
   release: () => void,
   workspaceRoot?: string,
   abortSignal?: AbortSignal,
+  messages: OpenAIMessage[] = [],
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
   active.lastAccessMs = Date.now();
+
+  // When the model is thrashing after compaction (context refill) or on
+  // AGENTS.md / git status restarts, append a loop-break note to tool output.
+  const stored = conversationStates.get(convKey);
+  const postCompact =
+    !!stored?.postCompactActive || isPostCompactHistory(messages);
+  const breakNote = buildLoopBreakNoteForMessages(messages);
+  if (breakNote) {
+    log.warn(
+      `[proxy] loop-break note on tool resume bridgeKey=${bridgeKey} postCompact=${postCompact}`,
+    );
+  }
 
   // Send mcpResult for each pending exec that has a matching tool result.
   // Unmatched pending execs get an explicit error so Cursor does not hang
@@ -3865,6 +4469,20 @@ function handleToolResultResume(
     const result = toolResults.find(
       (r) => r.toolCallId === exec.toolCallId,
     );
+    let resultText = "";
+    if (result) {
+      if (
+        postCompact &&
+        isPostCompactRefillToolCall(exec.toolName, exec.decodedArgs)
+      ) {
+        resultText = buildPostCompactRefillRefusal();
+        log.warn(
+          `[proxy] post-compact refill refused tool=${exec.toolName} bridgeKey=${bridgeKey}`,
+        );
+      } else {
+        resultText = `${result.content}${breakNote}`;
+      }
+    }
     const mcpResult = result
       ? create(McpResultSchema, {
           result: {
@@ -3874,7 +4492,7 @@ function handleToolResultResume(
                 create(McpToolResultContentItemSchema, {
                   content: {
                     case: "text",
-                    value: create(McpTextContentSchema, { text: result.content }),
+                    value: create(McpTextContentSchema, { text: resultText }),
                   },
                 }),
               ],
@@ -3907,6 +4525,21 @@ function handleToolResultResume(
     );
   }
 
+  const postedToolResults = toolResults.map((r, index) => {
+    const exec = pendingExecs.find((e) => e.toolCallId === r.toolCallId);
+    if (
+      postCompact &&
+      exec &&
+      isPostCompactRefillToolCall(exec.toolName, exec.decodedArgs)
+    ) {
+      return { ...r, content: buildPostCompactRefillRefusal() };
+    }
+    if (breakNote && index === toolResults.length - 1) {
+      return { ...r, content: `${r.content}${breakNote}` };
+    }
+    return r;
+  });
+
   // Post-tool stalls must not replay the original Run bytes (mcpResults would
   // be lost). Instead createBridgeStreamResponse rebuilds from the checkpoint
   // and re-attaches these tool results as a continuation prompt.
@@ -3920,7 +4553,7 @@ function handleToolResultResume(
     workspaceRoot,
     STALL_TIMEOUT_POST_TOOL_MS,
     false,
-    toolResults,
+    postedToolResults,
     false,
     abortSignal,
   );
