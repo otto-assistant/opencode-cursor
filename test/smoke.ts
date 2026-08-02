@@ -2786,6 +2786,94 @@ async function testInterruptSteerHelpers() {
     "Unfinished-plan nudge must demand a tool call or final answer",
   );
 
+  assert(
+    !proxy.detectRestatedPlanLoop([
+      { role: "user", content: "rebuild and restart prod on :8888" },
+      {
+        role: "assistant",
+        content: "I'll rebuild the web assets, then restart :8888 without a password.",
+      },
+    ]),
+    "A single unfinished plan must not trip the restated-plan detector",
+  );
+  assert(
+    proxy.detectRestatedPlanLoop([
+      { role: "user", content: "rebuild and restart prod on :8888" },
+      {
+        role: "assistant",
+        content: "Not yet — rebuild/restart hadn’t run. Doing that now.",
+        tool_calls: [
+          {
+            id: "b1",
+            type: "function",
+            function: { name: "bash", arguments: "{\"command\":\"bun run build:web\"}" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: "✓ built in 2m 15s\nPWA built\n",
+        tool_call_id: "b1",
+      },
+      {
+        role: "assistant",
+        content: "Ще ні — rebuild/restart не завершився. Зараз зупиню :8888 і підніму без пароля.",
+      },
+      {
+        role: "assistant",
+        content: "Not yet — rebuild/restart hadn’t run. Doing that now.",
+      },
+    ]),
+    "Restating the same rebuild plan after successful build output must be detected",
+  );
+  assert(
+    proxy.detectRestatedPlanLoop([
+      { role: "user", content: "stop port 8888" },
+      {
+        role: "assistant",
+        content: "I'll stop the :8888 process now.",
+        tool_calls: [
+          {
+            id: "s1",
+            type: "function",
+            function: {
+              name: "bash",
+              arguments: "{\"command\":\"node packages/web/bin/cli.js stop --port 8888\"}",
+            },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: "Error:\nOpenCode did not settle this tool after the session went idle.",
+        tool_call_id: "s1",
+      },
+    ]),
+    "OpenCode settle/idle tool errors must trip restated-plan recovery",
+  );
+  assert(
+    proxy
+      .buildRestatedPlanLoopBreakNote()
+      .toLowerCase()
+      .includes("did not settle"),
+    "Restated-plan break note must mention settle/idle recovery",
+  );
+
+  const hugeToolOut = `${"line\n".repeat(8_000)}✓ built in 2m 15s\n`;
+  const truncatedToolOut = proxy.truncateToolResultForCursor(hugeToolOut);
+  assert(
+    truncatedToolOut.length < hugeToolOut.length,
+    "Huge tool output must be truncated for Cursor mcpResult",
+  );
+  assert(
+    truncatedToolOut.includes("truncated") && truncatedToolOut.includes("✓ built"),
+    "Truncation must keep a marker and the tail success line",
+  );
+  assert(
+    proxy.truncateToolResultForCursor("short ok") === "short ok",
+    "Small tool output must pass through unchanged",
+  );
+
   const dirty = create(ConversationStateStructureSchema, {
     rootPromptMessagesJson: [],
     turns: [],
