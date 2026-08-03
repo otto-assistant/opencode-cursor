@@ -91,6 +91,22 @@ export const FALLBACK_MODELS: CursorModel[] = [
   flatModel("grok-4-fast-reasoning", "Grok 4 Fast Reasoning", true, 200_000, 64_000),
 ];
 
+/**
+ * Minimal catalog seeded while logged out. OpenCode removes providers that
+ * have zero models from `provider.list()`, which hides Cursor in OpenChamber's
+ * provider settings and blocks the OAuth connect button. A single placeholder
+ * keeps the provider visible without advertising a fake model catalog.
+ */
+export const LOGIN_PLACEHOLDER_MODELS: CursorModel[] = [
+  flatModel(
+    "default",
+    "Cursor (authorize to load models)",
+    false,
+    200_000,
+    64_000,
+  ),
+];
+
 interface VariantDescriptor {
   key: string;
   idSuffixes: readonly string[];

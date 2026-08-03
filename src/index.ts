@@ -19,6 +19,7 @@ import {
 import {
   getCursorModels,
   FALLBACK_MODELS,
+  LOGIN_PLACEHOLDER_MODELS,
   resolveCursorModelSelection,
   type CursorModel,
 } from "./models.js";
@@ -166,8 +167,10 @@ export const CursorAuthPlugin: Plugin = async (
     // longer surface a plugin's dynamic `provider.models()` hook there. Seed a
     // concrete `cursor` provider here so it always appears, without clobbering
     // any user-defined overrides. The dynamic hook + auth loader below still
-    // refine connection details and models at runtime. When logged out, seed
-    // the provider shell only — never inject hardcoded fallback models.
+    // refine connection details and models at runtime. When logged out, seed a
+    // login placeholder model so OpenCode does not drop the provider (empty
+    // model maps are removed from provider.list, which hides Cursor in
+    // OpenChamber). After OAuth, discovery replaces the placeholder.
     async config(config) {
       const models = await resolveConfigModels();
       rememberModels(models);
@@ -344,7 +347,7 @@ export const CursorAuthPlugin: Plugin = async (
             return {
               url: loginUrl,
               instructions:
-                "Complete login in your browser. This window will close automatically.",
+                "Open the link below in your browser to authorize Cursor. After you approve access, return here and click Complete — the model list will load automatically.",
               method: "auto" as const,
               async callback() {
                 const { accessToken, refreshToken } = await pollCursorAuth(
@@ -529,14 +532,20 @@ function ensureCursorProviderConfig(
 /**
  * Resolve the model list used to seed the static provider config. Prefers the
  * full set discovered from Cursor (using the stored OAuth access token) so the
- * whole catalog shows up in the menu. When logged out (no token), returns an
- * empty list so hardcoded fallback models are never injected into OpenCode.
+ * whole catalog shows up in the menu.
+ *
+ * When logged out (no token), seeds a single login placeholder model. OpenCode
+ * drops providers with zero models from `provider.list()`, which would hide
+ * Cursor entirely in OpenChamber's provider UI (no auth button, no connect
+ * target). The placeholder keeps the provider visible so OAuth can run; after
+ * login, discovery replaces it with the real catalog.
+ *
  * When logged in but discovery is slow/unavailable, falls back to the bundled
  * list. Never throws.
  */
 async function resolveConfigModels(): Promise<CursorModel[]> {
   const token = readStoredCursorAccessToken();
-  if (!token) return [];
+  if (!token) return LOGIN_PLACEHOLDER_MODELS;
   try {
     const discovered = await withTimeout(getCursorModels(token), 4000);
     return discovered.length > 0 ? discovered : FALLBACK_MODELS;

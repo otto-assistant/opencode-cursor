@@ -52,8 +52,9 @@ export async function pollCursorAuth(
   let consecutiveErrors = 0;
 
   for (let attempt = 0; attempt < POLL_MAX_ATTEMPTS; attempt++) {
-    await Bun.sleep(delay);
-
+    // OpenChamber calls callback() after the user clicks Complete — often once
+    // browser login already finished. Poll immediately on the first attempt so
+    // the auth link flow does not wait an extra second before succeeding.
     try {
       const response = await fetch(
         `${CURSOR_POLL_URL}?uuid=${uuid}&verifier=${verifier}`,
@@ -63,6 +64,7 @@ export async function pollCursorAuth(
       if (response.status === 404) {
         consecutiveErrors = 0;
         delay = Math.min(delay * POLL_BACKOFF_MULTIPLIER, POLL_MAX_DELAY);
+        await Bun.sleep(delay);
         continue;
       }
 
@@ -78,13 +80,15 @@ export async function pollCursorAuth(
       }
 
       throw new Error(`Poll failed: ${response.status}`);
-    } catch {
+    } catch (err) {
       consecutiveErrors++;
       if (consecutiveErrors >= 3) {
+        const detail = err instanceof Error ? err.message : String(err);
         throw new Error(
-          "Too many consecutive errors during Cursor auth polling",
+          `Too many consecutive errors during Cursor auth polling: ${detail}`,
         );
       }
+      await Bun.sleep(delay);
     }
   }
 

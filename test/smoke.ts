@@ -650,6 +650,34 @@ async function testPluginShape(modules: TestModules) {
   if (typeof hooks.auth.methods[0].authorize !== "function") {
     throw new Error("Plugin auth method missing authorize function");
   }
+  if (hooks.auth.methods[0].label !== "Login with Cursor") {
+    throw new Error(
+      `Expected auth method label 'Login with Cursor', got '${hooks.auth.methods[0].label}'`,
+    );
+  }
+
+  const authStart = await hooks.auth.methods[0].authorize();
+  if (!authStart || typeof authStart !== "object") {
+    throw new Error("Expected authorize() to return an OAuth result");
+  }
+  if (authStart.method !== "auto") {
+    throw new Error(`Expected OAuth method 'auto', got '${authStart.method}'`);
+  }
+  if (typeof authStart.url !== "string" || !authStart.url.includes("cursor.com")) {
+    throw new Error(`Expected Cursor login URL, got '${String(authStart.url)}'`);
+  }
+  if (
+    typeof authStart.instructions !== "string" ||
+    !authStart.instructions.toLowerCase().includes("link")
+  ) {
+    throw new Error(
+      "Expected authorize() instructions to mention the login link for OpenChamber",
+    );
+  }
+  if (typeof authStart.callback !== "function") {
+    throw new Error("Expected authorize() result to include callback()");
+  }
+
   if (typeof hooks["chat.headers"] !== "function") {
     throw new Error("Plugin hooks missing 'chat.headers'");
   }
@@ -1466,7 +1494,8 @@ async function testConfigHookSeedsProvider(
     throw new Error("Plugin hooks.config is not a function");
   }
 
-  // Fresh config while logged out: provider shell only — no hardcoded models.
+  // Fresh config while logged out: keep a single login placeholder so OpenCode
+  // / OpenChamber still list the Cursor provider (empty models are dropped).
   const fresh: any = {};
   await hooks.config!(fresh);
   const cursor = fresh.provider?.cursor;
@@ -1476,15 +1505,25 @@ async function testConfigHookSeedsProvider(
   assert(cursor.options?.baseURL, "Expected seeded options.baseURL");
   assertEqual(
     Object.keys(cursor.models ?? {}).length,
-    0,
-    "Expected no hardcoded models when logged out",
+    1,
+    "Expected a single login placeholder model when logged out",
+  );
+  assert(
+    "default" in (cursor.models ?? {}),
+    "Expected login placeholder default model when logged out",
+  );
+  assertEqual(
+    cursor.models.default.name,
+    "Cursor (authorize to load models)",
+    "Expected login placeholder display name",
   );
   assert(
     !("composer-1" in (cursor.models ?? {})),
     "Expected fallback model composer-1 not to be seeded when logged out",
   );
 
-  // User overrides must be preserved; logged-out must not inject fallbacks.
+  // User overrides must be preserved; logged-out must not inject the full
+  // fallback catalog over a user's explicit model list.
   const custom: any = {
     provider: {
       cursor: {
@@ -1506,11 +1545,6 @@ async function testConfigHookSeedsProvider(
   );
   assertEqual(c2.options.apiKey, "x", "Expected user option to be preserved");
   assert("my-model" in c2.models, "Expected user model to be preserved");
-  assertEqual(
-    Object.keys(c2.models).length,
-    1,
-    "Expected only user models when logged out (no hardcoded fallbacks)",
-  );
   assert(
     !("composer-1" in c2.models),
     "Expected fallback models not to be merged when logged out",
