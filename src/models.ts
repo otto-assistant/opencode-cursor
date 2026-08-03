@@ -241,8 +241,18 @@ async function fetchCursorUsableModels(
 
 let cachedModels: CursorModel[] | null = null;
 
+export type GetCursorModelsOptions = {
+  /**
+   * When false, return an empty list instead of the hardcoded FALLBACK_MODELS
+   * catalog. Use this for provider/config UI seeding so OpenChamber never shows
+   * the bundled ~14 models as if they were the live Cursor catalog (~50).
+   */
+  allowFallback?: boolean;
+};
+
 export async function getCursorModels(
   apiKey: string,
+  options?: GetCursorModelsOptions,
 ): Promise<CursorModel[]> {
   if (cachedModels) return cachedModels;
   const discovered =
@@ -255,6 +265,7 @@ export async function getCursorModels(
     cachedModels = discovered;
     return cachedModels;
   }
+  if (options?.allowFallback === false) return [];
   return FALLBACK_MODELS;
 }
 
