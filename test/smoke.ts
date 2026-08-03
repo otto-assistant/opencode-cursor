@@ -1500,7 +1500,7 @@ async function testConfigHookSeedsProvider(
   await hooks.config!(fresh);
   const cursor = fresh.provider?.cursor;
   assert(cursor, "Expected config hook to create provider.cursor");
-  assertEqual(cursor.name, "Cursor", "Expected seeded provider name");
+  assertEqual(cursor.name, "Cursor (sign in required)", "Expected seeded provider name");
   assertEqual(cursor.npm, "@ai-sdk/openai-compatible", "Expected seeded npm");
   assert(cursor.options?.baseURL, "Expected seeded options.baseURL");
   assertEqual(
@@ -1550,7 +1550,8 @@ async function testConfigHookSeedsProvider(
     "Expected fallback models not to be merged when logged out",
   );
 
-  // Logged in with empty discovery: seed fallback models for degraded use.
+  // Logged in with empty discovery: never advertise the hardcoded FALLBACK
+  // catalog (~14 models) in the provider UI — keep the login placeholder.
   await mkdir(join(loggedInDir, "opencode"), { recursive: true });
   await writeFile(
     join(loggedInDir, "opencode", "auth.json"),
@@ -1573,24 +1574,18 @@ async function testConfigHookSeedsProvider(
   await loggedInHooks.config!(degraded);
   const degradedCursor = degraded.provider?.cursor;
   assert(degradedCursor, "Expected config hook to create provider.cursor");
-  assert(
-    "composer-1" in degradedCursor.models,
-    "Expected fallback model composer-1 when logged in but discovery fails",
-  );
   assertEqual(
-    degradedCursor.models["composer-1"].reasoning,
-    false,
-    "Expected Cursor config models to bypass OpenCode generic variant generation",
+    Object.keys(degradedCursor.models ?? {}).length,
+    1,
+    "Expected login placeholder instead of hardcoded fallback catalog when discovery fails",
   );
   assert(
-    Array.isArray(degradedCursor.models["composer-1"].modalities?.input) &&
-      degradedCursor.models["composer-1"].modalities.input.includes("image"),
-    "Expected seeded Cursor models to declare modalities.input including image",
+    "default" in degradedCursor.models,
+    "Expected login placeholder default model when discovery fails",
   );
   assert(
-    Array.isArray(degradedCursor.models["composer-1"].capabilities?.input) &&
-      degradedCursor.models["composer-1"].capabilities.input.includes("image"),
-    "Expected seeded Cursor models to declare capabilities.input including image",
+    !("composer-1" in degradedCursor.models),
+    "Expected fallback model composer-1 not to be seeded when discovery fails",
   );
   assertEqual(
     degradedCursor.models.default.reasoning,
@@ -1607,10 +1602,33 @@ async function testConfigHookSeedsProvider(
     true,
     "Expected cursor/default max variant to be suppressed",
   );
-  assertEqual(
-    degradedCursor.models["composer-1"].variants.medium.disabled,
-    true,
-    "Expected unsupported generic variants to be suppressed on flat models",
+
+  // Logged in with successful discovery: seed the live catalog (not fallback).
+  modules.clearModelCache();
+  backend.setDiscoveryMode("success");
+  backend.setDiscoveredModels([
+    { id: "composer-2", name: "Composer 2", reasoning: true },
+    { id: "claude-4.6-sonnet-medium", name: "Claude 4.6 Sonnet", reasoning: true },
+  ]);
+  // AvailableModels path takes priority; leave it unset so GetUsableModels is used.
+  backend.setAvailableModels(undefined);
+
+  const liveHooks = await modules.CursorAuthPlugin(fakeInput);
+  const live: any = {};
+  await liveHooks.config!(live);
+  const liveCursor = live.provider?.cursor;
+  assert(liveCursor, "Expected config hook to create provider.cursor");
+  assert(
+    "composer-2" in liveCursor.models,
+    "Expected discovered composer-2 when logged in with successful discovery",
+  );
+  assert(
+    "claude-4.6-sonnet-medium" in liveCursor.models,
+    "Expected discovered claude model when logged in with successful discovery",
+  );
+  assert(
+    !("composer-1" in liveCursor.models) || liveCursor.models["composer-2"],
+    "Expected live discovery catalog rather than only hardcoded fallbacks",
   );
 
   backend.setDiscoveryMode("success");

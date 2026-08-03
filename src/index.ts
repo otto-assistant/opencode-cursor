@@ -5,7 +5,7 @@
  * 1. Browser-based OAuth login to Cursor
  * 2. Local proxy translating OpenAI format → Cursor gRPC protocol
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
@@ -18,7 +18,7 @@ import {
 } from "./auth.js";
 import {
   getCursorModels,
-  FALLBACK_MODELS,
+  clearModelCache,
   LOGIN_PLACEHOLDER_MODELS,
   resolveCursorModelSelection,
   type CursorModel,
@@ -103,7 +103,14 @@ async function loadCursorRuntime(
     }
   }
 
-  const models = await getCursorModels(accessToken);
+  // Never advertise the hardcoded FALLBACK catalog through the provider hook —
+  // OpenChamber's provider page would show ~14 stale models instead of the live
+  // Cursor catalog. If discovery fails, keep a login placeholder until retry.
+  const discovered = await getCursorModels(accessToken, {
+    allowFallback: false,
+  });
+  const models =
+    discovered.length > 0 ? discovered : LOGIN_PLACEHOLDER_MODELS;
   onModels?.(models);
 
   // startProxy() is idempotent: if the proxy is already running on the same
@@ -355,6 +362,10 @@ export const CursorAuthPlugin: Plugin = async (
                   verifier,
                 );
 
+                // Drop any prior failed/empty discovery so the next config and
+                // provider.models() load fetches the live Cursor catalog.
+                clearModelCache();
+
                 return {
                   type: "success" as const,
                   refresh: refreshToken,
@@ -510,9 +521,18 @@ function ensureCursorProviderConfig(
       ? existing.models
       : {};
 
+  const placeholderOnly = isLoginPlaceholderCatalog(models);
+  const seededName = placeholderOnly
+    ? "Cursor (sign in required)"
+    : "Cursor";
+  const providerName =
+    typeof existing.name === "string" && existing.name.trim()
+      ? existing.name
+      : seededName;
+
   cfg.provider[CURSOR_PROVIDER_ID] = {
-    name: "Cursor",
     ...existing,
+    name: providerName,
     npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
     options: {
       baseURL: CURSOR_BASE_URL,
@@ -529,50 +549,135 @@ function ensureCursorProviderConfig(
   };
 }
 
+function isLoginPlaceholderCatalog(models: CursorModel[]): boolean {
+  return (
+    models.length === 1 &&
+    models[0]?.id === LOGIN_PLACEHOLDER_MODELS[0]!.id &&
+    models[0]?.name === LOGIN_PLACEHOLDER_MODELS[0]!.name
+  );
+}
+
 /**
  * Resolve the model list used to seed the static provider config. Prefers the
  * full set discovered from Cursor (using the stored OAuth access token) so the
  * whole catalog shows up in the menu.
  *
- * When logged out (no token), seeds a single login placeholder model. OpenCode
- * drops providers with zero models from `provider.list()`, which would hide
- * Cursor entirely in OpenChamber's provider UI (no auth button, no connect
- * target). The placeholder keeps the provider visible so OAuth can run; after
- * login, discovery replaces it with the real catalog.
+ * When logged out — or when a stored token cannot discover models — seeds a
+ * single login placeholder. OpenCode drops providers with zero models from
+ * `provider.list()`, which would hide Cursor in OpenChamber. We intentionally
+ * never seed the hardcoded FALLBACK_MODELS catalog into the provider UI: that
+ * advertised ~14 stale models as if they were the live Cursor list (~50).
  *
- * When logged in but discovery is slow/unavailable, falls back to the bundled
- * list. Never throws.
+ * Never throws.
  */
 async function resolveConfigModels(): Promise<CursorModel[]> {
-  const token = readStoredCursorAccessToken();
-  if (!token) return LOGIN_PLACEHOLDER_MODELS;
+  const stored = readStoredCursorAuth();
+  if (!stored) return LOGIN_PLACEHOLDER_MODELS;
+
+  let accessToken = stored.access;
+  if (!accessToken || stored.expires < Date.now()) {
+    try {
+      const refreshed = await refreshCursorToken(stored.refresh);
+      writeStoredCursorAuth({
+        type: "oauth",
+        access: refreshed.access,
+        refresh: refreshed.refresh,
+        expires: refreshed.expires,
+      });
+      accessToken = refreshed.access;
+    } catch (err) {
+      const summary = err instanceof Error ? err.message : String(err);
+      log.warn(
+        `[opencode-cursor] config model discovery refresh failed: ${summary}`,
+      );
+      return LOGIN_PLACEHOLDER_MODELS;
+    }
+  }
+
   try {
-    const discovered = await withTimeout(getCursorModels(token), 4000);
-    return discovered.length > 0 ? discovered : FALLBACK_MODELS;
-  } catch {
-    return FALLBACK_MODELS;
+    // Allow enough time for the HTTP/2 bridge + AvailableModels round-trip.
+    // The previous 4s budget often fell through to the hardcoded fallback list.
+    const discovered = await withTimeout(
+      getCursorModels(accessToken, { allowFallback: false }),
+      15_000,
+    );
+    if (discovered.length > 0) {
+      log.info(
+        `[opencode-cursor] discovered ${discovered.length} Cursor models for provider config`,
+      );
+      return discovered;
+    }
+    log.warn(
+      "[opencode-cursor] Cursor model discovery returned no models; seeding login placeholder",
+    );
+    return LOGIN_PLACEHOLDER_MODELS;
+  } catch (err) {
+    const summary = err instanceof Error ? err.message : String(err);
+    log.warn(
+      `[opencode-cursor] Cursor model discovery failed for config: ${summary}`,
+    );
+    return LOGIN_PLACEHOLDER_MODELS;
   }
 }
 
+type StoredCursorAuth = {
+  type: "oauth";
+  access?: string;
+  refresh: string;
+  expires: number;
+};
+
+function getOpencodeAuthPath(): string {
+  const base =
+    process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
+  return join(base, "opencode", "auth.json");
+}
+
 /**
- * Best-effort read of the stored Cursor OAuth access token from OpenCode's
- * auth store. Returns undefined if missing, malformed, or expired.
+ * Best-effort read of the stored Cursor OAuth entry from OpenCode's auth store.
+ * Returns undefined if missing or malformed. Expired access tokens are still
+ * returned when a refresh token is present so callers can refresh.
  */
-function readStoredCursorAccessToken(): string | undefined {
+function readStoredCursorAuth(): StoredCursorAuth | undefined {
   try {
-    const base =
-      process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
-    const authPath = join(base, "opencode", "auth.json");
-    const data = JSON.parse(readFileSync(authPath, "utf8"));
+    const data = JSON.parse(readFileSync(getOpencodeAuthPath(), "utf8"));
     const cursor = data?.[CURSOR_PROVIDER_ID];
     if (!cursor || cursor.type !== "oauth") return undefined;
-    if (typeof cursor.access !== "string" || !cursor.access) return undefined;
-    if (typeof cursor.expires === "number" && cursor.expires < Date.now()) {
-      return undefined;
-    }
-    return cursor.access;
+    if (typeof cursor.refresh !== "string" || !cursor.refresh) return undefined;
+    if (typeof cursor.expires !== "number") return undefined;
+    return {
+      type: "oauth",
+      access: typeof cursor.access === "string" ? cursor.access : undefined,
+      refresh: cursor.refresh,
+      expires: cursor.expires,
+    };
   } catch {
     return undefined;
+  }
+}
+
+function writeStoredCursorAuth(auth: StoredCursorAuth): void {
+  try {
+    const authPath = getOpencodeAuthPath();
+    let data: Record<string, unknown> = {};
+    try {
+      data = JSON.parse(readFileSync(authPath, "utf8")) as Record<
+        string,
+        unknown
+      >;
+    } catch {
+      data = {};
+    }
+    data[CURSOR_PROVIDER_ID] = {
+      type: "oauth",
+      access: auth.access,
+      refresh: auth.refresh,
+      expires: auth.expires,
+    };
+    writeFileSync(authPath, `${JSON.stringify(data, null, 2)}\n`);
+  } catch (err) {
+    const summary = err instanceof Error ? err.message : String(err);
+    log.warn(`[opencode-cursor] failed to persist refreshed Cursor auth: ${summary}`);
   }
 }
 
