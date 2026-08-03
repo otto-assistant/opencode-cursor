@@ -1437,7 +1437,12 @@ async function doHandleChatCompletion(
       });
     }
     effectiveUserText = buildPostToolBridgeLossContinuation(continuationResults);
-    if (detectPostCompactRefillLoop(body.messages) || detectAgentsMdReplanLoop(body.messages)) {
+    if (
+      detectPostCompactRefillLoop(body.messages) ||
+      detectAgentsMdStartupLoop(body.messages) ||
+      detectAgentsMdReplanLoop(body.messages) ||
+      detectRestatedPlanLoop(body.messages)
+    ) {
       const note = buildLoopBreakNoteForMessages(body.messages);
       if (note && !effectiveUserText.includes("[Post-compact") && !effectiveUserText.includes("[Loop break]")) {
         effectiveUserText = `${effectiveUserText}\n${note}`;
@@ -3134,10 +3139,284 @@ export function buildLoopBreakNoteForMessages(
   if (detectPostCompactRefillLoop(messages)) {
     return buildPostCompactRefillBreakNote();
   }
+  // Startup / mid-chat AGENTS.md thrash (missing file retries, TodoWrite ritual)
+  // must beat the generic replan detector so the break note matches the failure.
+  if (detectAgentsMdStartupLoop(messages)) {
+    return buildAgentsMdStartupLoopBreakNote();
+  }
   if (detectAgentsMdReplanLoop(messages)) {
     return buildReplanLoopBreakNote();
   }
+  if (detectRestatedPlanLoop(messages)) {
+    return buildRestatedPlanLoopBreakNote();
+  }
   return "";
+}
+
+/** True when a tool result shows AGENTS.md was missing / unreadable. */
+export function isAgentsMdMissingToolResult(content: string): boolean {
+  const text = content ?? "";
+  return (
+    /File not found:.*AGENTS\.md/i.test(text) ||
+    /AGENTS\.md.*not found/i.test(text) ||
+    /cannot access .*AGENTS\.md/i.test(text) ||
+    /ENOENT.*AGENTS\.md/i.test(text) ||
+    /no such file.*AGENTS\.md/i.test(text)
+  );
+}
+
+/**
+ * Detect chat-start / mid-session thrash on AGENTS.md and other mandatory
+ * startup rituals (TodoWrite "read AGENTS.md first") — with or without
+ * compaction, and WITHOUT requiring git/push language.
+ *
+ * Gaps closed vs detectAgentsMdReplanLoop:
+ * - Pure missing-file retries (AGENTS.md absent) never tripped the old detector
+ * - AGENTS.md + TodoWrite startup loops without VCS words never tripped it
+ *
+ * Intentionally allows a normal first-pass: one AGENTS.md read (+ optional
+ * TodoWrite) must NOT trip.
+ */
+export function detectAgentsMdStartupLoop(messages: OpenAIMessage[]): boolean {
+  let agentsReadAttempts = 0;
+  let agentsMissingResults = 0;
+  let agentsTodoWrites = 0;
+  let startupPlanRestates = 0;
+
+  for (const msg of messages) {
+    if (msg.role === "assistant") {
+      const text = textContent(msg.content);
+      // Skip anchored compaction summaries — they mention AGENTS.md / reads.
+      if (
+        /^##\s*objective\b/im.test(text) &&
+        (/##\s*work state\b/im.test(text) || /\bimportant details\b/i.test(text))
+      ) {
+        continue;
+      }
+      const lower = text.toLowerCase();
+      const mentionsAgents = lower.includes("agents.md");
+      const mentionsReadOrTodo =
+        lower.includes("read") ||
+        lower.includes("check") ||
+        lower.includes("перевір") ||
+        lower.includes("читаю") ||
+        lower.includes("прочит") ||
+        lower.includes("todo") ||
+        lower.includes("mandatory") ||
+        lower.includes("startup") ||
+        lower.includes("first");
+      if (mentionsAgents && mentionsReadOrTodo) {
+        startupPlanRestates += 1;
+      }
+      if (Array.isArray(msg.tool_calls)) {
+        for (const call of msg.tool_calls) {
+          const args = call.function?.arguments ?? "";
+          const name = (call.function?.name ?? "").toLowerCase();
+          if (/AGENTS\.md/i.test(args)) agentsReadAttempts += 1;
+          if (
+            name.includes("todo") &&
+            /AGENTS\.md|read agents|mandatory|startup|заповн/i.test(args)
+          ) {
+            agentsTodoWrites += 1;
+          }
+        }
+      }
+      continue;
+    }
+    if (msg.role === "tool") {
+      const content = textContent(msg.content);
+      if (isAgentsMdMissingToolResult(content)) {
+        agentsMissingResults += 1;
+      }
+    }
+  }
+
+  // Missing-file retry thrash (the classic OpenCode startup loop).
+  if (agentsMissingResults >= 2 && agentsReadAttempts >= 2) return true;
+  if (agentsMissingResults >= 3) return true;
+  // AGENTS.md + TodoWrite ritual restated without finishing.
+  if (agentsReadAttempts >= 2 && agentsTodoWrites >= 2) return true;
+  // Keep restating "must read AGENTS.md" while actually re-invoking it.
+  if (startupPlanRestates >= 3 && agentsReadAttempts >= 2) return true;
+  // Many AGENTS.md reads with almost as many misses — still thrashing.
+  if (
+    agentsReadAttempts >= 3 &&
+    agentsMissingResults >= Math.max(2, agentsReadAttempts - 1)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** Break note for AGENTS.md / startup-ritual thrash (chat start or mid-session). */
+export function buildAgentsMdStartupLoopBreakNote(): string {
+  return [
+    "",
+    "[Loop break] You already retried AGENTS.md / startup discovery without finishing.",
+    "Do NOT read AGENTS.md again. Do NOT recreate a TodoWrite checklist whose first item is reading AGENTS.md.",
+    "If AGENTS.md was missing, treat that as final — continue with the user's actual objective using other evidence.",
+    "Take one concrete finishing action now, or answer from what you already know, then stop.",
+  ].join(" ");
+}
+
+/**
+ * True when a tool call is another AGENTS.md / startup-ritual attempt that
+ * should be hard-refused once detectAgentsMdStartupLoop has tripped.
+ */
+export function isAgentsMdStartupRefillToolCall(
+  toolName: string,
+  decodedArgs: string,
+): boolean {
+  const name = (toolName || "").toLowerCase();
+  const args = decodedArgs || "";
+  if (/AGENTS\.md/i.test(args)) return true;
+  if (
+    name.includes("todo") &&
+    /AGENTS\.md|read agents|mandatory|startup|заповн|fill context/i.test(args)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** Hard refusal replacing AGENTS.md / startup-ritual tool output mid-loop. */
+export function buildAgentsMdStartupRefillRefusal(): string {
+  return [
+    "[Startup loop refused]",
+    "AGENTS.md / startup discovery already failed or was retried enough times.",
+    "Do NOT call read/TodoWrite for AGENTS.md again.",
+    "Answer the user's request now from available context, or take ONE non-AGENTS finishing action, then stop.",
+  ].join(" ");
+}
+
+/**
+ * Max chars of a single mcpResult payload sent back to Cursor.
+ * Huge shell/build logs (vite/webpack) can stall or kill the H2 bridge mid-resume;
+ * OpenCode then marks the session idle with unsettled tool parts.
+ * Override with OPENCODE_CURSOR_MCP_RESULT_MAX_CHARS.
+ */
+const MCP_RESULT_MAX_CHARS = Number(
+  process.env.OPENCODE_CURSOR_MCP_RESULT_MAX_CHARS ?? 24_000,
+);
+const MCP_RESULT_HEAD_CHARS = Number(
+  process.env.OPENCODE_CURSOR_MCP_RESULT_HEAD_CHARS ?? 16_000,
+);
+const MCP_RESULT_TAIL_CHARS = Number(
+  process.env.OPENCODE_CURSOR_MCP_RESULT_TAIL_CHARS ?? 6_000,
+);
+
+/**
+ * Truncate oversized tool output for Cursor mcpResult / continuation prompts.
+ * Keeps head + tail so build success lines near the end stay visible.
+ */
+export function truncateToolResultForCursor(content: string): string {
+  const text = content ?? "";
+  if (text.length <= MCP_RESULT_MAX_CHARS) return text;
+  const headN = Math.min(MCP_RESULT_HEAD_CHARS, MCP_RESULT_MAX_CHARS);
+  const tailN = Math.min(
+    MCP_RESULT_TAIL_CHARS,
+    Math.max(0, MCP_RESULT_MAX_CHARS - headN),
+  );
+  const head = text.slice(0, headN);
+  const tail = tailN > 0 ? text.slice(-tailN) : "";
+  const omitted = Math.max(0, text.length - head.length - tail.length);
+  return `${head}\n\n…[truncated ${omitted} chars of tool output for Cursor bridge stability]…\n\n${tail}`;
+}
+
+/** Action nouns/verbs used to fingerprint restated plans across turns. */
+function planActionTokens(text: string): string {
+  const tokens = text.toLowerCase().match(
+    /\b(rebuild|restart|build|stop|start|port|serve|password|unauth|agents\.md|git|push|commit|install|deploy|8888|vite|bun|npm|docker|compact|todo)\b/g,
+  );
+  return tokens ? [...new Set(tokens)].sort().join(" ") : "";
+}
+
+function isProgressDenialPlan(text: string): boolean {
+  return /\b(not yet|ще ні|hadn'?t run|не (зроблено|заверш|вийшло)|doing that now|зараз (роблю|зупиню|перезбер|підніму)|rebuild and restart|rebuild\/restart)\b/i.test(
+    text,
+  );
+}
+
+function toolResultShowsConcreteProgress(content: string): boolean {
+  return /✓\s*built|built in \d|listening on|started successfully|server (is )?up|exit[_ ]?code[=:]?\s*0|port \d+ (is )?free|✓ built/i.test(
+    content,
+  );
+}
+
+function toolResultLooksLikeSettleIdleError(content: string): boolean {
+  return /did not settle this tool|session went idle/i.test(content);
+}
+
+/**
+ * Detect non-compaction thrash: the model keeps restating the same unfinished
+ * plan ("Not yet — I'll rebuild…") across turns — even after tools already
+ * showed progress, or after OpenCode settle/idle tool errors.
+ *
+ * Distinct from AGENTS.md / post-compact refill detectors.
+ */
+export function detectRestatedPlanLoop(messages: OpenAIMessage[]): boolean {
+  let denialTurns = 0;
+  let unfinishedPlanTurns = 0;
+  let toolProgress = 0;
+  let settleErrors = 0;
+  const fingerprints: string[] = [];
+
+  for (const msg of messages) {
+    if (msg.role === "tool") {
+      const content = textContent(msg.content);
+      if (toolResultShowsConcreteProgress(content)) toolProgress += 1;
+      if (toolResultLooksLikeSettleIdleError(content)) settleErrors += 1;
+      continue;
+    }
+    if (msg.role !== "assistant") continue;
+    const text = textContent(msg.content).trim();
+    if (!text) continue;
+    // Skip anchored compaction summaries.
+    if (
+      /^##\s*objective\b/im.test(text) &&
+      (/##\s*work state\b/im.test(text) || /\bimportant details\b/i.test(text))
+    ) {
+      continue;
+    }
+
+    const denial = isProgressDenialPlan(text);
+    const unfinished = looksLikeUnfinishedPlan(text);
+    if (!denial && !unfinished) continue;
+    if (denial) denialTurns += 1;
+    if (unfinished) unfinishedPlanTurns += 1;
+    const fp = planActionTokens(text);
+    if (fp) fingerprints.push(fp);
+  }
+
+  let repeatedActionTokens = 0;
+  const tokenCounts = new Map<string, number>();
+  for (const fp of fingerprints) {
+    for (const token of fp.split(" ")) {
+      if (token.length < 4) continue;
+      tokenCounts.set(token, (tokenCounts.get(token) ?? 0) + 1);
+    }
+  }
+  for (const count of tokenCounts.values()) {
+    if (count >= 3) repeatedActionTokens += 1;
+  }
+
+  if (settleErrors >= 1) return true;
+  if (fingerprints.length >= 3 && repeatedActionTokens >= 2) return true;
+  if (toolProgress >= 1 && denialTurns >= 2) return true;
+  if (denialTurns >= 3) return true;
+  if (unfinishedPlanTurns >= 4 && fingerprints.length >= 3) return true;
+  return false;
+}
+
+/** Appended when detectRestatedPlanLoop trips (works with or without compact). */
+export function buildRestatedPlanLoopBreakNote(): string {
+  return [
+    "",
+    "[Loop break] You already restated the same plan without finishing, and/or tool output already shows progress.",
+    "Do NOT restate 'not yet' / the whole plan again.",
+    "Use the latest tool results: take the single next concrete finishing action, or report status and stop.",
+    "If a prior tool failed with 'session went idle' / 'did not settle', retry that ONE tool once — do not restart the entire task.",
+  ].join(" ");
 }
 
 /**
@@ -3210,7 +3489,10 @@ export function detectAgentsMdReplanLoop(messages: OpenAIMessage[]): boolean {
     restartPlans >= 3 ||
     (agentsReadAttempts >= 3 && gitStatusAttempts >= 2) ||
     (agentsMissingResults >= 2 && restartPlans >= 2) ||
-    (agentsReadAttempts >= 4 && restartPlans >= 2)
+    (agentsReadAttempts >= 4 && restartPlans >= 2) ||
+    // Missing-file thrash without VCS words — also covered by
+    // detectAgentsMdStartupLoop; keep a high-bar fallback here.
+    agentsMissingResults >= 3
   );
 }
 
@@ -4346,11 +4628,8 @@ function appendToolResultsToContinuation(
   if (!toolResults || toolResults.length === 0) return;
   for (const result of toolResults) {
     const content = result.content.trim() || "(no output)";
-    const truncated =
-      content.length > 4_000
-        ? `${content.slice(0, 4_000)}…`
-        : content;
-    parts.push(truncated);
+    // Head+tail truncation keeps build success lines near the end.
+    parts.push(truncateToolResultForCursor(content));
   }
 }
 
@@ -4450,15 +4729,17 @@ function handleToolResultResume(
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
   active.lastAccessMs = Date.now();
 
-  // When the model is thrashing after compaction (context refill) or on
-  // AGENTS.md / git status restarts, append a loop-break note to tool output.
+  // When the model is thrashing after compaction (context refill), on
+  // AGENTS.md startup rituals, or on git status restarts, append a
+  // loop-break note to tool output (and hard-refuse refill tools).
   const stored = conversationStates.get(convKey);
   const postCompact =
     !!stored?.postCompactActive || isPostCompactHistory(messages);
+  const startupLoop = detectAgentsMdStartupLoop(messages);
   const breakNote = buildLoopBreakNoteForMessages(messages);
   if (breakNote) {
     log.warn(
-      `[proxy] loop-break note on tool resume bridgeKey=${bridgeKey} postCompact=${postCompact}`,
+      `[proxy] loop-break note on tool resume bridgeKey=${bridgeKey} postCompact=${postCompact} startupLoop=${startupLoop}`,
     );
   }
 
@@ -4479,8 +4760,24 @@ function handleToolResultResume(
         log.warn(
           `[proxy] post-compact refill refused tool=${exec.toolName} bridgeKey=${bridgeKey}`,
         );
+      } else if (
+        startupLoop &&
+        isAgentsMdStartupRefillToolCall(exec.toolName, exec.decodedArgs)
+      ) {
+        resultText = buildAgentsMdStartupRefillRefusal();
+        log.warn(
+          `[proxy] startup AGENTS.md loop refused tool=${exec.toolName} bridgeKey=${bridgeKey}`,
+        );
       } else {
-        resultText = `${result.content}${breakNote}`;
+        // Truncate before Cursor sees it — multi-MB vite/build logs have stalled
+        // the H2 resume path and left OpenCode with unsettled idle tools.
+        const truncated = truncateToolResultForCursor(result.content);
+        if (truncated.length < result.content.length) {
+          log.warn(
+            `[proxy] truncated mcpResult tool=${exec.toolName} from=${result.content.length} to=${truncated.length} bridgeKey=${bridgeKey}`,
+          );
+        }
+        resultText = `${truncated}${breakNote}`;
       }
     }
     const mcpResult = result
@@ -4534,10 +4831,18 @@ function handleToolResultResume(
     ) {
       return { ...r, content: buildPostCompactRefillRefusal() };
     }
-    if (breakNote && index === toolResults.length - 1) {
-      return { ...r, content: `${r.content}${breakNote}` };
+    if (
+      startupLoop &&
+      exec &&
+      isAgentsMdStartupRefillToolCall(exec.toolName, exec.decodedArgs)
+    ) {
+      return { ...r, content: buildAgentsMdStartupRefillRefusal() };
     }
-    return r;
+    const truncated = truncateToolResultForCursor(r.content);
+    if (breakNote && index === toolResults.length - 1) {
+      return { ...r, content: `${truncated}${breakNote}` };
+    }
+    return truncated === r.content ? r : { ...r, content: truncated };
   });
 
   // Post-tool stalls must not replay the original Run bytes (mcpResults would
