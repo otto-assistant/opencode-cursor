@@ -40,6 +40,7 @@ interface TestModules {
   normalizeCursorModels: typeof import("../src/models").normalizeCursorModels;
   normalizeAvailableModels: typeof import("../src/models").normalizeAvailableModels;
   resolveCursorModelSelection: typeof import("../src/models").resolveCursorModelSelection;
+  resetPendingCursorLogin: typeof import("../src/auth-login").resetPendingCursorLogin;
 }
 
 interface TestCursorBackend {
@@ -472,6 +473,7 @@ async function loadModules(): Promise<TestModules> {
   const index = await import("../src/index");
   const models = await import("../src/models");
   const modelSelection = await import("../src/model-selection");
+  const authLogin = await import("../src/auth-login");
   return {
     startProxy: proxy.startProxy,
     stopProxy: proxy.stopProxy,
@@ -490,6 +492,7 @@ async function loadModules(): Promise<TestModules> {
     normalizeCursorModels: models.normalizeCursorModels,
     normalizeAvailableModels: models.normalizeAvailableModels,
     resolveCursorModelSelection: models.resolveCursorModelSelection,
+    resetPendingCursorLogin: authLogin.resetPendingCursorLogin,
   };
 }
 
@@ -656,26 +659,48 @@ async function testPluginShape(modules: TestModules) {
     );
   }
 
-  const authStart = await hooks.auth.methods[0].authorize();
-  if (!authStart || typeof authStart !== "object") {
-    throw new Error("Expected authorize() to return an OAuth result");
-  }
-  if (authStart.method !== "auto") {
-    throw new Error(`Expected OAuth method 'auto', got '${authStart.method}'`);
-  }
-  if (typeof authStart.url !== "string" || !authStart.url.includes("cursor.com")) {
-    throw new Error(`Expected Cursor login URL, got '${String(authStart.url)}'`);
-  }
-  if (
-    typeof authStart.instructions !== "string" ||
-    !authStart.instructions.toLowerCase().includes("link")
-  ) {
-    throw new Error(
-      "Expected authorize() instructions to mention the login link for OpenChamber",
-    );
-  }
-  if (typeof authStart.callback !== "function") {
-    throw new Error("Expected authorize() result to include callback()");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.includes("api2.cursor.sh/auth/poll")) {
+      return new Response("", { status: 404 });
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+
+  try {
+    const authStart = await hooks.auth.methods[0].authorize();
+    if (!authStart || typeof authStart !== "object") {
+      throw new Error("Expected authorize() to return an OAuth result");
+    }
+    if (authStart.method !== "auto") {
+      throw new Error(`Expected OAuth method 'auto', got '${authStart.method}'`);
+    }
+    if (typeof authStart.url !== "string" || !authStart.url.includes("cursor.com")) {
+      throw new Error(`Expected Cursor login URL, got '${String(authStart.url)}'`);
+    }
+    if (
+      typeof authStart.instructions !== "string" ||
+      !authStart.instructions.toLowerCase().includes("opencode auth login")
+    ) {
+      throw new Error(
+        "Expected authorize() instructions to mention `opencode auth login`",
+      );
+    }
+    if (
+      typeof authStart.instructions !== "string" ||
+      !authStart.instructions.toLowerCase().includes("api key")
+    ) {
+      throw new Error(
+        "Expected authorize() instructions to clarify that no API key is required",
+      );
+    }
+    if (typeof authStart.callback !== "function") {
+      throw new Error("Expected authorize() result to include callback()");
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    modules.resetPendingCursorLogin();
   }
 
   if (typeof hooks["chat.headers"] !== "function") {
@@ -1494,13 +1519,26 @@ async function testConfigHookSeedsProvider(
     throw new Error("Plugin hooks.config is not a function");
   }
 
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.includes("api2.cursor.sh/auth/poll")) {
+      return new Response("", { status: 404 });
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+
+  try {
   // Fresh config while logged out: keep a single login placeholder so OpenCode
   // / OpenChamber still list the Cursor provider (empty models are dropped).
   const fresh: any = {};
   await hooks.config!(fresh);
   const cursor = fresh.provider?.cursor;
   assert(cursor, "Expected config hook to create provider.cursor");
-  assertEqual(cursor.name, "Cursor (sign in required)", "Expected seeded provider name");
+  assert(
+    cursor.name.includes("browser OAuth") || cursor.name.includes("sign in"),
+    `Expected seeded provider name to mention browser OAuth / sign in, got '${cursor.name}'`,
+  );
   assertEqual(cursor.npm, "@ai-sdk/openai-compatible", "Expected seeded npm");
   assert(cursor.options?.baseURL, "Expected seeded options.baseURL");
   assertEqual(
@@ -1512,11 +1550,19 @@ async function testConfigHookSeedsProvider(
     "default" in (cursor.models ?? {}),
     "Expected login placeholder default model when logged out",
   );
-  assertEqual(
-    cursor.models.default.name,
-    "Cursor (authorize to load models)",
-    "Expected login placeholder display name",
+  assert(
+    typeof cursor.models.default.name === "string" &&
+      (cursor.models.default.name.startsWith("OPEN THIS URL TO LOGIN → ") ||
+        cursor.models.default.name === "Cursor (authorize to load models)"),
+    `Expected login placeholder to embed browser URL or authorize hint, got '${cursor.models.default.name}'`,
   );
+  if (cursor.models.default.name.startsWith("OPEN THIS URL TO LOGIN → ")) {
+    assert(
+      cursor.models.default.name.includes("cursor.com") ||
+        cursor.models.default.name.includes("loginDeepControl"),
+      "Expected embedded login URL to point at Cursor",
+    );
+  }
   assert(
     !("composer-1" in (cursor.models ?? {})),
     "Expected fallback model composer-1 not to be seeded when logged out",
@@ -1641,6 +1687,10 @@ async function testConfigHookSeedsProvider(
   }
 
   console.log("[test] Config hook seeding OK");
+  } finally {
+    globalThis.fetch = originalFetch;
+    modules.resetPendingCursorLogin();
+  }
 }
 
 async function testArrayContentParsing(modules: TestModules) {

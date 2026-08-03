@@ -10,9 +10,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
 import {
-  generateCursorAuthParams,
-  getTokenExpiry,
-  pollCursorAuth,
   refreshCursorToken,
   RefreshTokenInvalidError,
 } from "./auth.js";
@@ -20,6 +17,8 @@ import {
   getCursorModels,
   clearModelCache,
   LOGIN_PLACEHOLDER_MODELS,
+  loginPlaceholderModels,
+  isLoginPlaceholderModel,
   resolveCursorModelSelection,
   type CursorModel,
 } from "./models.js";
@@ -31,6 +30,11 @@ import {
   CURSOR_SELECTION_HEADER,
   encodeCursorModelSelection,
 } from "./model-selection.js";
+import {
+  startCursorBrowserLogin,
+  getPendingCursorLogin,
+  waitForCursorBrowserLogin,
+} from "./auth-login.js";
 import { log } from "./log.js";
 
 const CURSOR_PROVIDER_ID = "cursor";
@@ -348,29 +352,26 @@ export const CursorAuthPlugin: Plugin = async (
           type: "oauth",
           label: "Login with Cursor",
           async authorize() {
-            const { verifier, uuid, loginUrl } =
-              await generateCursorAuthParams();
+            // Reuse the headless browser login started by the config hook so
+            // OpenChamber / CLI show one URL and share one poll session.
+            let pending = getPendingCursorLogin();
+            if (!pending || pending.completed) {
+              pending = await startCursorBrowserLogin();
+            }
 
             return {
-              url: loginUrl,
+              url: pending.url,
               instructions:
-                "Open the link below in your browser to authorize Cursor. After you approve access, return here and click Complete — the model list will load automatically.",
+                "Open the URL below in your browser to authorize Cursor (same as `opencode auth login`). After you approve access, return here and click Complete — the live model list will load automatically. No API key is required.",
               method: "auto" as const,
               async callback() {
-                const { accessToken, refreshToken } = await pollCursorAuth(
-                  uuid,
-                  verifier,
-                );
-
-                // Drop any prior failed/empty discovery so the next config and
-                // provider.models() load fetches the live Cursor catalog.
+                const tokens = await waitForCursorBrowserLogin();
                 clearModelCache();
-
                 return {
                   type: "success" as const,
-                  refresh: refreshToken,
-                  access: accessToken,
-                  expires: getTokenExpiry(accessToken),
+                  refresh: tokens.refresh,
+                  access: tokens.access,
+                  expires: tokens.expires,
                 };
               },
             };
@@ -522,8 +523,13 @@ function ensureCursorProviderConfig(
       : {};
 
   const placeholderOnly = isLoginPlaceholderCatalog(models);
+  const loginUrl = placeholderOnly
+    ? extractLoginUrlFromPlaceholder(models[0]?.name)
+    : undefined;
   const seededName = placeholderOnly
-    ? "Cursor (sign in required)"
+    ? loginUrl
+      ? "Cursor — open the login URL shown in the model list (browser OAuth, not an API key)"
+      : "Cursor (sign in required — browser OAuth, not an API key)"
     : "Cursor";
   const providerName =
     typeof existing.name === "string" && existing.name.trim()
@@ -550,11 +556,15 @@ function ensureCursorProviderConfig(
 }
 
 function isLoginPlaceholderCatalog(models: CursorModel[]): boolean {
-  return (
-    models.length === 1 &&
-    models[0]?.id === LOGIN_PLACEHOLDER_MODELS[0]!.id &&
-    models[0]?.name === LOGIN_PLACEHOLDER_MODELS[0]!.name
-  );
+  return models.length === 1 && isLoginPlaceholderModel(models[0]);
+}
+
+function extractLoginUrlFromPlaceholder(name: string | undefined): string | undefined {
+  if (!name) return undefined;
+  const marker = "OPEN THIS URL TO LOGIN → ";
+  if (!name.startsWith(marker)) return undefined;
+  const url = name.slice(marker.length).trim();
+  return url.startsWith("http") ? url : undefined;
 }
 
 /**
@@ -570,9 +580,23 @@ function isLoginPlaceholderCatalog(models: CursorModel[]): boolean {
  *
  * Never throws.
  */
+async function resolveLoggedOutPlaceholder(): Promise<CursorModel[]> {
+  // OpenChamber's provider detail page often skips plugin OAuth methods and
+  // shows a misleading API-key field. Start the same browser OAuth as
+  // `opencode auth login` and embed the URL in the placeholder model name.
+  try {
+    const pending = await startCursorBrowserLogin();
+    return loginPlaceholderModels(pending.url);
+  } catch (err) {
+    const summary = err instanceof Error ? err.message : String(err);
+    log.warn(`[opencode-cursor] failed to start browser login: ${summary}`);
+    return LOGIN_PLACEHOLDER_MODELS;
+  }
+}
+
 async function resolveConfigModels(): Promise<CursorModel[]> {
   const stored = readStoredCursorAuth();
-  if (!stored) return LOGIN_PLACEHOLDER_MODELS;
+  if (!stored) return resolveLoggedOutPlaceholder();
 
   let accessToken = stored.access;
   if (!accessToken || stored.expires < Date.now()) {
@@ -590,7 +614,7 @@ async function resolveConfigModels(): Promise<CursorModel[]> {
       log.warn(
         `[opencode-cursor] config model discovery refresh failed: ${summary}`,
       );
-      return LOGIN_PLACEHOLDER_MODELS;
+      return resolveLoggedOutPlaceholder();
     }
   }
 
@@ -610,13 +634,13 @@ async function resolveConfigModels(): Promise<CursorModel[]> {
     log.warn(
       "[opencode-cursor] Cursor model discovery returned no models; seeding login placeholder",
     );
-    return LOGIN_PLACEHOLDER_MODELS;
+    return resolveLoggedOutPlaceholder();
   } catch (err) {
     const summary = err instanceof Error ? err.message : String(err);
     log.warn(
       `[opencode-cursor] Cursor model discovery failed for config: ${summary}`,
     );
-    return LOGIN_PLACEHOLDER_MODELS;
+    return resolveLoggedOutPlaceholder();
   }
 }
 
