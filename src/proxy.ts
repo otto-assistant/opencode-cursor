@@ -1439,6 +1439,7 @@ async function doHandleChatCompletion(
     effectiveUserText = buildPostToolBridgeLossContinuation(continuationResults);
     if (
       detectPostCompactRefillLoop(body.messages) ||
+      detectAgentsMdStartupLoop(body.messages) ||
       detectAgentsMdReplanLoop(body.messages) ||
       detectRestatedPlanLoop(body.messages)
     ) {
@@ -3138,6 +3139,11 @@ export function buildLoopBreakNoteForMessages(
   if (detectPostCompactRefillLoop(messages)) {
     return buildPostCompactRefillBreakNote();
   }
+  // Startup / mid-chat AGENTS.md thrash (missing file retries, TodoWrite ritual)
+  // must beat the generic replan detector so the break note matches the failure.
+  if (detectAgentsMdStartupLoop(messages)) {
+    return buildAgentsMdStartupLoopBreakNote();
+  }
   if (detectAgentsMdReplanLoop(messages)) {
     return buildReplanLoopBreakNote();
   }
@@ -3145,6 +3151,142 @@ export function buildLoopBreakNoteForMessages(
     return buildRestatedPlanLoopBreakNote();
   }
   return "";
+}
+
+/** True when a tool result shows AGENTS.md was missing / unreadable. */
+export function isAgentsMdMissingToolResult(content: string): boolean {
+  const text = content ?? "";
+  return (
+    /File not found:.*AGENTS\.md/i.test(text) ||
+    /AGENTS\.md.*not found/i.test(text) ||
+    /cannot access .*AGENTS\.md/i.test(text) ||
+    /ENOENT.*AGENTS\.md/i.test(text) ||
+    /no such file.*AGENTS\.md/i.test(text)
+  );
+}
+
+/**
+ * Detect chat-start / mid-session thrash on AGENTS.md and other mandatory
+ * startup rituals (TodoWrite "read AGENTS.md first") — with or without
+ * compaction, and WITHOUT requiring git/push language.
+ *
+ * Gaps closed vs detectAgentsMdReplanLoop:
+ * - Pure missing-file retries (AGENTS.md absent) never tripped the old detector
+ * - AGENTS.md + TodoWrite startup loops without VCS words never tripped it
+ *
+ * Intentionally allows a normal first-pass: one AGENTS.md read (+ optional
+ * TodoWrite) must NOT trip.
+ */
+export function detectAgentsMdStartupLoop(messages: OpenAIMessage[]): boolean {
+  let agentsReadAttempts = 0;
+  let agentsMissingResults = 0;
+  let agentsTodoWrites = 0;
+  let startupPlanRestates = 0;
+
+  for (const msg of messages) {
+    if (msg.role === "assistant") {
+      const text = textContent(msg.content);
+      // Skip anchored compaction summaries — they mention AGENTS.md / reads.
+      if (
+        /^##\s*objective\b/im.test(text) &&
+        (/##\s*work state\b/im.test(text) || /\bimportant details\b/i.test(text))
+      ) {
+        continue;
+      }
+      const lower = text.toLowerCase();
+      const mentionsAgents = lower.includes("agents.md");
+      const mentionsReadOrTodo =
+        lower.includes("read") ||
+        lower.includes("check") ||
+        lower.includes("перевір") ||
+        lower.includes("читаю") ||
+        lower.includes("прочит") ||
+        lower.includes("todo") ||
+        lower.includes("mandatory") ||
+        lower.includes("startup") ||
+        lower.includes("first");
+      if (mentionsAgents && mentionsReadOrTodo) {
+        startupPlanRestates += 1;
+      }
+      if (Array.isArray(msg.tool_calls)) {
+        for (const call of msg.tool_calls) {
+          const args = call.function?.arguments ?? "";
+          const name = (call.function?.name ?? "").toLowerCase();
+          if (/AGENTS\.md/i.test(args)) agentsReadAttempts += 1;
+          if (
+            name.includes("todo") &&
+            /AGENTS\.md|read agents|mandatory|startup|заповн/i.test(args)
+          ) {
+            agentsTodoWrites += 1;
+          }
+        }
+      }
+      continue;
+    }
+    if (msg.role === "tool") {
+      const content = textContent(msg.content);
+      if (isAgentsMdMissingToolResult(content)) {
+        agentsMissingResults += 1;
+      }
+    }
+  }
+
+  // Missing-file retry thrash (the classic OpenCode startup loop).
+  if (agentsMissingResults >= 2 && agentsReadAttempts >= 2) return true;
+  if (agentsMissingResults >= 3) return true;
+  // AGENTS.md + TodoWrite ritual restated without finishing.
+  if (agentsReadAttempts >= 2 && agentsTodoWrites >= 2) return true;
+  // Keep restating "must read AGENTS.md" while actually re-invoking it.
+  if (startupPlanRestates >= 3 && agentsReadAttempts >= 2) return true;
+  // Many AGENTS.md reads with almost as many misses — still thrashing.
+  if (
+    agentsReadAttempts >= 3 &&
+    agentsMissingResults >= Math.max(2, agentsReadAttempts - 1)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** Break note for AGENTS.md / startup-ritual thrash (chat start or mid-session). */
+export function buildAgentsMdStartupLoopBreakNote(): string {
+  return [
+    "",
+    "[Loop break] You already retried AGENTS.md / startup discovery without finishing.",
+    "Do NOT read AGENTS.md again. Do NOT recreate a TodoWrite checklist whose first item is reading AGENTS.md.",
+    "If AGENTS.md was missing, treat that as final — continue with the user's actual objective using other evidence.",
+    "Take one concrete finishing action now, or answer from what you already know, then stop.",
+  ].join(" ");
+}
+
+/**
+ * True when a tool call is another AGENTS.md / startup-ritual attempt that
+ * should be hard-refused once detectAgentsMdStartupLoop has tripped.
+ */
+export function isAgentsMdStartupRefillToolCall(
+  toolName: string,
+  decodedArgs: string,
+): boolean {
+  const name = (toolName || "").toLowerCase();
+  const args = decodedArgs || "";
+  if (/AGENTS\.md/i.test(args)) return true;
+  if (
+    name.includes("todo") &&
+    /AGENTS\.md|read agents|mandatory|startup|заповн|fill context/i.test(args)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** Hard refusal replacing AGENTS.md / startup-ritual tool output mid-loop. */
+export function buildAgentsMdStartupRefillRefusal(): string {
+  return [
+    "[Startup loop refused]",
+    "AGENTS.md / startup discovery already failed or was retried enough times.",
+    "Do NOT call read/TodoWrite for AGENTS.md again.",
+    "Answer the user's request now from available context, or take ONE non-AGENTS finishing action, then stop.",
+  ].join(" ");
 }
 
 /**
@@ -3347,7 +3489,10 @@ export function detectAgentsMdReplanLoop(messages: OpenAIMessage[]): boolean {
     restartPlans >= 3 ||
     (agentsReadAttempts >= 3 && gitStatusAttempts >= 2) ||
     (agentsMissingResults >= 2 && restartPlans >= 2) ||
-    (agentsReadAttempts >= 4 && restartPlans >= 2)
+    (agentsReadAttempts >= 4 && restartPlans >= 2) ||
+    // Missing-file thrash without VCS words — also covered by
+    // detectAgentsMdStartupLoop; keep a high-bar fallback here.
+    agentsMissingResults >= 3
   );
 }
 
@@ -4584,15 +4729,17 @@ function handleToolResultResume(
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
   active.lastAccessMs = Date.now();
 
-  // When the model is thrashing after compaction (context refill) or on
-  // AGENTS.md / git status restarts, append a loop-break note to tool output.
+  // When the model is thrashing after compaction (context refill), on
+  // AGENTS.md startup rituals, or on git status restarts, append a
+  // loop-break note to tool output (and hard-refuse refill tools).
   const stored = conversationStates.get(convKey);
   const postCompact =
     !!stored?.postCompactActive || isPostCompactHistory(messages);
+  const startupLoop = detectAgentsMdStartupLoop(messages);
   const breakNote = buildLoopBreakNoteForMessages(messages);
   if (breakNote) {
     log.warn(
-      `[proxy] loop-break note on tool resume bridgeKey=${bridgeKey} postCompact=${postCompact}`,
+      `[proxy] loop-break note on tool resume bridgeKey=${bridgeKey} postCompact=${postCompact} startupLoop=${startupLoop}`,
     );
   }
 
@@ -4612,6 +4759,14 @@ function handleToolResultResume(
         resultText = buildPostCompactRefillRefusal();
         log.warn(
           `[proxy] post-compact refill refused tool=${exec.toolName} bridgeKey=${bridgeKey}`,
+        );
+      } else if (
+        startupLoop &&
+        isAgentsMdStartupRefillToolCall(exec.toolName, exec.decodedArgs)
+      ) {
+        resultText = buildAgentsMdStartupRefillRefusal();
+        log.warn(
+          `[proxy] startup AGENTS.md loop refused tool=${exec.toolName} bridgeKey=${bridgeKey}`,
         );
       } else {
         // Truncate before Cursor sees it — multi-MB vite/build logs have stalled
@@ -4675,6 +4830,13 @@ function handleToolResultResume(
       isPostCompactRefillToolCall(exec.toolName, exec.decodedArgs)
     ) {
       return { ...r, content: buildPostCompactRefillRefusal() };
+    }
+    if (
+      startupLoop &&
+      exec &&
+      isAgentsMdStartupRefillToolCall(exec.toolName, exec.decodedArgs)
+    ) {
+      return { ...r, content: buildAgentsMdStartupRefillRefusal() };
     }
     const truncated = truncateToolResultForCursor(r.content);
     if (breakNote && index === toolResults.length - 1) {

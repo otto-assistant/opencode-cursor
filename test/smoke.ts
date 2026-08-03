@@ -2586,6 +2586,264 @@ async function testInterruptSteerHelpers() {
     "Single AGENTS.md mention must not trip the re-plan detector",
   );
   assert(
+    !proxy.detectAgentsMdStartupLoop([
+      { role: "user", content: "what is this repo?" },
+      {
+        role: "assistant",
+        content: "I'll read AGENTS.md first.",
+        tool_calls: [
+          {
+            id: "s1",
+            type: "function",
+            function: { name: "read", arguments: "{\"filePath\":\"AGENTS.md\"}" },
+          },
+        ],
+      },
+      { role: "tool", content: "# AGENTS\nUse TodoWrite", tool_call_id: "s1" },
+    ]),
+    "Normal first-pass AGENTS.md read must not trip the startup-loop detector",
+  );
+  assert(
+    !proxy.detectAgentsMdStartupLoop([
+      { role: "user", content: "fix the bug" },
+      {
+        role: "assistant",
+        content: "Reading AGENTS.md and setting todos.",
+        tool_calls: [
+          {
+            id: "t1",
+            type: "function",
+            function: { name: "read", arguments: "{\"filePath\":\"AGENTS.md\"}" },
+          },
+          {
+            id: "t2",
+            type: "function",
+            function: {
+              name: "TodoWrite",
+              arguments: "{\"todos\":[{\"content\":\"Read AGENTS.md\",\"status\":\"in_progress\"}]}",
+            },
+          },
+        ],
+      },
+      { role: "tool", content: "# Rules", tool_call_id: "t1" },
+      { role: "tool", content: "ok", tool_call_id: "t2" },
+    ]),
+    "Single AGENTS.md + TodoWrite pass must not trip startup-loop detector",
+  );
+  assert(
+    proxy.detectAgentsMdStartupLoop([
+      { role: "user", content: "hi, what is this repo?" },
+      {
+        role: "assistant",
+        content: "I will read AGENTS.md first as required.",
+        tool_calls: [
+          {
+            id: "1",
+            type: "function",
+            function: { name: "read", arguments: "{\"filePath\":\"AGENTS.md\"}" },
+          },
+        ],
+      },
+      { role: "tool", content: "File not found: AGENTS.md", tool_call_id: "1" },
+      {
+        role: "assistant",
+        content: "Checking AGENTS.md in the workspace root.",
+        tool_calls: [
+          {
+            id: "2",
+            type: "function",
+            function: {
+              name: "read",
+              arguments: "{\"filePath\":\"/workspace/AGENTS.md\"}",
+            },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: "File not found: /workspace/AGENTS.md",
+        tool_call_id: "2",
+      },
+      {
+        role: "assistant",
+        content: "Still need AGENTS.md — reading it now.",
+        tool_calls: [
+          {
+            id: "3",
+            type: "function",
+            function: { name: "read", arguments: "{\"filePath\":\"./AGENTS.md\"}" },
+          },
+        ],
+      },
+      { role: "tool", content: "ENOENT: AGENTS.md", tool_call_id: "3" },
+    ]),
+    "Repeated AGENTS.md missing-file retries at chat start must be detected",
+  );
+  assert(
+    proxy.detectAgentsMdStartupLoop([
+      { role: "user", content: "Fix the bug" },
+      {
+        role: "assistant",
+        content: "First I'll read AGENTS.md and set up todos.",
+        tool_calls: [
+          {
+            id: "a",
+            type: "function",
+            function: { name: "read", arguments: "{\"filePath\":\"AGENTS.md\"}" },
+          },
+          {
+            id: "b",
+            type: "function",
+            function: {
+              name: "TodoWrite",
+              arguments:
+                "{\"todos\":[{\"content\":\"Read AGENTS.md\",\"status\":\"in_progress\"}]}",
+            },
+          },
+        ],
+      },
+      { role: "tool", content: "File not found: AGENTS.md", tool_call_id: "a" },
+      { role: "tool", content: "Todos updated", tool_call_id: "b" },
+      {
+        role: "assistant",
+        content: "Reading AGENTS.md again then updating todos.",
+        tool_calls: [
+          {
+            id: "c",
+            type: "function",
+            function: {
+              name: "read",
+              arguments: "{\"filePath\":\"/workspace/AGENTS.md\"}",
+            },
+          },
+          {
+            id: "d",
+            type: "function",
+            function: {
+              name: "TodoWrite",
+              arguments:
+                "{\"todos\":[{\"content\":\"Read AGENTS.md\",\"status\":\"in_progress\"}]}",
+            },
+          },
+        ],
+      },
+      { role: "tool", content: "File not found", tool_call_id: "c" },
+      { role: "tool", content: "ok", tool_call_id: "d" },
+    ]),
+    "AGENTS.md + TodoWrite startup ritual loop must be detected",
+  );
+  assert(
+    proxy
+      .buildAgentsMdStartupLoopBreakNote()
+      .toLowerCase()
+      .includes("do not read agents.md again"),
+    "Startup-loop break note must forbid another AGENTS.md read",
+  );
+  assert(
+    proxy.isAgentsMdStartupRefillToolCall(
+      "read",
+      "{\"filePath\":\"/tmp/AGENTS.md\"}",
+    ),
+    "Startup refill refusal must match AGENTS.md reads",
+  );
+  assert(
+    proxy.isAgentsMdStartupRefillToolCall(
+      "TodoWrite",
+      "{\"todos\":[{\"content\":\"Read AGENTS.md first\"}]}",
+    ),
+    "Startup refill refusal must match AGENTS.md TodoWrite rituals",
+  );
+  assert(
+    !proxy.isAgentsMdStartupRefillToolCall(
+      "bash",
+      "{\"command\":\"git status\"}",
+    ),
+    "Startup refill refusal must not block unrelated tools",
+  );
+  assert(
+    proxy
+      .buildLoopBreakNoteForMessages([
+        { role: "user", content: "hi" },
+        {
+          role: "assistant",
+          content: "Reading AGENTS.md",
+          tool_calls: [
+            {
+              id: "x1",
+              type: "function",
+              function: { name: "read", arguments: "{\"filePath\":\"AGENTS.md\"}" },
+            },
+          ],
+        },
+        { role: "tool", content: "File not found: AGENTS.md", tool_call_id: "x1" },
+        {
+          role: "assistant",
+          content: "Checking AGENTS.md again",
+          tool_calls: [
+            {
+              id: "x2",
+              type: "function",
+              function: {
+                name: "read",
+                arguments: "{\"filePath\":\"/workspace/AGENTS.md\"}",
+              },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          content: "File not found: /workspace/AGENTS.md",
+          tool_call_id: "x2",
+        },
+      ])
+      .includes("[Loop break]") &&
+      proxy
+        .buildLoopBreakNoteForMessages([
+          { role: "user", content: "hi" },
+          {
+            role: "assistant",
+            content: "Reading AGENTS.md",
+            tool_calls: [
+              {
+                id: "x1",
+                type: "function",
+                function: {
+                  name: "read",
+                  arguments: "{\"filePath\":\"AGENTS.md\"}",
+                },
+              },
+            ],
+          },
+          {
+            role: "tool",
+            content: "File not found: AGENTS.md",
+            tool_call_id: "x1",
+          },
+          {
+            role: "assistant",
+            content: "Checking AGENTS.md again",
+            tool_calls: [
+              {
+                id: "x2",
+                type: "function",
+                function: {
+                  name: "read",
+                  arguments: "{\"filePath\":\"/workspace/AGENTS.md\"}",
+                },
+              },
+            ],
+          },
+          {
+            role: "tool",
+            content: "File not found: /workspace/AGENTS.md",
+            tool_call_id: "x2",
+          },
+        ])
+        .toLowerCase()
+        .includes("startup"),
+    "buildLoopBreakNoteForMessages must prefer the startup-loop note",
+  );
+  assert(
     !proxy.detectAgentsMdReplanLoop([
       { role: "user", content: "fill context" },
       { role: "assistant", content: "I'll read AGENTS.md then update todos." },
