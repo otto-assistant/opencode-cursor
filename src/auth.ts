@@ -56,30 +56,12 @@ export async function pollCursorAuth(
     // browser login already finished. Poll immediately on the first attempt so
     // the auth link flow does not wait an extra second before succeeding.
     try {
-      const response = await fetch(
-        `${CURSOR_POLL_URL}?uuid=${uuid}&verifier=${verifier}`,
-        { signal: AbortSignal.timeout(POLL_REQUEST_TIMEOUT_MS) },
-      );
+      const result = await tryPollCursorAuth(uuid, verifier);
+      if (result) return result;
 
-      if (response.status === 404) {
-        consecutiveErrors = 0;
-        delay = Math.min(delay * POLL_BACKOFF_MULTIPLIER, POLL_MAX_DELAY);
-        await Bun.sleep(delay);
-        continue;
-      }
-
-      if (response.ok) {
-        const data = (await response.json()) as {
-          accessToken: string;
-          refreshToken: string;
-        };
-        return {
-          accessToken: data.accessToken,
-          refreshToken: data.refreshToken,
-        };
-      }
-
-      throw new Error(`Poll failed: ${response.status}`);
+      consecutiveErrors = 0;
+      delay = Math.min(delay * POLL_BACKOFF_MULTIPLIER, POLL_MAX_DELAY);
+      await Bun.sleep(delay);
     } catch (err) {
       consecutiveErrors++;
       if (consecutiveErrors >= 3) {
@@ -93,6 +75,34 @@ export async function pollCursorAuth(
   }
 
   throw new Error("Cursor authentication polling timeout");
+}
+
+/** Single Cursor auth poll attempt. Returns null while the user has not approved yet (HTTP 404). */
+export async function tryPollCursorAuth(
+  uuid: string,
+  verifier: string,
+): Promise<{ accessToken: string; refreshToken: string } | null> {
+  const response = await fetch(
+    `${CURSOR_POLL_URL}?uuid=${uuid}&verifier=${verifier}`,
+    { signal: AbortSignal.timeout(POLL_REQUEST_TIMEOUT_MS) },
+  );
+
+  if (response.status === 404) {
+    return null;
+  }
+
+  if (response.ok) {
+    const data = (await response.json()) as {
+      accessToken: string;
+      refreshToken: string;
+    };
+    return {
+      accessToken: data.accessToken,
+      refreshToken: data.refreshToken,
+    };
+  }
+
+  throw new Error(`Poll failed: ${response.status}`);
 }
 
 /**

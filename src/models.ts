@@ -96,6 +96,10 @@ export const FALLBACK_MODELS: CursorModel[] = [
  * have zero models from `provider.list()`, which hides Cursor in OpenChamber's
  * provider settings and blocks the OAuth connect button. A single placeholder
  * keeps the provider visible without advertising a fake model catalog.
+ *
+ * When a live browser login URL is available (OpenChamber does not always
+ * surface plugin OAuth methods), embed it in the model name so the user can
+ * copy/open it — same flow as `opencode auth login`.
  */
 export const LOGIN_PLACEHOLDER_MODELS: CursorModel[] = [
   flatModel(
@@ -107,6 +111,26 @@ export const LOGIN_PLACEHOLDER_MODELS: CursorModel[] = [
   ),
 ];
 
+export function loginPlaceholderModels(loginUrl?: string): CursorModel[] {
+  if (!loginUrl) return LOGIN_PLACEHOLDER_MODELS;
+  return [
+    flatModel(
+      "default",
+      `OPEN THIS URL TO LOGIN → ${loginUrl}`,
+      false,
+      200_000,
+      64_000,
+    ),
+  ];
+}
+
+export function isLoginPlaceholderModel(model: CursorModel | undefined): boolean {
+  if (!model || model.id !== "default") return false;
+  return (
+    model.name === LOGIN_PLACEHOLDER_MODELS[0]!.name ||
+    model.name.startsWith("OPEN THIS URL TO LOGIN")
+  );
+}
 interface VariantDescriptor {
   key: string;
   idSuffixes: readonly string[];
