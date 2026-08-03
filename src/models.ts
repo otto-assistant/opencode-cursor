@@ -100,7 +100,7 @@ export const FALLBACK_MODELS: CursorModel[] = [
 export const LOGIN_PLACEHOLDER_MODELS: CursorModel[] = [
   flatModel(
     "default",
-    "Cursor (authorize to load models)",
+    "Sign in: Reconnect → paste Cursor API key (crsr_…)",
     false,
     200_000,
     64_000,

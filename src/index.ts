@@ -12,6 +12,7 @@ import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
 import {
   generateCursorAuthParams,
   getTokenExpiry,
+  isCursorApiKey,
   pollCursorAuth,
   refreshCursorToken,
   RefreshTokenInvalidError,
@@ -59,6 +60,13 @@ type CursorOAuthAuth = {
   expires: number;
 };
 
+type CursorApiAuth = {
+  type: "api";
+  key: string;
+};
+
+type CursorAuth = CursorOAuthAuth | CursorApiAuth;
+
 async function loadCursorRuntime(
   input: PluginInput,
   getAuth: () => Promise<unknown>,
@@ -72,34 +80,66 @@ async function loadCursorRuntime(
   | undefined
 > {
   const auth = await getAuth();
-  if (!isCursorOAuthAuth(auth)) return undefined;
+  if (!isCursorAuth(auth)) return undefined;
 
-  // Ensure we have a valid access token, refreshing if expired.
+  // Ensure we have a valid access token. OpenChamber's provider page always
+  // exposes an API-key field; accept Cursor `crsr_…` keys there and exchange
+  // them the same way as an OAuth refresh credential.
   // Refresh failures must NOT throw out of provider/auth hooks, or
   // OpenCode's provider.list() fails entirely and every Discord /model and
   // /login call surfaces "Failed to fetch providers". Return undefined so
   // Cursor is simply treated as unavailable until the user re-runs login.
-  let accessToken = auth.access;
-  if (!accessToken || auth.expires < Date.now()) {
+  let accessToken: string | undefined;
+
+  if (isCursorApiAuth(auth)) {
+    const apiKey = auth.key.trim();
     try {
-      const refreshed = await refreshCursorToken(auth.refresh);
+      const exchanged = await refreshCursorToken(apiKey);
+      // Normalize to oauth storage so subsequent loads share the refresh path.
+      // Keep the API key as `refresh` — exchange_user_api_key accepts crsr_ keys
+      // repeatedly, and refreshCursorToken will not clobber it with a non-JWT.
       await input.client.auth.set({
         path: { id: CURSOR_PROVIDER_ID },
         body: {
           type: "oauth",
-          refresh: refreshed.refresh,
-          access: refreshed.access,
-          expires: refreshed.expires,
+          refresh: apiKey,
+          access: exchanged.access,
+          expires: exchanged.expires,
         },
       });
-      accessToken = refreshed.access;
+      accessToken = exchanged.access;
+      clearModelCache();
     } catch (err) {
       const permanent = err instanceof RefreshTokenInvalidError;
       const summary = err instanceof Error ? err.message : String(err);
       log.error(
-        `[opencode-cursor] Cursor token refresh ${permanent ? "rejected (re-login required)" : "failed (transient)"}: ${summary}`,
+        `[opencode-cursor] Cursor API key exchange ${permanent ? "rejected (check key)" : "failed (transient)"}: ${summary}`,
       );
       return undefined;
+    }
+  } else {
+    accessToken = auth.access;
+    if (!accessToken || auth.expires < Date.now()) {
+      try {
+        const refreshed = await refreshCursorToken(auth.refresh);
+        await input.client.auth.set({
+          path: { id: CURSOR_PROVIDER_ID },
+          body: {
+            type: "oauth",
+            refresh: refreshed.refresh,
+            access: refreshed.access,
+            expires: refreshed.expires,
+          },
+        });
+        accessToken = refreshed.access;
+      } catch (err) {
+        const permanent = err instanceof RefreshTokenInvalidError;
+        const summary = err instanceof Error ? err.message : String(err);
+        log.error(
+          `[opencode-cursor] Cursor token refresh ${permanent ? "rejected (re-login required)" : "failed (transient)"}: ${summary}`,
+        );
+        return undefined;
+      }
     }
   }
 
@@ -117,8 +157,22 @@ async function loadCursorRuntime(
   // port it returns immediately. If it was stopped, it binds a new random port.
   const port = await startProxy(async () => {
     const currentAuth = await getAuth();
-    if (!isCursorOAuthAuth(currentAuth)) {
+    if (!isCursorAuth(currentAuth)) {
       throw new Error("Cursor auth not configured");
+    }
+
+    if (isCursorApiAuth(currentAuth)) {
+      const exchanged = await refreshCursorToken(currentAuth.key.trim());
+      await input.client.auth.set({
+        path: { id: CURSOR_PROVIDER_ID },
+        body: {
+          type: "oauth",
+          refresh: currentAuth.key.trim(),
+          access: exchanged.access,
+          expires: exchanged.expires,
+        },
+      });
+      return exchanged.access;
     }
 
     if (!currentAuth.access || currentAuth.expires < Date.now()) {
@@ -154,6 +208,20 @@ function isCursorOAuthAuth(auth: unknown): auth is CursorOAuthAuth {
     typeof (auth as { refresh?: unknown }).refresh === "string" &&
     typeof (auth as { expires?: unknown }).expires === "number"
   );
+}
+
+function isCursorApiAuth(auth: unknown): auth is CursorApiAuth {
+  return (
+    !!auth &&
+    typeof auth === "object" &&
+    (auth as { type?: unknown }).type === "api" &&
+    typeof (auth as { key?: unknown }).key === "string" &&
+    Boolean((auth as { key: string }).key.trim())
+  );
+}
+
+function isCursorAuth(auth: unknown): auth is CursorAuth {
+  return isCursorOAuthAuth(auth) || isCursorApiAuth(auth);
 }
 
 /**
@@ -376,6 +444,13 @@ export const CursorAuthPlugin: Plugin = async (
             };
           },
         },
+        {
+          // OpenChamber's provider page always shows an API key field. Accept
+          // Cursor dashboard keys (crsr_…) so that field actually works even
+          // when the OAuth method list is not loaded in the UI.
+          type: "api",
+          label: "Cursor API Key",
+        },
       ],
     },
   };
@@ -559,40 +634,18 @@ function isLoginPlaceholderCatalog(models: CursorModel[]): boolean {
 
 /**
  * Resolve the model list used to seed the static provider config. Prefers the
- * full set discovered from Cursor (using the stored OAuth access token) so the
- * whole catalog shows up in the menu.
+ * full set discovered from Cursor (OAuth access token or exchanged API key).
  *
- * When logged out — or when a stored token cannot discover models — seeds a
- * single login placeholder. OpenCode drops providers with zero models from
+ * When logged out — or when stored credentials cannot discover models — seeds
+ * a single login placeholder. OpenCode drops providers with zero models from
  * `provider.list()`, which would hide Cursor in OpenChamber. We intentionally
- * never seed the hardcoded FALLBACK_MODELS catalog into the provider UI: that
- * advertised ~14 stale models as if they were the live Cursor list (~50).
+ * never seed the hardcoded FALLBACK_MODELS catalog into the provider UI.
  *
  * Never throws.
  */
 async function resolveConfigModels(): Promise<CursorModel[]> {
-  const stored = readStoredCursorAuth();
-  if (!stored) return LOGIN_PLACEHOLDER_MODELS;
-
-  let accessToken = stored.access;
-  if (!accessToken || stored.expires < Date.now()) {
-    try {
-      const refreshed = await refreshCursorToken(stored.refresh);
-      writeStoredCursorAuth({
-        type: "oauth",
-        access: refreshed.access,
-        refresh: refreshed.refresh,
-        expires: refreshed.expires,
-      });
-      accessToken = refreshed.access;
-    } catch (err) {
-      const summary = err instanceof Error ? err.message : String(err);
-      log.warn(
-        `[opencode-cursor] config model discovery refresh failed: ${summary}`,
-      );
-      return LOGIN_PLACEHOLDER_MODELS;
-    }
-  }
+  const accessToken = await resolveStoredAccessToken();
+  if (!accessToken) return LOGIN_PLACEHOLDER_MODELS;
 
   try {
     // Allow enough time for the HTTP/2 bridge + AvailableModels round-trip.
@@ -620,12 +673,19 @@ async function resolveConfigModels(): Promise<CursorModel[]> {
   }
 }
 
-type StoredCursorAuth = {
+type StoredCursorOAuth = {
   type: "oauth";
   access?: string;
   refresh: string;
   expires: number;
 };
+
+type StoredCursorApi = {
+  type: "api";
+  key: string;
+};
+
+type StoredCursorAuth = StoredCursorOAuth | StoredCursorApi;
 
 function getOpencodeAuthPath(): string {
   const base =
@@ -634,15 +694,20 @@ function getOpencodeAuthPath(): string {
 }
 
 /**
- * Best-effort read of the stored Cursor OAuth entry from OpenCode's auth store.
- * Returns undefined if missing or malformed. Expired access tokens are still
- * returned when a refresh token is present so callers can refresh.
+ * Best-effort read of the stored Cursor auth entry (OAuth or API key).
  */
 function readStoredCursorAuth(): StoredCursorAuth | undefined {
   try {
     const data = JSON.parse(readFileSync(getOpencodeAuthPath(), "utf8"));
     const cursor = data?.[CURSOR_PROVIDER_ID];
-    if (!cursor || cursor.type !== "oauth") return undefined;
+    if (!cursor || typeof cursor !== "object") return undefined;
+
+    if (cursor.type === "api") {
+      if (typeof cursor.key !== "string" || !cursor.key.trim()) return undefined;
+      return { type: "api", key: cursor.key.trim() };
+    }
+
+    if (cursor.type !== "oauth") return undefined;
     if (typeof cursor.refresh !== "string" || !cursor.refresh) return undefined;
     if (typeof cursor.expires !== "number") return undefined;
     return {
@@ -656,7 +721,57 @@ function readStoredCursorAuth(): StoredCursorAuth | undefined {
   }
 }
 
-function writeStoredCursorAuth(auth: StoredCursorAuth): void {
+/**
+ * Resolve a usable Cursor access token from the auth store, exchanging an API
+ * key or refreshing an expired OAuth access token when needed.
+ */
+async function resolveStoredAccessToken(): Promise<string | undefined> {
+  const stored = readStoredCursorAuth();
+  if (!stored) return undefined;
+
+  if (stored.type === "api") {
+    try {
+      const exchanged = await refreshCursorToken(stored.key);
+      writeStoredCursorAuth({
+        type: "oauth",
+        access: exchanged.access,
+        refresh: isCursorApiKey(stored.key) ? stored.key : exchanged.refresh,
+        expires: exchanged.expires,
+      });
+      clearModelCache();
+      return exchanged.access;
+    } catch (err) {
+      const summary = err instanceof Error ? err.message : String(err);
+      log.warn(
+        `[opencode-cursor] config API key exchange failed: ${summary}`,
+      );
+      return undefined;
+    }
+  }
+
+  let accessToken = stored.access;
+  if (!accessToken || stored.expires < Date.now()) {
+    try {
+      const refreshed = await refreshCursorToken(stored.refresh);
+      writeStoredCursorAuth({
+        type: "oauth",
+        access: refreshed.access,
+        refresh: refreshed.refresh,
+        expires: refreshed.expires,
+      });
+      accessToken = refreshed.access;
+    } catch (err) {
+      const summary = err instanceof Error ? err.message : String(err);
+      log.warn(
+        `[opencode-cursor] config model discovery refresh failed: ${summary}`,
+      );
+      return undefined;
+    }
+  }
+  return accessToken;
+}
+
+function writeStoredCursorAuth(auth: StoredCursorOAuth): void {
   try {
     const authPath = getOpencodeAuthPath();
     let data: Record<string, unknown> = {};

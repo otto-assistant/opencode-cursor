@@ -655,6 +655,15 @@ async function testPluginShape(modules: TestModules) {
       `Expected auth method label 'Login with Cursor', got '${hooks.auth.methods[0].label}'`,
     );
   }
+  const apiMethod = hooks.auth.methods.find((method: { type?: string }) => method.type === "api");
+  if (!apiMethod) {
+    throw new Error("Expected an 'api' auth method for OpenChamber API key field");
+  }
+  if (apiMethod.label !== "Cursor API Key") {
+    throw new Error(
+      `Expected API method label 'Cursor API Key', got '${String(apiMethod.label)}'`,
+    );
+  }
 
   const authStart = await hooks.auth.methods[0].authorize();
   if (!authStart || typeof authStart !== "object") {
@@ -1514,7 +1523,7 @@ async function testConfigHookSeedsProvider(
   );
   assertEqual(
     cursor.models.default.name,
-    "Cursor (authorize to load models)",
+    "Sign in: Reconnect → paste Cursor API key (crsr_…)",
     "Expected login placeholder display name",
   );
   assert(
@@ -1804,6 +1813,74 @@ async function testRefreshFailureKeepsProviderListable(
 
   modules.stopProxy();
   console.log("[test] Refresh-failure-non-throw OK");
+}
+
+async function testApiKeyAuthExchangesAndLoadsModels(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing API key auth exchange for OpenChamber...");
+  modules.clearModelCache();
+  backend.resetObservations();
+  backend.setDiscoveryMode("success");
+  backend.setDiscoveredModels([
+    { id: "composer-2", name: "Composer 2", reasoning: true },
+    { id: "gpt-5.4-medium", name: "GPT-5.4", reasoning: true },
+  ]);
+  backend.setAvailableModels(undefined);
+
+  const writes: Array<any> = [];
+  const hooks = await modules.CursorAuthPlugin({
+    client: {
+      auth: {
+        set: async ({ body }: any) => {
+          writes.push(body);
+        },
+      },
+    },
+  } as any);
+  const provider = { models: {} } as any;
+
+  // OpenChamber's Save Key button persists type:api — the loader must exchange
+  // that key and populate live models (not the login placeholder).
+  const result = await hooks.auth!.loader(
+    async () => ({ type: "api", key: "valid-refresh" }),
+    provider,
+  );
+
+  assert(result && typeof result === "object", "Expected loader result object");
+  assertEqual(
+    (result as any).apiKey,
+    "cursor-proxy",
+    "Expected proxy apiKey after API key exchange",
+  );
+  assert(
+    typeof (result as any).baseURL === "string" &&
+      (result as any).baseURL.includes("/v1"),
+    "Expected local proxy baseURL after API key exchange",
+  );
+  assert(
+    writes.length >= 1 && writes[0].type === "oauth",
+    "Expected API key auth to be normalized to oauth storage",
+  );
+  assertEqual(
+    writes[0].refresh,
+    "valid-refresh",
+    "Expected API key retained as refresh credential",
+  );
+  assert(
+    "composer-2" in provider.models,
+    "Expected discovered composer-2 after API key exchange",
+  );
+  assert(
+    !("default" in provider.models) ||
+      provider.models.default?.name !==
+        "Sign in: Reconnect → paste Cursor API key (crsr_…)",
+    "Expected login placeholder to be replaced by live models",
+  );
+
+  modules.stopProxy();
+  console.log("[test] API key auth exchange OK");
 }
 
 async function testRefreshPreservesOriginalWhenResponseRefreshIsNotJwt(
@@ -3675,6 +3752,7 @@ async function main() {
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testRefreshFailureKeepsProviderListable(modules, backend);
+    await testApiKeyAuthExchangesAndLoadsModels(modules, backend);
     await testRefreshPreservesOriginalWhenResponseRefreshIsNotJwt(modules, backend);
     await testRefreshRotatesWhenResponseRefreshIsJwt(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);

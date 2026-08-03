@@ -28,6 +28,20 @@ export interface CursorCredentials {
   expires: number;
 }
 
+/**
+ * Exchange a Cursor user API key (`crsr_…`) or OAuth refresh JWT for an access
+ * token via `/auth/exchange_user_api_key`. Same endpoint serves both.
+ */
+export async function exchangeCursorCredential(
+  credential: string,
+): Promise<CursorCredentials> {
+  return refreshCursorToken(credential);
+}
+
+export function isCursorApiKey(value: unknown): value is string {
+  return typeof value === "string" && /^crsr_[A-Za-z0-9]+/.test(value.trim());
+}
+
 
 export async function generateCursorAuthParams(): Promise<CursorAuthParams> {
   const { verifier, challenge } = await generatePKCE();
