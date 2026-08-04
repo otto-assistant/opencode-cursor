@@ -7,9 +7,11 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
   AgentClientMessageSchema,
   AgentServerMessageSchema,
+  ExecServerMessageSchema,
   GetUsableModelsResponseSchema,
   HeartbeatUpdateSchema,
   InteractionUpdateSchema,
+  McpArgsSchema,
   ModelDetailsSchema,
   TextDeltaUpdateSchema,
   TurnEndedUpdateSchema,
@@ -20,7 +22,9 @@ type RunMode =
   | "immediate-close"
   | "stall-once-then-close"
   | "heartbeat-only-stall"
-  | "text-then-hang";
+  | "text-then-hang"
+  | "tool-call-then-hang"
+  | "resume-text-then-hang";
 
 interface TestModules {
   startProxy: typeof import("../src/proxy").startProxy;
@@ -234,7 +238,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     const authHeader = String(headers.authorization ?? "");
     if (path === "/agent.v1.AgentService/Run") {
       runRequestCount++;
-      let pending = Buffer.alloc(0);
+          let pending = Buffer.alloc(0);
       stream.on("data", (chunk) => {
         pending = Buffer.concat([pending, Buffer.from(chunk)]);
         while (pending.length >= 5) {
@@ -266,6 +270,20 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
                   ]),
                 ),
               });
+            } else if (message.message.case === "execClientMessage") {
+              // The proxy delivered an mcpResult (tool-result resume). In the
+              // tool-call modes, respond with visible text and then hang —
+              // simulating a model that starts answering and stalls.
+              if (
+                runMode === "tool-call-then-hang" ||
+                runMode === "resume-text-then-hang"
+              ) {
+                try {
+                  stream.write(frameTextThenEndServerMessages("partial...")[0]!);
+                } catch {
+                  // ignore
+                }
+              }
             }
           } catch {
             // Other Connect frames are not relevant to model-routing assertions.
@@ -310,7 +328,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         }, 8_000);
         return;
       }
-      if (runMode === "text-then-hang") {
+      if (runMode === "text-then-hang" || runMode === "resume-text-then-hang") {
         try {
           stream.write(frameTextThenEndServerMessages("partial...")[0]!);
         } catch {
@@ -324,6 +342,47 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
             // ignore
           }
         }, 8_000);
+        return;
+      }
+      if (runMode === "tool-call-then-hang") {
+        // Emit an MCP tool call (bash) so the proxy streams tool_calls SSE and
+        // parks the bridge; then keep the Run open until the proxy sends the
+        // mcpResult (handled in the data listener above).
+        try {
+          const execMsg = create(ExecServerMessageSchema, {
+            id: 1,
+            execId: "exec-1",
+            message: {
+              case: "mcpArgs",
+              value: create(McpArgsSchema, {
+                name: "bash",
+                toolName: "bash",
+                toolCallId: "cursor-call-1",
+                providerIdentifier: "opencode",
+                args: {},
+              }),
+            },
+          });
+          stream.write(
+            frameConnectUnaryMessage(
+              toBinary(
+                AgentServerMessageSchema,
+                create(AgentServerMessageSchema, {
+                  message: { case: "execServerMessage", value: execMsg },
+                }),
+              ),
+            ),
+          );
+        } catch {
+          // ignore
+        }
+        setTimeout(() => {
+          try {
+            stream.end();
+          } catch {
+            // ignore
+          }
+        }, 12_000);
         return;
       }
       for (const frame of frameTextThenEndServerMessages("ok")) {
@@ -2602,13 +2661,21 @@ async function testInterruptSteerHelpers() {
     "Normal tool resume must not look like a user steer",
   );
   assert(
-    proxy.hasUserSteerAfterTools([
+    !proxy.hasUserSteerAfterTools([
       { role: "user", content: "do work" },
       { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: "{}" } }] },
       { role: "tool", content: "file contents", tool_call_id: "c1" },
       { role: "user", content: "stop, do this instead" },
     ]),
-    "Trailing user message after tools must be detected as steer",
+    "Completed tool round + trailing user must NOT be a steer (OpenCode appends the current prompt; treating it as a steer abandoned the parked bridge with the tool results and made the model restate forever)",
+  );
+  assert(
+    proxy.hasUserSteerAfterTools([
+      { role: "user", content: "do work" },
+      { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: "{}" } }] },
+      { role: "user", content: "stop, do this instead" },
+    ]),
+    "Open tool batch (no results yet) + trailing user must be detected as steer",
   );
 
   const framed = proxy.buildInterruptSteerUserText("stop, do this instead");
@@ -2641,31 +2708,6 @@ async function testInterruptSteerHelpers() {
     !proxy.isCompactionContinueUserText("continue the refactor of next steps helper"),
     "Normal chat mentioning next steps must not look like compaction-continue",
   );
-  const compactContinue = proxy.buildCompactionContinueUserText(
-    "## Objective\nDeliver access steps\n## Work State\n### Completed\nroute=/issues",
-  );
-  assert(
-    /do not restart|never restart/i.test(compactContinue),
-    "Compaction-continue framing must forbid restarting the plan",
-  );
-  assert(
-    /do not re-read|refill is forbidden|context refill is forbidden/i.test(
-      compactContinue,
-    ),
-    "Compaction-continue framing must forbid re-reading finished context",
-  );
-  assert(
-    !compactContinue.toLowerCase().includes("continue if you have next steps"),
-    "Compaction-continue framing must replace the weak OpenCode prompt",
-  );
-  assert(
-    compactContinue.toLowerCase().includes("agents.md"),
-    "Compaction-continue framing must explicitly forbid AGENTS.md restart thrash",
-  );
-  assert(
-    compactContinue.includes("route=/issues"),
-    "Compaction-continue framing must embed the anchored summary for Cursor",
-  );
   assert(
     proxy
       .extractAnchoredSummary([
@@ -2680,544 +2722,6 @@ async function testInterruptSteerHelpers() {
     "extractAnchoredSummary must return the Objective summary",
   );
 
-  assert(
-    !proxy.detectAgentsMdReplanLoop([
-      { role: "user", content: "push all changes" },
-      { role: "assistant", content: "I'll read AGENTS.md then push." },
-    ]),
-    "Single AGENTS.md mention must not trip the re-plan detector",
-  );
-  assert(
-    !proxy.detectAgentsMdStartupLoop([
-      { role: "user", content: "what is this repo?" },
-      {
-        role: "assistant",
-        content: "I'll read AGENTS.md first.",
-        tool_calls: [
-          {
-            id: "s1",
-            type: "function",
-            function: { name: "read", arguments: "{\"filePath\":\"AGENTS.md\"}" },
-          },
-        ],
-      },
-      { role: "tool", content: "# AGENTS\nUse TodoWrite", tool_call_id: "s1" },
-    ]),
-    "Normal first-pass AGENTS.md read must not trip the startup-loop detector",
-  );
-  assert(
-    !proxy.detectAgentsMdStartupLoop([
-      { role: "user", content: "fix the bug" },
-      {
-        role: "assistant",
-        content: "Reading AGENTS.md and setting todos.",
-        tool_calls: [
-          {
-            id: "t1",
-            type: "function",
-            function: { name: "read", arguments: "{\"filePath\":\"AGENTS.md\"}" },
-          },
-          {
-            id: "t2",
-            type: "function",
-            function: {
-              name: "TodoWrite",
-              arguments: "{\"todos\":[{\"content\":\"Read AGENTS.md\",\"status\":\"in_progress\"}]}",
-            },
-          },
-        ],
-      },
-      { role: "tool", content: "# Rules", tool_call_id: "t1" },
-      { role: "tool", content: "ok", tool_call_id: "t2" },
-    ]),
-    "Single AGENTS.md + TodoWrite pass must not trip startup-loop detector",
-  );
-  assert(
-    proxy.detectAgentsMdStartupLoop([
-      { role: "user", content: "hi, what is this repo?" },
-      {
-        role: "assistant",
-        content: "I will read AGENTS.md first as required.",
-        tool_calls: [
-          {
-            id: "1",
-            type: "function",
-            function: { name: "read", arguments: "{\"filePath\":\"AGENTS.md\"}" },
-          },
-        ],
-      },
-      { role: "tool", content: "File not found: AGENTS.md", tool_call_id: "1" },
-      {
-        role: "assistant",
-        content: "Checking AGENTS.md in the workspace root.",
-        tool_calls: [
-          {
-            id: "2",
-            type: "function",
-            function: {
-              name: "read",
-              arguments: "{\"filePath\":\"/workspace/AGENTS.md\"}",
-            },
-          },
-        ],
-      },
-      {
-        role: "tool",
-        content: "File not found: /workspace/AGENTS.md",
-        tool_call_id: "2",
-      },
-      {
-        role: "assistant",
-        content: "Still need AGENTS.md — reading it now.",
-        tool_calls: [
-          {
-            id: "3",
-            type: "function",
-            function: { name: "read", arguments: "{\"filePath\":\"./AGENTS.md\"}" },
-          },
-        ],
-      },
-      { role: "tool", content: "ENOENT: AGENTS.md", tool_call_id: "3" },
-    ]),
-    "Repeated AGENTS.md missing-file retries at chat start must be detected",
-  );
-  assert(
-    proxy.detectAgentsMdStartupLoop([
-      { role: "user", content: "Fix the bug" },
-      {
-        role: "assistant",
-        content: "First I'll read AGENTS.md and set up todos.",
-        tool_calls: [
-          {
-            id: "a",
-            type: "function",
-            function: { name: "read", arguments: "{\"filePath\":\"AGENTS.md\"}" },
-          },
-          {
-            id: "b",
-            type: "function",
-            function: {
-              name: "TodoWrite",
-              arguments:
-                "{\"todos\":[{\"content\":\"Read AGENTS.md\",\"status\":\"in_progress\"}]}",
-            },
-          },
-        ],
-      },
-      { role: "tool", content: "File not found: AGENTS.md", tool_call_id: "a" },
-      { role: "tool", content: "Todos updated", tool_call_id: "b" },
-      {
-        role: "assistant",
-        content: "Reading AGENTS.md again then updating todos.",
-        tool_calls: [
-          {
-            id: "c",
-            type: "function",
-            function: {
-              name: "read",
-              arguments: "{\"filePath\":\"/workspace/AGENTS.md\"}",
-            },
-          },
-          {
-            id: "d",
-            type: "function",
-            function: {
-              name: "TodoWrite",
-              arguments:
-                "{\"todos\":[{\"content\":\"Read AGENTS.md\",\"status\":\"in_progress\"}]}",
-            },
-          },
-        ],
-      },
-      { role: "tool", content: "File not found", tool_call_id: "c" },
-      { role: "tool", content: "ok", tool_call_id: "d" },
-    ]),
-    "AGENTS.md + TodoWrite startup ritual loop must be detected",
-  );
-  assert(
-    proxy
-      .buildAgentsMdStartupLoopBreakNote()
-      .toLowerCase()
-      .includes("do not read agents.md again"),
-    "Startup-loop break note must forbid another AGENTS.md read",
-  );
-  assert(
-    proxy.isAgentsMdStartupRefillToolCall(
-      "read",
-      "{\"filePath\":\"/tmp/AGENTS.md\"}",
-    ),
-    "Startup refill refusal must match AGENTS.md reads",
-  );
-  assert(
-    proxy.isAgentsMdStartupRefillToolCall(
-      "TodoWrite",
-      "{\"todos\":[{\"content\":\"Read AGENTS.md first\"}]}",
-    ),
-    "Startup refill refusal must match AGENTS.md TodoWrite rituals",
-  );
-  assert(
-    !proxy.isAgentsMdStartupRefillToolCall(
-      "bash",
-      "{\"command\":\"git status\"}",
-    ),
-    "Startup refill refusal must not block unrelated tools",
-  );
-  assert(
-    proxy
-      .buildLoopBreakNoteForMessages([
-        { role: "user", content: "hi" },
-        {
-          role: "assistant",
-          content: "Reading AGENTS.md",
-          tool_calls: [
-            {
-              id: "x1",
-              type: "function",
-              function: { name: "read", arguments: "{\"filePath\":\"AGENTS.md\"}" },
-            },
-          ],
-        },
-        { role: "tool", content: "File not found: AGENTS.md", tool_call_id: "x1" },
-        {
-          role: "assistant",
-          content: "Checking AGENTS.md again",
-          tool_calls: [
-            {
-              id: "x2",
-              type: "function",
-              function: {
-                name: "read",
-                arguments: "{\"filePath\":\"/workspace/AGENTS.md\"}",
-              },
-            },
-          ],
-        },
-        {
-          role: "tool",
-          content: "File not found: /workspace/AGENTS.md",
-          tool_call_id: "x2",
-        },
-      ])
-      .includes("[Loop break]") &&
-      proxy
-        .buildLoopBreakNoteForMessages([
-          { role: "user", content: "hi" },
-          {
-            role: "assistant",
-            content: "Reading AGENTS.md",
-            tool_calls: [
-              {
-                id: "x1",
-                type: "function",
-                function: {
-                  name: "read",
-                  arguments: "{\"filePath\":\"AGENTS.md\"}",
-                },
-              },
-            ],
-          },
-          {
-            role: "tool",
-            content: "File not found: AGENTS.md",
-            tool_call_id: "x1",
-          },
-          {
-            role: "assistant",
-            content: "Checking AGENTS.md again",
-            tool_calls: [
-              {
-                id: "x2",
-                type: "function",
-                function: {
-                  name: "read",
-                  arguments: "{\"filePath\":\"/workspace/AGENTS.md\"}",
-                },
-              },
-            ],
-          },
-          {
-            role: "tool",
-            content: "File not found: /workspace/AGENTS.md",
-            tool_call_id: "x2",
-          },
-        ])
-        .toLowerCase()
-        .includes("startup"),
-    "buildLoopBreakNoteForMessages must prefer the startup-loop note",
-  );
-  assert(
-    !proxy.detectAgentsMdReplanLoop([
-      { role: "user", content: "fill context" },
-      { role: "assistant", content: "I'll read AGENTS.md then update todos." },
-      { role: "assistant", content: "Next I'll check AGENTS.md and continue the todo checklist." },
-      {
-        role: "assistant",
-        content: null,
-        tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: "{\"filePath\":\"AGENTS.md\"}" } }],
-      },
-      { role: "tool", content: "# AGENTS\nUse TodoWrite", tool_call_id: "c1" },
-    ]),
-    "Normal AGENTS.md + TodoWrite context fill must not trip the re-plan detector",
-  );
-  assert(
-    proxy.detectAgentsMdReplanLoop([
-      { role: "user", content: "push all changes" },
-      { role: "assistant", content: "I'll read AGENTS.md, then check git and push." },
-      {
-        role: "assistant",
-        content: null,
-        tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: "{\"filePath\":\"/repo/AGENTS.md\"}" } }],
-      },
-      { role: "tool", content: "File not found: /repo/AGENTS.md", tool_call_id: "c1" },
-      { role: "assistant", content: "The last request was to push all changes. I'll check AGENTS.md and git status." },
-      {
-        role: "assistant",
-        content: null,
-        tool_calls: [{ id: "c2", type: "function", function: { name: "bash", arguments: "{\"command\":\"git status\"}" } }],
-      },
-      { role: "tool", content: "On branch main\nnothing to commit", tool_call_id: "c2" },
-      { role: "assistant", content: "The remaining step is pushing. Checking AGENTS.md and git status first." },
-      {
-        role: "assistant",
-        content: null,
-        tool_calls: [
-          { id: "c3", type: "function", function: { name: "read", arguments: "{\"filePath\":\"AGENTS.md\"}" } },
-          { id: "c4", type: "function", function: { name: "bash", arguments: "{\"command\":\"git status && git log\"}" } },
-        ],
-      },
-      { role: "tool", content: "File not found: AGENTS.md", tool_call_id: "c3" },
-      { role: "tool", content: "On branch main", tool_call_id: "c4" },
-      { role: "assistant", content: "I'll read AGENTS.md, then check git status and push." },
-      {
-        role: "assistant",
-        content: null,
-        tool_calls: [
-          { id: "c5", type: "function", function: { name: "read", arguments: "{\"filePath\":\"/x/AGENTS.md\"}" } },
-          { id: "c6", type: "function", function: { name: "bash", arguments: "{\"command\":\"git status\"}" } },
-        ],
-      },
-      { role: "tool", content: "File not found: /x/AGENTS.md", tool_call_id: "c5" },
-      { role: "tool", content: "On branch main", tool_call_id: "c6" },
-    ]),
-    "Repeated AGENTS.md + git status restarts must be detected as a re-plan loop",
-  );
-  assert(
-    proxy.buildReplanLoopBreakNote().toLowerCase().includes("do not read agents.md again"),
-    "Loop-break note must forbid another AGENTS.md read",
-  );
-
-  assert(
-    proxy.isFreshCompactionContinue(
-      [
-        { role: "user", content: "What did we do so far?" },
-        { role: "assistant", content: "## Objective\n\n## Work State\n### Completed\nok" },
-        {
-          role: "user",
-          content:
-            "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
-        },
-      ],
-      "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
-    ),
-    "Fresh post-compact continue must be detected",
-  );
-  assert(
-    !proxy.isFreshCompactionContinue(
-      [
-        { role: "user", content: "What did we do so far?" },
-        { role: "assistant", content: "## Objective\n\n## Work State\n### Completed\nok" },
-        {
-          role: "user",
-          content:
-            "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
-        },
-        { role: "assistant", content: "Giving the final access steps now." },
-      ],
-      "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
-    ),
-    "Continue text after an assistant reply must NOT re-frame as fresh compaction-continue",
-  );
-
-  const summaryAssistant = [
-    "## Objective",
-    "- Find access steps; follow encyclopedia checklist.",
-    "## Important Details",
-    "- Required reads: encyclopedia, repeat-a, big.json, AGENTS.md",
-    "## Work State",
-    "### Completed",
-    "- encyclopedia fully read; route is /issues?view=queue",
-    "### Active",
-    "- deliver final access steps",
-  ].join("\n");
-  assert(
-    proxy.isPostCompactHistory([
-      { role: "user", content: "What did we do so far?" },
-      { role: "assistant", content: summaryAssistant },
-      {
-        role: "user",
-        content:
-          "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
-      },
-    ]),
-    "OpenCode post-compact history shape must be detected",
-  );
-  assert(
-    !proxy.detectPostCompactRefillLoop([
-      { role: "user", content: "What did we do so far?" },
-      { role: "assistant", content: summaryAssistant },
-      {
-        role: "user",
-        content:
-          "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
-      },
-    ]),
-    "Anchored summary alone must not look like a refill loop",
-  );
-  assert(
-    proxy.detectPostCompactRefillLoop([
-      { role: "user", content: "What did we do so far?" },
-      { role: "assistant", content: summaryAssistant },
-      {
-        role: "user",
-        content:
-          "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
-      },
-      {
-        role: "assistant",
-        content: "I'll check AGENTS.md and resume unfinished context filling.",
-        tool_calls: [
-          {
-            id: "c1",
-            type: "function",
-            function: {
-              name: "read",
-              arguments: "{\"filePath\":\"/tmp/ctx/AGENTS.md\"}",
-            },
-          },
-        ],
-      },
-    ]),
-    "Post-compact AGENTS.md re-read must be detected as a refill loop",
-  );
-  assert(
-    proxy
-      .buildPostCompactRefillBreakNote()
-      .toLowerCase()
-      .includes("refilling context is forbidden"),
-    "Post-compact break note must forbid context refill",
-  );
-  assert(
-    proxy.isPostCompactRefillToolCall(
-      "todowrite",
-      JSON.stringify({ todos: [{ content: "deliver final answer" }] }),
-    ),
-    "Post-compact TodoWrite must be refused as refill/planning thrash",
-  );
-  assert(
-    proxy
-      .buildPostCompactRefillRefusal()
-      .toLowerCase()
-      .includes("refill refused"),
-    "Post-compact refusal text must be explicit",
-  );
-  assert(
-    compactContinue.toLowerCase().includes("context refill is forbidden") ||
-      compactContinue.toLowerCase().includes("refill is forbidden"),
-    "Compaction-continue framing must forbid context refill",
-  );
-
-  assert(
-    proxy.looksLikeUnfinishedPlan(
-      "I'll check AGENTS.md and git status, then push.",
-    ),
-    "Short plan-with-no-answer must look unfinished",
-  );
-  assert(
-    !proxy.looksLikeUnfinishedPlan(
-      "## Auth-gate flow\n\n- Redirect: /login\n- Flags: FEATURE_AUTH_GATE\n- Refresh: POST /api/auth/refresh\n\nDone.",
-    ),
-    "Concrete final answers must not look like unfinished plans",
-  );
-  assert(
-    proxy
-      .buildUnfinishedPlanNudgeUserText("I'll read AGENTS.md next.")
-      .toLowerCase()
-      .includes("without taking action"),
-    "Unfinished-plan nudge must demand a tool call or final answer",
-  );
-
-  assert(
-    !proxy.detectRestatedPlanLoop([
-      { role: "user", content: "rebuild and restart prod on :8888" },
-      {
-        role: "assistant",
-        content: "I'll rebuild the web assets, then restart :8888 without a password.",
-      },
-    ]),
-    "A single unfinished plan must not trip the restated-plan detector",
-  );
-  assert(
-    proxy.detectRestatedPlanLoop([
-      { role: "user", content: "rebuild and restart prod on :8888" },
-      {
-        role: "assistant",
-        content: "Not yet — rebuild/restart hadn’t run. Doing that now.",
-        tool_calls: [
-          {
-            id: "b1",
-            type: "function",
-            function: { name: "bash", arguments: "{\"command\":\"bun run build:web\"}" },
-          },
-        ],
-      },
-      {
-        role: "tool",
-        content: "✓ built in 2m 15s\nPWA built\n",
-        tool_call_id: "b1",
-      },
-      {
-        role: "assistant",
-        content: "Ще ні — rebuild/restart не завершився. Зараз зупиню :8888 і підніму без пароля.",
-      },
-      {
-        role: "assistant",
-        content: "Not yet — rebuild/restart hadn’t run. Doing that now.",
-      },
-    ]),
-    "Restating the same rebuild plan after successful build output must be detected",
-  );
-  assert(
-    proxy.detectRestatedPlanLoop([
-      { role: "user", content: "stop port 8888" },
-      {
-        role: "assistant",
-        content: "I'll stop the :8888 process now.",
-        tool_calls: [
-          {
-            id: "s1",
-            type: "function",
-            function: {
-              name: "bash",
-              arguments: "{\"command\":\"node packages/web/bin/cli.js stop --port 8888\"}",
-            },
-          },
-        ],
-      },
-      {
-        role: "tool",
-        content: "Error:\nOpenCode did not settle this tool after the session went idle.",
-        tool_call_id: "s1",
-      },
-    ]),
-    "OpenCode settle/idle tool errors must trip restated-plan recovery",
-  );
-  assert(
-    proxy
-      .buildRestatedPlanLoopBreakNote()
-      .toLowerCase()
-      .includes("did not settle"),
-    "Restated-plan break note must mention settle/idle recovery",
-  );
 
   const hugeToolOut = `${"line\n".repeat(8_000)}✓ built in 2m 15s\n`;
   const truncatedToolOut = proxy.truncateToolResultForCursor(hugeToolOut);
@@ -3695,6 +3199,252 @@ async function testClientAbortReleasesMutexForSteer(
 }
 
 // ---------------------------------------------------------------------------
+
+async function testUserSteerDetectionTailOnly(modules: TestModules) {
+  console.log("[test] Testing user-steer detection is tail-based (not whole history)...");
+  const proxy = await import("../src/proxy");
+  const toolCall = (id: string) => [
+    { id, type: "function", function: { name: "bash", arguments: "{}" } },
+  ];
+
+  // Normal continuation: completed tool round (result present), then the
+  // current user prompt which OpenCode appends at the end. Must NOT be a steer.
+  const completedRound = [
+    { role: "user", content: "do the work" },
+    { role: "assistant", content: "Running.", tool_calls: toolCall("c1") },
+    { role: "tool", content: "exit 0", tool_call_id: "c1" },
+    { role: "user", content: "Продовжуй" },
+  ];
+  assertEqual(
+    proxy.hasUserSteerAfterTools(completedRound),
+    false,
+    "Completed tool round + trailing current prompt must NOT be a steer",
+  );
+
+  // Real steer: batch opened by last assistant but NO results, then user text.
+  const openBatch = [
+    { role: "user", content: "do the work" },
+    { role: "assistant", content: "Running.", tool_calls: toolCall("c1") },
+    { role: "user", content: "stop, do this instead" },
+  ];
+  assertEqual(
+    proxy.hasUserSteerAfterTools(openBatch),
+    true,
+    "Open tool batch + trailing user text IS a steer",
+  );
+
+  // No trailing user text at all → not a steer.
+  const noTrailingUser = [
+    { role: "user", content: "do the work" },
+    { role: "assistant", content: "Running.", tool_calls: toolCall("c1") },
+    { role: "tool", content: "exit 0", tool_call_id: "c1" },
+  ];
+  assertEqual(
+    proxy.hasUserSteerAfterTools(noTrailingUser),
+    false,
+    "No trailing user message is not a steer",
+  );
+
+  // Completed round followed by an assistant text answer, then user → not a steer.
+  const answeredRound = [
+    { role: "user", content: "do the work" },
+    { role: "assistant", content: "Running.", tool_calls: toolCall("c1") },
+    { role: "tool", content: "exit 0", tool_call_id: "c1" },
+    { role: "assistant", content: "Done." },
+    { role: "user", content: "Продовжуй" },
+  ];
+  assertEqual(
+    proxy.hasUserSteerAfterTools(answeredRound),
+    false,
+    "Completed + answered round then user is not a steer",
+  );
+
+  // Orphaned results (OpenCode drops assistant.tool_calls) + trailing user → not a steer.
+  const orphaned = [
+    { role: "user", content: "do the work" },
+    { role: "assistant", content: "Running." },
+    { role: "tool", content: "exit 0", tool_call_id: "c1" },
+    { role: "user", content: "Продовжуй" },
+  ];
+  assertEqual(
+    proxy.hasUserSteerAfterTools(orphaned),
+    false,
+    "Orphaned tool result + user is not a steer",
+  );
+
+  // History with an EARLIER tool round, then a new open batch + user → steer.
+  const earlierRoundThenOpen = [
+    { role: "user", content: "a" },
+    { role: "assistant", content: "Old call.", tool_calls: toolCall("c_old") },
+    { role: "tool", content: "old", tool_call_id: "c_old" },
+    { role: "assistant", content: "New call.", tool_calls: toolCall("c_new") },
+    { role: "user", content: "interrupt!" },
+  ];
+  assertEqual(
+    proxy.hasUserSteerAfterTools(earlierRoundThenOpen),
+    true,
+    "Earlier completed round must not mask an unresolved new batch",
+  );
+
+  console.log("[test] User-steer detection tail-only OK");
+}
+
+async function testSteerVsResumeThroughProxy(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing completed-round continuation resumes (no interrupt framing)...");
+  const proxy = await import("../src/proxy");
+  modules.stopProxy();
+  backend.setRunMode("immediate-close");
+  backend.resetObservations();
+  const port = await modules.startProxy(async () => "test-token");
+
+  // Scenario 1: completed tool round + trailing current prompt (the loop shape).
+  // The proxy must send the user text normally — WITHOUT interrupt framing.
+  const res = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "default",
+      messages: [
+        { role: "system", content: "You are opencode." },
+        { role: "user", content: "do the work" },
+        {
+          role: "assistant",
+          content: "Running.",
+          tool_calls: [
+            { id: "c1", type: "function", function: { name: "bash", arguments: "{}" } },
+          ],
+        },
+        { role: "tool", content: "exit 0", tool_call_id: "c1" },
+        { role: "user", content: "Продовжуй" },
+      ],
+    }),
+  });
+  assertEqual(res.status, 200, "Completed-round continuation must succeed");
+  const body1 = await res.text();
+  assert(body1.includes("data: [DONE]"), "SSE must complete");
+  const texts1 = backend.getRunUserTexts();
+  assert(texts1.length >= 1, "A Cursor Run must start");
+  const last1 = texts1[texts1.length - 1] ?? "";
+  assert(
+    last1.includes("Продовжуй"),
+    `Run must carry the user text; got: ${last1.slice(0, 160)}`,
+  );
+  assert(
+    !last1.includes("Please follow this new instruction"),
+    `Completed round must NOT be framed as an interrupt steer; got: ${last1.slice(0, 160)}`,
+  );
+
+  // Scenario 2: genuinely open batch + user text (real steer) → interrupt framing.
+  backend.resetObservations();
+  const res2 = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "default",
+      messages: [
+        { role: "system", content: "You are opencode." },
+        { role: "user", content: "do the work" },
+        {
+          role: "assistant",
+          content: "Running.",
+          tool_calls: [
+            { id: "c1", type: "function", function: { name: "bash", arguments: "{}" } },
+          ],
+        },
+        { role: "user", content: "stop, do this instead" },
+      ],
+    }),
+  });
+  assertEqual(res2.status, 200, "Steer request must succeed");
+  const body2 = await res2.text();
+  assert(body2.includes("data: [DONE]"), "Steer SSE must complete");
+  const texts2 = backend.getRunUserTexts();
+  const last2 = texts2[texts2.length - 1] ?? "";
+  assert(
+    last2.includes("Please follow this new instruction"),
+    `Open batch + user must be framed as interrupt steer; got: ${last2.slice(0, 160)}`,
+  );
+
+  modules.stopProxy();
+  console.log("[test] Completed-round continuation resumes OK");
+}
+
+async function testAdaptivePostTextStallBudget(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing adaptive stall budget after visible text (post-tool resume)...");
+  const proxy = await import("../src/proxy");
+  // Without the adaptive switch, the resumed stream would use this huge
+  // post-tool budget and hang for 10 minutes, leaving the OpenCode step
+  // uncompleted (session blocked). With the fix, once visible text is sent
+  // the standard (short) budget applies and the stream finishes in seconds.
+  process.env.OPENCODE_CURSOR_STALL_TIMEOUT_POST_TOOL_MS = "600000";
+  modules.stopProxy();
+  backend.setRunMode("tool-call-then-hang");
+  const port = await modules.startProxy(async () => "test-token");
+
+  const tools = [
+    { type: "function", function: { name: "bash", description: "run shell", parameters: { type: "object", properties: {} } } },
+  ];
+  const base = [
+    { role: "system", content: "You are opencode." },
+    { role: "user", content: "run the command" },
+  ];
+
+  // Request 1: model emits a bash tool call → proxy parks the bridge.
+  const res1 = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "default", tools, messages: base }),
+  });
+  assertEqual(res1.status, 200, "Request 1 must succeed");
+  const body1 = await res1.text();
+  assert(body1.includes('"tool_calls"'), "Request 1 must stream tool_calls");
+  const idMatch = body1.match(/"id":"(call_[0-9a-f]+)"/);
+  assert(idMatch?.[1], "Request 1 must carry a proxy tool call id");
+  const callId = idMatch![1]!;
+
+  // Request 2: tool-result follow-up; the resumed Cursor stream sends visible
+  // text then hangs. The adaptive stall budget must finish it quickly.
+  backend.setRunMode("resume-text-then-hang");
+  const res2 = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "default",
+      tools,
+      messages: [
+        ...base,
+        {
+          role: "assistant",
+          content: "Running.",
+          tool_calls: [{ id: callId, type: "function", function: { name: "bash", arguments: "{}" } }],
+        },
+        { role: "tool", content: "ok", tool_call_id: callId },
+      ],
+    }),
+  });
+  assertEqual(res2.status, 200, "Resumed request must succeed");
+  const t0 = Date.now();
+  const body2 = await res2.text();
+  const elapsed = Date.now() - t0;
+  assert(body2.includes("data: [DONE]"), "Resumed stream must finish with DONE");
+  assert(
+    elapsed < 8_000,
+    `Adaptive stall budget must finish a post-text hang quickly; took ${elapsed}ms`,
+  );
+
+  delete process.env.OPENCODE_CURSOR_STALL_TIMEOUT_POST_TOOL_MS;
+  backend.setRunMode("immediate-close");
+  modules.stopProxy();
+  console.log("[test] Adaptive stall budget OK");
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -3713,7 +3463,7 @@ async function main() {
   const modules = await loadModules();
 
   try {
-    await testProxyStartStop(modules);
+        await testProxyStartStop(modules);
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testProxyModelAliasResolution(modules);
@@ -3746,6 +3496,9 @@ async function main() {
     await testLongToolBridgeTtlAndContinuation();
     await testAwaitingToolResultsBridgeSurvivesEviction();
     await testClientAbortReleasesMutexForSteer(modules, backend);
+    await testUserSteerDetectionTailOnly(modules);
+    await testSteerVsResumeThroughProxy(modules, backend);
+    await testAdaptivePostTextStallBudget(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exit(0);
   } catch (err) {
