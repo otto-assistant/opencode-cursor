@@ -82,6 +82,26 @@ function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
 
+/**
+ * POST a chat-completion body with keepalive disabled. The suite starts/stops
+ * the proxy ~35 times on the SAME port, and Bun's keepalive pool caches
+ * sockets per origin — a socket left over from a previous proxy instance is
+ * stale after stopProxy() closes the server, and reusing it yields a flaky
+ * ECONNRESET on the first request after a restart. keepalive:false forces a
+ * fresh connection each time.
+ */
+async function postChat(
+  url: string,
+  body: unknown,
+): Promise<Response> {
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    keepalive: false,
+  });
+}
+
 function assertEqual<T>(actual: T, expected: T, message: string): void {
   if (actual !== expected) {
     throw new Error(`${message}: expected ${String(expected)}, got ${String(actual)}`);
@@ -3346,25 +3366,21 @@ async function testSteerVsResumeThroughProxy(
 
   // Scenario 1: completed tool round + trailing current prompt (the loop shape).
   // The proxy must send the user text normally — WITHOUT interrupt framing.
-  const res = await fetch(`http://localhost:${port}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "default",
-      messages: [
-        { role: "system", content: "You are opencode." },
-        { role: "user", content: "do the work" },
-        {
-          role: "assistant",
-          content: "Running.",
-          tool_calls: [
-            { id: "c1", type: "function", function: { name: "bash", arguments: "{}" } },
-          ],
-        },
-        { role: "tool", content: "exit 0", tool_call_id: "c1" },
-        { role: "user", content: "Продовжуй" },
-      ],
-    }),
+  const res = await postChat(`http://localhost:${port}/v1/chat/completions`, {
+    model: "default",
+    messages: [
+      { role: "system", content: "You are opencode." },
+      { role: "user", content: "do the work" },
+      {
+        role: "assistant",
+        content: "Running.",
+        tool_calls: [
+          { id: "c1", type: "function", function: { name: "bash", arguments: "{}" } },
+        ],
+      },
+      { role: "tool", content: "exit 0", tool_call_id: "c1" },
+      { role: "user", content: "Продовжуй" },
+    ],
   });
   assertEqual(res.status, 200, "Completed-round continuation must succeed");
   const body1 = await res.text();
@@ -3383,24 +3399,20 @@ async function testSteerVsResumeThroughProxy(
 
   // Scenario 2: genuinely open batch + user text (real steer) → interrupt framing.
   backend.resetObservations();
-  const res2 = await fetch(`http://localhost:${port}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "default",
-      messages: [
-        { role: "system", content: "You are opencode." },
-        { role: "user", content: "do the work" },
-        {
-          role: "assistant",
-          content: "Running.",
-          tool_calls: [
-            { id: "c1", type: "function", function: { name: "bash", arguments: "{}" } },
-          ],
-        },
-        { role: "user", content: "stop, do this instead" },
-      ],
-    }),
+  const res2 = await postChat(`http://localhost:${port}/v1/chat/completions`, {
+    model: "default",
+    messages: [
+      { role: "system", content: "You are opencode." },
+      { role: "user", content: "do the work" },
+      {
+        role: "assistant",
+        content: "Running.",
+        tool_calls: [
+          { id: "c1", type: "function", function: { name: "bash", arguments: "{}" } },
+        ],
+      },
+      { role: "user", content: "stop, do this instead" },
+    ],
   });
   assertEqual(res2.status, 200, "Steer request must succeed");
   const body2 = await res2.text();
@@ -3440,10 +3452,8 @@ async function testAdaptivePostTextStallBudget(
   ];
 
   // Request 1: model emits a bash tool call → proxy parks the bridge.
-  const res1 = await fetch(`http://localhost:${port}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "default", tools, messages: base }),
+  const res1 = await postChat(`http://localhost:${port}/v1/chat/completions`, {
+    model: "default", tools, messages: base,
   });
   assertEqual(res1.status, 200, "Request 1 must succeed");
   const body1 = await res1.text();
@@ -3455,22 +3465,18 @@ async function testAdaptivePostTextStallBudget(
   // Request 2: tool-result follow-up; the resumed Cursor stream sends visible
   // text then hangs. The adaptive stall budget must finish it quickly.
   backend.setRunMode("resume-text-then-hang");
-  const res2 = await fetch(`http://localhost:${port}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "default",
-      tools,
-      messages: [
-        ...base,
-        {
-          role: "assistant",
-          content: "Running.",
-          tool_calls: [{ id: callId, type: "function", function: { name: "bash", arguments: "{}" } }],
-        },
-        { role: "tool", content: "ok", tool_call_id: callId },
-      ],
-    }),
+  const res2 = await postChat(`http://localhost:${port}/v1/chat/completions`, {
+    model: "default",
+    tools,
+    messages: [
+      ...base,
+      {
+        role: "assistant",
+        content: "Running.",
+        tool_calls: [{ id: callId, type: "function", function: { name: "bash", arguments: "{}" } }],
+      },
+      { role: "tool", content: "ok", tool_call_id: callId },
+    ],
   });
   assertEqual(res2.status, 200, "Resumed request must succeed");
   const t0 = Date.now();
@@ -3505,16 +3511,12 @@ async function testPreOutputStallBudgetAllowsSlowThinking(
   backend.setRunMode("stall-once-then-close"); // silence ~3s, then close
   const port = await modules.startProxy(async () => "test-token");
 
-  const res = await fetch(`http://localhost:${port}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "default",
-      messages: [
-        { role: "system", content: "You are opencode." },
-        { role: "user", content: "think slowly then answer" },
-      ],
-    }),
+  const res = await postChat(`http://localhost:${port}/v1/chat/completions`, {
+    model: "default",
+    messages: [
+      { role: "system", content: "You are opencode." },
+      { role: "user", content: "think slowly then answer" },
+    ],
   });
   assertEqual(res.status, 200, "Silent-start request must succeed");
   const body = await res.text();
@@ -3558,10 +3560,8 @@ async function testPostToolPreOutputStallBudget(
   ];
 
   // Request 1: model emits a bash tool call → proxy parks the bridge.
-  const res1 = await fetch(`http://localhost:${port}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "default", tools, messages: base }),
+  const res1 = await postChat(`http://localhost:${port}/v1/chat/completions`, {
+    model: "default", tools, messages: base,
   });
   assertEqual(res1.status, 200, "Request 1 must succeed");
   const body1 = await res1.text();
@@ -3573,22 +3573,18 @@ async function testPostToolPreOutputStallBudget(
   // Request 2: tool-result follow-up; the resumed stream stays SILENT. The
   // post-tool pre-output stall budget must fire and recover (checkpoint
   // rebuild) — the recovery's fresh stream emits a tool call, ending the test.
-  const res2 = await fetch(`http://localhost:${port}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "default",
-      tools,
-      messages: [
-        ...base,
-        {
-          role: "assistant",
-          content: "Running.",
-          tool_calls: [{ id: callId, type: "function", function: { name: "bash", arguments: "{}" } }],
-        },
-        { role: "tool", content: "ok", tool_call_id: callId },
-      ],
-    }),
+  const res2 = await postChat(`http://localhost:${port}/v1/chat/completions`, {
+    model: "default",
+    tools,
+    messages: [
+      ...base,
+      {
+        role: "assistant",
+        content: "Running.",
+        tool_calls: [{ id: callId, type: "function", function: { name: "bash", arguments: "{}" } }],
+      },
+      { role: "tool", content: "ok", tool_call_id: callId },
+    ],
   });
   assertEqual(res2.status, 200, "Silent-resume request must succeed");
   const t0 = Date.now();
