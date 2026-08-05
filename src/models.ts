@@ -1,65 +1,25 @@
-/**
- * Cursor model discovery via AvailableModels, with GetUsableModels and a
- * bundled catalog as fallbacks.
- */
-import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { tool } from "@opencode-ai/plugin";
-const z = tool.schema;
-import { callCursorUnaryRpc, probeCursorAgentSelection } from "./proxy.js";
+/** Cursor model discovery and filtering for stateless UnifiedChat. */
+import { createHash } from "node:crypto";
+import { gunzipSync } from "node:zlib";
 import {
   literalCursorModelSelection,
   type CursorModelParameter,
   type CursorModelSelection,
 } from "./model-selection.js";
 import {
-  GetUsableModelsRequestSchema,
-  GetUsableModelsResponseSchema,
-} from "./proto/agent_pb.js";
+  UnifiedChatTransport,
+  collectTransportBody,
+  type CursorTransport,
+} from "./unified-chat-transport.js";
 
-const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
 const AVAILABLE_MODELS_PATH = "/aiserver.v1.AiService/AvailableModels";
-
-// Cursor's AvailableModels omits some catalog entries unless they are named
-// explicitly. Grok models (including Grok 4.5 / grok-4-5) are user-added
-// named models and never appear with an empty additionalModelNames list.
-const ADDITIONAL_MODEL_NAMES = [
-  "grok-4-5",
-  "grok-4.20",
-  "grok-code-fast-1",
-  "grok-4-fast-reasoning",
-  "grok-4-0709",
-] as const;
-
-const AGENT_PROBE_MODEL_IDS = new Set<string>(ADDITIONAL_MODEL_NAMES);
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 64_000;
-
-const CursorModelDetailsSchema = z.object({
-  modelId: z.string(),
-  displayName: z.string().optional().catch(undefined),
-  displayNameShort: z.string().optional().catch(undefined),
-  displayModelId: z.string().optional().catch(undefined),
-  aliases: z
-    .array(z.unknown())
-    .optional()
-    .catch([])
-    .transform((aliases) =>
-      (aliases ?? []).filter(
-        (alias: unknown): alias is string => typeof alias === "string",
-      ),
-    ),
-  thinkingDetails: z.unknown().optional(),
-});
-
-interface CursorModelDetails {
-  modelId: string;
-  displayName?: string;
-  displayNameShort?: string;
-  displayModelId?: string;
-  aliases: string[];
-  thinkingDetails?: unknown;
-}
+const MAX_DISCOVERY_RESPONSE_BYTES = 8 * 1024 * 1024;
+const KNOWN_DEPRECATED_MODEL_IDS = new Set(["composer-2"]);
+const NON_TEXT_OUTPUT_MODEL_PATTERN =
+  /(?:^|[-_.])(?:image(?:gen|generation)?|imagen|realtime|audio|speech|tts|video)(?:[-_.]|$)/;
 
 export interface CursorModel {
   id: string;
@@ -70,26 +30,6 @@ export interface CursorModel {
   defaultSelection: CursorModelSelection;
   variants: Record<string, CursorModelSelection>;
 }
-
-export const FALLBACK_MODELS: CursorModel[] = [
-  // Composer models
-  flatModel("composer-1", "Composer 1", true, 200_000, 64_000),
-  flatModel("composer-1.5", "Composer 1.5", true, 200_000, 64_000),
-  // Claude models
-  flatModel("claude-4.6-opus-high", "Claude 4.6 Opus", true, 200_000, 128_000),
-  flatModel("claude-4.6-sonnet-medium", "Claude 4.6 Sonnet", true, 200_000, 64_000),
-  flatModel("claude-4.5-sonnet", "Claude 4.5 Sonnet", true, 200_000, 64_000),
-  // GPT models
-  flatModel("gpt-5.4-medium", "GPT-5.4", true, 272_000, 128_000),
-  flatModel("gpt-5.2", "GPT-5.2", true, 400_000, 128_000),
-  flatModel("gpt-5.2-codex", "GPT-5.2 Codex", true, 400_000, 128_000),
-  flatModel("gpt-5.3-codex", "GPT-5.3 Codex", true, 400_000, 128_000),
-  flatModel("gpt-5.3-codex-spark-preview", "GPT-5.3 Codex Spark", true, 128_000, 128_000),
-  // Other models
-  flatModel("gemini-3.1-pro", "Gemini 3.1 Pro", true, 1_000_000, 64_000),
-  flatModel("grok-code-fast-1", "Grok Code Fast 1", false, 256_000, 64_000),
-  flatModel("grok-4-fast-reasoning", "Grok 4 Fast Reasoning", true, 200_000, 64_000),
-];
 
 /**
  * Minimal catalog seeded while logged out. OpenCode removes providers that
@@ -131,24 +71,14 @@ export function isLoginPlaceholderModel(model: CursorModel | undefined): boolean
     model.name.startsWith("OPEN THIS URL TO LOGIN")
   );
 }
-interface VariantDescriptor {
-  key: string;
-  idSuffixes: readonly string[];
-  nameSuffixes: readonly string[];
-}
-
-const VARIANT_DESCRIPTORS: readonly VariantDescriptor[] = [
-  variantDescriptor("none", ["none"], ["None"]),
-  variantDescriptor("low", ["low"], ["Low"]),
-  variantDescriptor("medium", ["medium"], ["Medium"]),
-  variantDescriptor(
-    "xhigh",
-    ["xhigh", "extra-high"],
-    ["Extra High", "XHigh", "X High"],
-  ),
-  variantDescriptor("high", ["high"], ["High"]),
-  variantDescriptor("max", ["max"], ["Max"]),
-];
+const SUPPORTED_VARIANT_KEYS = new Set([
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
 
 const DEFAULT_VARIANT_ORDER = [
   "medium",
@@ -167,18 +97,6 @@ const VARIANT_DISPLAY_ORDER = [
   "xhigh",
   "max",
 ] as const;
-
-function variantDescriptor(
-  key: string,
-  idSuffixes: readonly string[],
-  nameSuffixes: readonly string[],
-): VariantDescriptor {
-  return {
-    key,
-    idSuffixes: idSuffixes.map((suffix) => `-${suffix}`),
-    nameSuffixes: nameSuffixes.map((suffix) => ` ${suffix}`),
-  };
-}
 
 function flatModel(
   id: string,
@@ -200,35 +118,49 @@ function flatModel(
 
 async function fetchCursorAvailableModels(
   apiKey: string,
+  transport: CursorTransport,
 ): Promise<CursorModel[] | null> {
   try {
     const requestBody = new TextEncoder().encode(
       JSON.stringify({
         isNightly: false,
         excludeMaxNamedModels: true,
-        additionalModelNames: [...ADDITIONAL_MODEL_NAMES],
+        additionalModelNames: [],
         useModelParameters: true,
         useReactModelPicker: true,
       }),
     );
-    const response = await callCursorUnaryRpc({
+    const response = await transport.request({
       accessToken: apiKey,
-      rpcPath: AVAILABLE_MODELS_PATH,
-      requestBody,
+      path: AVAILABLE_MODELS_PATH,
+      body: requestBody,
       contentType: "application/json",
       connectProtocolVersion: "1",
+      timeoutMs: 5_000,
     });
-    if (response.timedOut || response.exitCode !== 0 || response.body.length === 0) {
+    if (response.status < 200 || response.status >= 300) {
+      await response.body.cancel().catch(() => undefined);
       return null;
     }
-
-    const decoded = JSON.parse(new TextDecoder().decode(response.body)) as unknown;
+    const encodedBody = await collectTransportBody(
+      response,
+      MAX_DISCOVERY_RESPONSE_BYTES,
+    );
+    const contentEncoding = response.headers
+      .get("content-encoding")
+      ?.trim()
+      .toLowerCase();
+    if (contentEncoding && contentEncoding !== "identity" && contentEncoding !== "gzip") {
+      return null;
+    }
+    const body = contentEncoding === "gzip"
+      ? gunzipSync(encodedBody, { maxOutputLength: MAX_DISCOVERY_RESPONSE_BYTES })
+      : encodedBody;
+    if (body.length === 0) return null;
+    const decoded = JSON.parse(new TextDecoder().decode(body)) as unknown;
     const record = asRecord(decoded);
     const models = Array.isArray(record?.models)
-      ? await filterAgentRunnableModels(
-          apiKey,
-          normalizeAvailableModels(record.models),
-        )
+      ? filterSupportedCursorModels(normalizeAvailableModels(record.models))
       : [];
     return models.length > 0 ? models : null;
   } catch {
@@ -236,133 +168,140 @@ async function fetchCursorAvailableModels(
   }
 }
 
-async function fetchCursorUsableModels(
-  apiKey: string,
-): Promise<CursorModel[] | null> {
-  try {
-    const requestPayload = create(GetUsableModelsRequestSchema, {});
-    const requestBody = toBinary(GetUsableModelsRequestSchema, requestPayload);
+let defaultDiscoveryTransport: UnifiedChatTransport | undefined;
+const cachedModels = new Map<string, CursorModel[]>();
 
-    const response = await callCursorUnaryRpc({
-      accessToken: apiKey,
-      rpcPath: GET_USABLE_MODELS_PATH,
-      requestBody,
-    });
-
-    if (response.timedOut || response.exitCode !== 0 || response.body.length === 0) {
-      return null;
-    }
-
-    const decoded = decodeGetUsableModelsResponse(response.body);
-    if (!decoded) return null;
-
-    const models = normalizeCursorModels(decoded.models);
-    return models.length > 0 ? models : null;
-  } catch {
-    return null;
-  }
+function discoveryTransport(): CursorTransport {
+  defaultDiscoveryTransport ??= new UnifiedChatTransport({ minSize: 0 });
+  return defaultDiscoveryTransport;
 }
 
-let cachedModels: CursorModel[] | null = null;
+function tokenCacheKey(apiKey: string): string {
+  return createHash("sha256").update(apiKey).digest("hex");
+}
 
-export type GetCursorModelsOptions = {
-  /**
-   * When false, return an empty list instead of the hardcoded FALLBACK_MODELS
-   * catalog. Use this for provider/config UI seeding so OpenChamber never shows
-   * the bundled ~14 models as if they were the live Cursor catalog (~50).
-   */
-  allowFallback?: boolean;
-};
+export function isSupportedCursorSelection(
+  selection: CursorModelSelection,
+  model?: CursorModel,
+): boolean {
+  const id = selection.publicId.trim().toLowerCase();
+  return (
+    (!selection.maxMode || (model !== undefined && isExplicitOneMillionContextSelection(model, selection))) &&
+    /^(?:claude|gpt|gemini)(?:-|$)/.test(id) &&
+    !NON_TEXT_OUTPUT_MODEL_PATTERN.test(id) &&
+    !KNOWN_DEPRECATED_MODEL_IDS.has(id)
+  );
+}
+
+export function filterSupportedCursorModels(
+  models: readonly CursorModel[],
+): CursorModel[] {
+  const supported = models.flatMap((model) => {
+    const variants = Object.fromEntries(
+      Object.entries(model.variants).filter(([, selection]) =>
+        isSupportedCursorSelection(selection, model),
+      ),
+    );
+    const defaultSelection = isSupportedCursorSelection(
+      model.defaultSelection,
+      model,
+    )
+      ? model.defaultSelection
+      : Object.values(variants)[0];
+    if (!defaultSelection) return [];
+    return [{ ...model, defaultSelection, variants }];
+  });
+  return removeAmbiguousSelectionIds(supported);
+}
+
+export function isExplicitOneMillionContextSelection(
+  model: CursorModel,
+  selection: CursorModelSelection,
+): boolean {
+  return (
+    selection.maxMode &&
+    model.contextWindow === 1_000_000 &&
+    /(?:^|-)1m(?:-|$)/.test(model.id.toLowerCase()) &&
+    selection.parameters.some((parameter) =>
+      parameter.id.toLowerCase() === "context" &&
+      parameter.value.trim().toLowerCase() === "1m"
+    )
+  );
+}
+
+function removeAmbiguousSelectionIds(models: readonly CursorModel[]): CursorModel[] {
+  const owners = new Map<string, Set<string>>();
+  for (const model of models) {
+    for (const selection of [
+      model.defaultSelection,
+      ...Object.values(model.variants),
+    ]) {
+      const key = selectionWireKey(selection);
+      const entries = owners.get(key) ?? new Set<string>();
+      entries.add(`${model.id}\0${selectionSignature(selection)}`);
+      owners.set(key, entries);
+    }
+  }
+  const ambiguous = new Set(
+    [...owners.entries()]
+      .filter(([, entries]) => entries.size > 1)
+      .map(([key]) => key),
+  );
+  return models.flatMap((model) => {
+    const variants = Object.fromEntries(
+      Object.entries(model.variants).filter(
+        ([, selection]) => !ambiguous.has(selectionWireKey(selection)),
+      ),
+    );
+    const defaultSelection = ambiguous.has(selectionWireKey(model.defaultSelection))
+      ? Object.values(variants)[0]
+      : model.defaultSelection;
+    return defaultSelection ? [{ ...model, defaultSelection, variants }] : [];
+  });
+}
+
+function selectionWireKey(selection: CursorModelSelection): string {
+  return JSON.stringify([selection.publicId, selection.maxMode]);
+}
+
+function selectionSignature(selection: CursorModelSelection): string {
+  return JSON.stringify([
+    selection.modelId,
+    selection.maxMode,
+    selection.parameters.map((parameter) => [parameter.id, parameter.value]),
+  ]);
+}
+
+function modelRoutingSignature(model: CursorModel): string {
+  return JSON.stringify([
+    model.defaultSelection.publicId,
+    selectionSignature(model.defaultSelection),
+    Object.entries(model.variants).map(([key, selection]) => [
+      key,
+      selection.publicId,
+      selectionSignature(selection),
+    ]),
+  ]);
+}
 
 export async function getCursorModels(
   apiKey: string,
-  options?: GetCursorModelsOptions,
+  transport: CursorTransport = discoveryTransport(),
 ): Promise<CursorModel[]> {
-  if (cachedModels) return cachedModels;
-  const discovered =
-    (await fetchCursorAvailableModels(apiKey)) ??
-    (await fetchCursorUsableModels(apiKey));
-  // Only cache a successful discovery. Caching FALLBACK_MODELS would pin the
-  // whole process to the bundled list after a single transient failure; instead
-  // return the fallback for this call and let the next call retry discovery.
+  const key = tokenCacheKey(apiKey);
+  const cached = cachedModels.get(key);
+  if (cached) return cached;
+  const discovered = await fetchCursorAvailableModels(apiKey, transport);
   if (discovered && discovered.length > 0) {
-    cachedModels = discovered;
-    return cachedModels;
+    cachedModels.set(key, discovered);
+    return discovered;
   }
-  if (options?.allowFallback === false) return [];
-  return FALLBACK_MODELS;
-}
-
-async function filterAgentRunnableModels(
-  accessToken: string,
-  models: CursorModel[],
-): Promise<CursorModel[]> {
-  const probeTargets = models.filter((model) => AGENT_PROBE_MODEL_IDS.has(model.id));
-  if (probeTargets.length === 0) return models;
-
-  const probeResults = await Promise.all(
-    probeTargets.map(async (model) => ({
-      id: model.id,
-      runnable: await probeCursorAgentSelection(accessToken, model.defaultSelection),
-    })),
-  );
-  const runnableIds = new Set(
-    probeResults.filter((result) => result.runnable).map((result) => result.id),
-  );
-
-  return models.filter(
-    (model) => !AGENT_PROBE_MODEL_IDS.has(model.id) || runnableIds.has(model.id),
-  );
+  return [];
 }
 
 /** @internal Test-only. */
 export function clearModelCache(): void {
-  cachedModels = null;
-}
-
-function decodeGetUsableModelsResponse(payload: Uint8Array): {
-  models: readonly unknown[];
-} | null {
-  try {
-    return fromBinary(GetUsableModelsResponseSchema, payload);
-  } catch {
-    const framedBody = decodeConnectUnaryBody(payload);
-    if (!framedBody) return null;
-    try {
-      return fromBinary(GetUsableModelsResponseSchema, framedBody);
-    } catch {
-      return null;
-    }
-  }
-}
-
-function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
-  if (payload.length < 5) return null;
-
-  let offset = 0;
-  while (offset + 5 <= payload.length) {
-    const flags = payload[offset]!;
-    const view = new DataView(
-      payload.buffer,
-      payload.byteOffset + offset,
-      payload.byteLength - offset,
-    );
-    const messageLength = view.getUint32(1, false);
-    const frameEnd = offset + 5 + messageLength;
-    if (frameEnd > payload.length) return null;
-
-    // Compression flag
-    if ((flags & 0b0000_0001) !== 0) return null;
-
-    // End-of-stream flag — skip trailer frames
-    if ((flags & 0b0000_0010) === 0) {
-      return payload.subarray(offset + 5, frameEnd);
-    }
-
-    offset = frameEnd;
-  }
-
-  return null;
+  cachedModels.clear();
 }
 
 interface AvailableSelection {
@@ -397,11 +336,12 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
     string,
     { model: CursorModel; rank: number; sourceName: string }
   >();
+  const ambiguousModelIds = new Set<string>();
 
   for (const rawModel of models) {
     const model = asRecord(rawModel);
     const name = stringProp(model, "name");
-    if (!model || !name) continue;
+    if (!model || !name || isDeprecatedAvailableModel(model, name)) continue;
 
     const displayName = pickAvailableDisplayName(model, name);
     const serverModelName = stringProp(model, "serverModelName") ?? name;
@@ -424,7 +364,11 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
       const rawEffort = values.get("reasoning") ?? values.get("effort");
       const effort = normalizeEffort(rawEffort);
       if (rawEffort && !effort) continue;
-      const structuralParts = buildStructuralParts(values, structuralParameters);
+      const structuralParts = buildStructuralParts(
+        values,
+        structuralParameters,
+        variant.isMaxMode === true,
+      );
       const suffixes = structuralParts.map((part) => part.id);
       const groupId = [name, ...suffixes].join("-");
       const groupKey = structuralParameterSignature(
@@ -437,7 +381,8 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
       ]
         .filter((value): value is string => Boolean(value))
         .join(" ");
-      const legacySlug = stringProp(variant, "legacySlug") ?? name;
+      const legacySlug = stringProp(variant, "legacySlug");
+      if (!legacySlug) continue;
       const selection: CursorModelSelection = {
         publicId: legacySlug,
         modelId: serverModelName,
@@ -462,6 +407,7 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
     }
 
     if (groups.size === 0) {
+      if (variants.length > 0) continue;
       const flatSelection: CursorModelSelection = {
         publicId: name,
         modelId: serverModelName,
@@ -482,13 +428,25 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
       const existing = output.get(name);
       if (!existing) {
         output.set(name, { model: candidate, rank: 0, sourceName: name });
+      } else if (
+        modelRoutingSignature(existing.model) !== modelRoutingSignature(candidate)
+      ) {
+        ambiguousModelIds.add(name);
       }
       continue;
     }
 
     for (const group of groups.values()) {
+      const publicIdCounts = new Map<string, number>();
+      for (const entry of group.selections) {
+        const publicId = entry.selection.publicId;
+        publicIdCounts.set(publicId, (publicIdCounts.get(publicId) ?? 0) + 1);
+      }
+      const selections = group.selections.filter(
+        (entry) => publicIdCounts.get(entry.selection.publicId) === 1,
+      );
       const variantsByEffort = Object.fromEntries(
-        group.selections
+        selections
           .filter((entry): entry is AvailableSelection & { effort: string } =>
             Boolean(entry.effort),
           )
@@ -496,8 +454,8 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
           .map((entry) => [entry.effort, entry.selection]),
       );
       const defaultEntry =
-        group.selections.find((entry) => entry.isDefault) ??
-        selectDefaultAvailableSelection(group.selections);
+        selections.find((entry) => entry.isDefault) ??
+        selectDefaultAvailableSelection(selections);
       if (!defaultEntry) continue;
       let publicId = group.id;
       if (
@@ -523,6 +481,12 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
       const rank = publicId === name ? 0 : 1;
       const existing = output.get(publicId);
       if (
+        existing &&
+        modelRoutingSignature(existing.model) !== modelRoutingSignature(candidate)
+      ) {
+        ambiguousModelIds.add(publicId);
+      }
+      if (
         !existing ||
         rank < existing.rank ||
         (rank === existing.rank && name.localeCompare(existing.sourceName) < 0)
@@ -534,6 +498,7 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
 
   return [...output.values()]
     .map((entry) => entry.model)
+    .filter((model) => !ambiguousModelIds.has(model.id))
     .sort((a, b) => a.id.localeCompare(b.id));
 }
 
@@ -606,7 +571,10 @@ function buildStructuralParameterMetadata(
     const values = parameterDefinitionValues(definition);
     metadata.set(id, {
       id,
-      baseline: values[0]?.value,
+      baseline:
+        id === "context"
+          ? nonMaxParameterValue(id, variants) ?? values[0]?.value
+          : values[0]?.value,
       labels: new Map(
         values.map((value) => [
           value.value,
@@ -647,9 +615,27 @@ function buildStructuralParameterMetadata(
   );
 }
 
+function nonMaxParameterValue(
+  id: string,
+  variants: readonly Record<string, unknown>[],
+): string | undefined {
+  const ordered = [
+    ...variants.filter((variant) => variant.isDefaultNonMaxConfig === true),
+    ...variants.filter((variant) => variant.isDefaultNonMaxConfig !== true),
+  ];
+  for (const variant of ordered) {
+    if (variant.isMaxMode === true) continue;
+    const parameter = parseParameterValues(variant.parameterValues)
+      .find((candidate) => candidate.id === id);
+    if (parameter) return parameter.value;
+  }
+  return undefined;
+}
+
 function buildStructuralParts(
   values: ReadonlyMap<string, string>,
   metadata: readonly ParameterMetadata[],
+  maxMode: boolean,
 ): Array<{ id: string; name: string }> {
   const parts: Array<{ id: string; name: string }> = [];
   for (const parameter of metadata) {
@@ -662,7 +648,8 @@ function buildStructuralParts(
       });
       continue;
     }
-    if (value === parameter.baseline) continue;
+    const forceMaxContext = maxMode && parameter.id === "context";
+    if (value === parameter.baseline && !forceMaxContext) continue;
     const label = parameter.labels.get(value);
     if (parameter.id === "context") {
       parts.push({
@@ -706,7 +693,7 @@ function normalizeEffort(value: string | undefined): string | undefined {
   if (!value) return undefined;
   const normalized = value.trim().toLowerCase();
   if (normalized === "extra-high") return "xhigh";
-  return VARIANT_DESCRIPTORS.some((descriptor) => descriptor.key === normalized)
+  return SUPPORTED_VARIANT_KEYS.has(normalized)
     ? normalized
     : undefined;
 }
@@ -758,189 +745,16 @@ function arrayProp(
   return Array.isArray(value) ? value : [];
 }
 
-export function normalizeCursorModels(
-  models: readonly unknown[],
-): CursorModel[] {
-  if (models.length === 0) return [];
-
-  const byId = new Map<string, CursorModel>();
-  for (const model of models) {
-    const normalized = normalizeSingleModel(model);
-    if (normalized) byId.set(normalized.id, normalized);
-  }
-
-  return groupCursorModelVariants([...byId.values()]);
-}
-
-function normalizeSingleModel(model: unknown): CursorModel | null {
-  const parsed = CursorModelDetailsSchema.safeParse(model);
-  if (!parsed.success) return null;
-
-  const details = parsed.data;
-  const id = details.modelId.trim();
-  if (!id) return null;
-
-  return {
-    id,
-    name: pickDisplayName(details, id),
-    reasoning: Boolean(details.thinkingDetails),
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
-    defaultSelection: literalCursorModelSelection(id),
-    variants: {},
-  };
-}
-
-interface VariantCandidate {
-  model: CursorModel;
-  baseId: string;
-  baseName: string;
-  key: string;
-}
-
-function groupCursorModelVariants(models: CursorModel[]): CursorModel[] {
-  const byId = new Map(models.map((model) => [model.id, model]));
-  const groups = new Map<string, VariantCandidate[]>();
-
-  for (const model of models) {
-    const candidate = parseVariantCandidate(model);
-    if (!candidate) continue;
-    const entries = groups.get(candidate.baseId) ?? [];
-    entries.push(candidate);
-    groups.set(candidate.baseId, entries);
-  }
-
-  const viableGroups = [...groups.entries()]
-    .filter(([baseId, candidates]) => {
-      const memberCount = candidates.length + (byId.has(baseId) ? 1 : 0);
-      const uniqueKeys = new Set(candidates.map((candidate) => candidate.key));
-      const names = new Set(
-        candidates.map((candidate) => normalizeFamilyName(candidate.baseName)),
-      );
-      const bare = byId.get(baseId);
-      if (bare) names.add(normalizeFamilyName(bare.name));
-      return (
-        memberCount >= 2 &&
-        uniqueKeys.size === candidates.length &&
-        names.size === 1
-      );
-    })
-    .sort(([a], [b]) => b.length - a.length || a.localeCompare(b));
-
-  const consumed = new Set<string>();
-  const grouped: CursorModel[] = [];
-
-  for (const [baseId, candidates] of viableGroups) {
-    const availableCandidates = candidates.filter(
-      (candidate) => !consumed.has(candidate.model.id),
-    );
-    const bare = !consumed.has(baseId) ? byId.get(baseId) : undefined;
-    if (availableCandidates.length + (bare ? 1 : 0) < 2) continue;
-    if (
-      new Set(availableCandidates.map((candidate) => candidate.key)).size !==
-      availableCandidates.length
-    ) {
-      continue;
-    }
-    const availableNames = new Set(
-      availableCandidates.map((candidate) =>
-        normalizeFamilyName(candidate.baseName),
-      ),
-    );
-    if (bare) availableNames.add(normalizeFamilyName(bare.name));
-    if (availableNames.size !== 1) continue;
-
-    const variants = Object.fromEntries(
-      availableCandidates
-        .sort(compareVariantCandidates)
-        .map((candidate) => [candidate.key, candidate.model.defaultSelection]),
-    );
-    const defaultModel = bare ?? selectDefaultVariant(availableCandidates)?.model;
-    if (!defaultModel) continue;
-
-    const members = [
-      ...(bare ? [bare] : []),
-      ...availableCandidates.map((candidate) => candidate.model),
-    ];
-    const baseName = bare?.name ?? availableCandidates[0]!.baseName;
-    grouped.push({
-      id: baseId,
-      name: baseName,
-      reasoning: members.some((model) => model.reasoning),
-      contextWindow: defaultModel.contextWindow,
-      maxTokens: defaultModel.maxTokens,
-      defaultSelection: defaultModel.defaultSelection,
-      variants,
-    });
-
-    for (const member of members) consumed.add(member.id);
-  }
-
-  for (const model of models) {
-    if (!consumed.has(model.id)) grouped.push(model);
-  }
-
-  return grouped.sort((a, b) => a.id.localeCompare(b.id));
-}
-
-function normalizeFamilyName(name: string): string {
-  return name.trim().replace(/\s+/g, " ").toLowerCase();
-}
-
-function parseVariantCandidate(model: CursorModel): VariantCandidate | undefined {
-  const lowerId = model.id.toLowerCase();
-  const lowerName = model.name.toLowerCase();
-
-  for (const descriptor of VARIANT_DESCRIPTORS) {
-    const thinkingIdSuffix = descriptor.idSuffixes.find((suffix) =>
-      lowerId.endsWith(`${suffix}-thinking`),
-    );
-    if (thinkingIdSuffix) {
-      const thinkingNameSuffix = descriptor.nameSuffixes.find((suffix) =>
-        lowerName.endsWith(`${suffix.toLowerCase()} thinking`),
-      );
-      if (thinkingNameSuffix) {
-        const fullIdSuffix = `${thinkingIdSuffix}-thinking`;
-        const fullNameSuffix = `${thinkingNameSuffix} Thinking`;
-        const idStem = model.id.slice(0, -fullIdSuffix.length);
-        const nameStem = model.name.slice(0, -fullNameSuffix.length).trim();
-        if (!idStem || !nameStem) return undefined;
-        const baseId = `${idStem}-thinking`;
-        const baseName = `${nameStem} Thinking`;
-        return { model, baseId, baseName, key: descriptor.key };
-      }
-    }
-
-    const idSuffix = descriptor.idSuffixes.find((suffix) => lowerId.endsWith(suffix));
-    if (!idSuffix) continue;
-    const nameSuffix = descriptor.nameSuffixes.find((suffix) =>
-      lowerName.endsWith(suffix.toLowerCase()),
-    );
-    if (!nameSuffix) continue;
-
-    const baseId = model.id.slice(0, -idSuffix.length);
-    const baseName = model.name.slice(0, -nameSuffix.length).trim();
-    if (!baseId || !baseName) return undefined;
-    return { model, baseId, baseName, key: descriptor.key };
-  }
-
-  return undefined;
-}
-
-function compareVariantCandidates(a: VariantCandidate, b: VariantCandidate): number {
-  const order = (key: string): number => {
-    const index = DEFAULT_VARIANT_ORDER.indexOf(
-      key as (typeof DEFAULT_VARIANT_ORDER)[number],
-    );
-    return index === -1 ? DEFAULT_VARIANT_ORDER.length : index;
-  };
-  return order(a.key) - order(b.key) || a.key.localeCompare(b.key);
-}
-
-function selectDefaultVariant(
-  candidates: readonly VariantCandidate[],
-): VariantCandidate | undefined {
-  return [...candidates].sort(compareVariantCandidates)[0];
+function isDeprecatedAvailableModel(
+  model: Record<string, unknown>,
+  name: string,
+): boolean {
+  return (
+    model.isDeprecated === true ||
+    model.deprecated === true ||
+    stringProp(model, "status")?.toLowerCase() === "deprecated" ||
+    KNOWN_DEPRECATED_MODEL_IDS.has(name.toLowerCase())
+  );
 }
 
 export function resolveCursorModelSelection(
@@ -952,23 +766,7 @@ export function resolveCursorModelSelection(
   if (!model) return undefined;
   const key = variant?.trim().toLowerCase();
   if (!key || key === "default") return model.defaultSelection;
-  return model.variants[key] ?? model.defaultSelection;
-}
-
-function pickDisplayName(model: CursorModelDetails, fallbackId: string): string {
-  const candidates = [
-    model.displayName,
-    model.displayNameShort,
-    model.displayModelId,
-    ...model.aliases,
-    fallbackId,
-  ];
-  for (const candidate of candidates) {
-    if (typeof candidate !== "string") continue;
-    const trimmed = candidate.trim();
-    if (trimmed) return trimmed;
-  }
-  return fallbackId;
+  return model.variants[key];
 }
 
 function pickAvailableDisplayName(

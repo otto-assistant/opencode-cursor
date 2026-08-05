@@ -17,16 +17,21 @@ on:
           - patch
           - major
       dry_run:
-        description: 'Dry run — skip npm publish, create draft release'
+        description: 'Validate only; skip npm publish and repository writes'
         required: false
         default: false
         type: boolean
 
 env:
   NODE_VERSION: '22'
+  PACKAGE_TAG_PREFIX: 'opencode-cursor-auth-v'
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -34,6 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
           fetch-tags: true
 
@@ -47,6 +53,7 @@ jobs:
           CURRENT_VERSION: ${{ steps.current_version.outputs.version }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
           BUMP_TYPE: ${{ github.event.inputs.bump }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [[ -n "$INPUT_VERSION" ]]; then
@@ -56,6 +63,14 @@ jobs:
               exit 1
             fi
             echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+          elif ! git rev-parse -q --verify "refs/tags/${PACKAGE_TAG_PREFIX}${CURRENT_VERSION}" >/dev/null; then
+            # The repository has legacy v0.x tags. This package has its own tag
+            # namespace and starts from the version already in package.json.
+            echo "version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
+          elif ! gh release view "${PACKAGE_TAG_PREFIX}${CURRENT_VERSION}" >/dev/null 2>&1; then
+            # Resume a release whose tag was pushed but whose GitHub release was
+            # not created. npm publication is checked separately and is idempotent.
+            echo "version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
           else
             IFS='.' read -r major minor patch <<< "$CURRENT_VERSION"
             case "$BUMP_TYPE" in
@@ -70,15 +85,13 @@ jobs:
         run: |
           echo "Current version: ${{ steps.current_version.outputs.version }}"
           echo "New version:     ${{ steps.version.outputs.version }}"
+          echo "Package tag:     ${{ env.PACKAGE_TAG_PREFIX }}${{ steps.version.outputs.version }}"
           echo "Dry run:         ${{ github.event.inputs.dry_run == 'true' && 'yes' || 'no' }}"
 
-      - name: Update package.json version
-        run: |
-          node -e "
-            const pkg = require('./package.json');
-            pkg.version = '${{ steps.version.outputs.version }}';
-            require('fs').writeFileSync('./package.json', JSON.stringify(pkg, null, 2) + '\n');
-          "
+      - name: Update package version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: npm version "${VERSION}" --no-git-tag-version --allow-same-version
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -98,43 +111,68 @@ jobs:
       - name: Build package
         run: bun run build
 
+      - name: Inspect package contents
+        run: npm pack --dry-run
+
       - name: Commit and tag
+        if: ${{ github.event.inputs.dry_run != 'true' }}
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add package.json
+          git add package.json package-lock.json
           if git ls-files --modified --others | grep -q bun.lock; then
             git add bun.lock
           fi
-          git commit -m "chore: release v${VERSION}"
-          git tag "v${VERSION}"
-          git push origin "v${VERSION}"
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: release v${VERSION}"
+          fi
+          TAG="${PACKAGE_TAG_PREFIX}${VERSION}"
+          if git show-ref --tags --verify --quiet "refs/tags/${TAG}"; then
+            if [[ "$(git rev-list -n 1 "${TAG}")" != "$(git rev-parse HEAD)" ]]; then
+              echo "Error: ${TAG} already points to a different commit"
+              exit 1
+            fi
+          else
+            git tag "${TAG}"
+          fi
           git push origin HEAD:main
+          git push origin "${TAG}"
 
       - name: Publish to npm
         if: ${{ github.event.inputs.dry_run != 'true' }}
-        run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PACKAGE_NAME: '@otto-assistant/opencode-cursor-auth'
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          PUBLISHED="$(npm view "${PACKAGE_NAME}@${VERSION}" version 2>/dev/null || true)"
+          if [[ "$PUBLISHED" == "$VERSION" ]]; then
+            echo "${PACKAGE_NAME}@${VERSION} is already published; continuing the release."
+          else
+            npm publish --access public
+          fi
 
       - name: Create GitHub Release
+        if: ${{ github.event.inputs.dry_run != 'true' }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.version.outputs.version }}
+          tag_name: ${{ env.PACKAGE_TAG_PREFIX }}${{ steps.version.outputs.version }}
           generate_release_notes: true
-          draft: ${{ github.event.inputs.dry_run == 'true' }}
-          name: v${{ steps.version.outputs.version }}
+          draft: false
+          name: opencode-cursor-auth v${{ steps.version.outputs.version }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Send Discord notification
         if: ${{ github.event.inputs.dry_run != 'true' }}
+        continue-on-error: true
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
+          PACKAGE_TAG: ${{ env.PACKAGE_TAG_PREFIX }}${{ steps.version.outputs.version }}
           REPOSITORY: ${{ github.repository }}
         run: |
           if [ -z "$DISCORD_WEBHOOK_URL" ]; then
@@ -143,7 +181,7 @@ jobs:
           fi
           node - <<'NODE'
           (async () => {
-            const tag = `v${process.env.VERSION}`;
+            const tag = process.env.PACKAGE_TAG;
             const repo = process.env.REPOSITORY;
             const releaseRes = await fetch(`https://api.github.com/repos/${repo}/releases/tags/${tag}`, {
               headers: {
@@ -156,16 +194,16 @@ jobs:
               throw new Error(`Failed to fetch release ${tag}: ${releaseRes.status} ${body}`);
             }
             const release = await releaseRes.json();
-            const description = (release.body || `opencode-cursor-oauth ${tag} released.`).slice(0, 4096);
+            const description = (release.body || `opencode-cursor-auth ${tag} released.`).slice(0, 4096);
             const payload = {
-              username: 'opencode-cursor-oauth Releases',
+              username: 'opencode-cursor-auth Releases',
               embeds: [
                 {
-                  title: release.name || `opencode-cursor-oauth ${tag}`,
+                  title: release.name || `opencode-cursor-auth ${tag}`,
                   url: release.html_url,
                   description,
                   color: 3447003,
-                  footer: { text: 'opencode-cursor-oauth Changelog' },
+                  footer: { text: 'opencode-cursor-auth Changelog' },
                 },
               ],
             };

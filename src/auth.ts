@@ -1,9 +1,9 @@
+import { Buffer } from "node:buffer";
 import { generatePKCE } from "./pkce.js";
 
 const CURSOR_LOGIN_URL = "https://cursor.com/loginDeepControl";
 const CURSOR_POLL_URL = "https://api2.cursor.sh/auth/poll";
-const CURSOR_REFRESH_URL =
-  process.env.CURSOR_REFRESH_URL ??
+const DEFAULT_CURSOR_REFRESH_URL =
   "https://api2.cursor.sh/auth/exchange_user_api_key";
 
 const POLL_MAX_ATTEMPTS = 150;
@@ -92,10 +92,24 @@ export async function tryPollCursorAuth(
   }
 
   if (response.ok) {
-    const data = (await response.json()) as {
-      accessToken: string;
-      refreshToken: string;
-    };
+    let data: unknown;
+    try {
+      data = await response.json();
+    } catch {
+      throw new Error("Cursor auth poll returned an invalid response");
+    }
+    if (
+      typeof data !== "object" ||
+      data === null ||
+      !("accessToken" in data) ||
+      typeof data.accessToken !== "string" ||
+      data.accessToken.length === 0 ||
+      !("refreshToken" in data) ||
+      typeof data.refreshToken !== "string" ||
+      data.refreshToken.length === 0
+    ) {
+      throw new Error("Cursor auth poll returned an invalid response");
+    }
     return {
       accessToken: data.accessToken,
       refreshToken: data.refreshToken,
@@ -113,38 +127,57 @@ export async function tryPollCursorAuth(
  */
 export class RefreshTokenInvalidError extends Error {
   readonly status: number;
-  readonly body: string;
-  constructor(status: number, body: string) {
-    super(
-      `Cursor token refresh rejected (HTTP ${status}): ${body || "<empty body>"}`,
-    );
+  constructor(status: number) {
+    super(`Cursor token refresh rejected (HTTP ${status})`);
     this.name = "RefreshTokenInvalidError";
     this.status = status;
-    this.body = body;
   }
 }
 
 function looksLikeJwt(value: unknown): value is string {
   if (typeof value !== "string") return false;
   const parts = value.split(".");
-  return parts.length === 3 && parts.every((p) => p.length > 0);
+  if (parts.length !== 3 || parts.some((part) => part.length === 0)) return false;
+  try {
+    const header: unknown = JSON.parse(
+      Buffer.from(parts[0]!, "base64url").toString("utf8"),
+    );
+    const payload: unknown = JSON.parse(
+      Buffer.from(parts[1]!, "base64url").toString("utf8"),
+    );
+    return (
+      typeof header === "object" &&
+      header !== null &&
+      typeof payload === "object" &&
+      payload !== null &&
+      "exp" in payload &&
+      typeof payload.exp === "number" &&
+      Number.isFinite(payload.exp) &&
+      payload.exp * 1_000 > Date.now()
+    );
+  } catch {
+    return false;
+  }
 }
 
 export async function refreshCursorToken(
   refreshToken: string,
 ): Promise<CursorCredentials> {
-  const response = await fetch(CURSOR_REFRESH_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${refreshToken}`,
-      "Content-Type": "application/json",
+  const response = await fetch(
+    process.env.CURSOR_REFRESH_URL ?? DEFAULT_CURSOR_REFRESH_URL,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${refreshToken}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+      signal: AbortSignal.timeout(REFRESH_REQUEST_TIMEOUT_MS),
     },
-    body: "{}",
-    signal: AbortSignal.timeout(REFRESH_REQUEST_TIMEOUT_MS),
-  });
+  );
 
   if (!response.ok) {
-    const body = await response.text().catch(() => "");
+    await response.body?.cancel().catch(() => undefined);
     // 4xx (except 408/429) = permanent: refresh token is invalid/revoked/expired.
     // 5xx, 408, 429 = transient: server-side or rate-limit, safe to retry.
     const isPermanent =
@@ -153,26 +186,40 @@ export async function refreshCursorToken(
       response.status !== 408 &&
       response.status !== 429;
     if (isPermanent) {
-      throw new RefreshTokenInvalidError(response.status, body);
+      throw new RefreshTokenInvalidError(response.status);
     }
-    throw new Error(
-      `Cursor token refresh failed (HTTP ${response.status}): ${body || "<empty body>"}`,
-    );
+    throw new Error(`Cursor token refresh failed (HTTP ${response.status})`);
   }
 
-  const data = (await response.json()) as {
-    accessToken: string;
-    refreshToken?: string;
-  };
+  let data: unknown;
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error("Cursor token refresh returned an invalid response");
+  }
+  if (
+    typeof data !== "object" ||
+    data === null ||
+    !("accessToken" in data) ||
+    typeof data.accessToken !== "string" ||
+    data.accessToken.length === 0
+  ) {
+    throw new Error("Cursor token refresh returned an invalid response");
+  }
+  const responseRefresh =
+    "refreshToken" in data && typeof data.refreshToken === "string"
+      ? data.refreshToken
+      : undefined;
 
   // Cursor's /auth/exchange_user_api_key historically returns an API key
   // string (not a JWT) for `accessToken`, and sometimes echoes the value
   // back as `refreshToken`. Persisting that as the new refresh would clobber
   // the original long-lived OAuth JWT and break every subsequent refresh.
   // Only adopt `data.refreshToken` when it actually looks like a JWT.
-  const nextRefresh = looksLikeJwt(data.refreshToken)
-    ? data.refreshToken
-    : refreshToken;
+  const nextRefresh =
+    responseRefresh !== data.accessToken && looksLikeJwt(responseRefresh)
+      ? responseRefresh
+      : refreshToken;
 
   return {
     access: data.accessToken,

@@ -1,7 +1,7 @@
 {
-  "name": "@otto-assistant/opencode-cursor-oauth",
-  "version": "2.2.0",
-  "description": "OpenCode plugin that connects Cursor's API to OpenCode via OAuth, model discovery, and a local OpenAI-compatible proxy.",
+  "name": "@otto-assistant/opencode-cursor-auth",
+  "version": "3.0.0",
+  "description": "Stateless Cursor OAuth provider for OpenCode with images and OpenCode-owned tool loops.",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
@@ -15,20 +15,25 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/copy-runtime.mjs",
-    "test": "bun test/smoke.ts",
-    "prepublishOnly": "npm run build"
+    "build": "node scripts/clean.mjs && tsc -p tsconfig.json && node scripts/copy-runtime.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "bun test test/*.test.ts",
+    "pack:dry-run": "npm pack --dry-run",
+    "prepublishOnly": "npm run build && npm test"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/otto-assistant/opencode-cursor.git"
+    "url": "git+https://github.com/CasualDeveloper/opencode-cursor-auth.git"
   },
-  "homepage": "https://github.com/otto-assistant/opencode-cursor#readme",
+  "homepage": "https://github.com/CasualDeveloper/opencode-cursor-auth#readme",
   "bugs": {
-    "url": "https://github.com/otto-assistant/opencode-cursor/issues"
+    "url": "https://github.com/CasualDeveloper/opencode-cursor-auth/issues"
   },
   "keywords": [
     "opencode",
@@ -43,11 +48,11 @@
   "publishConfig": {
     "access": "public"
   },
-  "dependencies": {
-    "@bufbuild/protobuf": "^2.0.0",
-    "@opencode-ai/plugin": "^1.15.7"
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.15.7"
   },
   "devDependencies": {
+    "@opencode-ai/plugin": "1.18.3",
     "@types/bun": "^1.3.11",
     "typescript": "^5.9.3"
   }

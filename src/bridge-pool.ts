@@ -1,393 +1,623 @@
-/**
- * Connection pool for persistent H2 bridge processes.
- *
- * Keeps a pool of long-lived Node.js child processes that maintain
- * HTTP/2 connections to Cursor's API, eliminating the ~300-500ms
- * overhead of spawning a new process per request.
- *
- * The pool pre-warms MIN_SIZE workers on startup. Workers are reused
- * across requests: after a stream completes, the worker returns to
- * the idle pool. Dead workers are replaced automatically.
- */
-import { resolve as pathResolve } from "node:path";
+import { Buffer } from "node:buffer";
+import { randomBytes } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
-const PERSISTENT_BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge-persistent.mjs");
+const BRIDGE_PATH = fileURLToPath(
+  new URL("./h2-bridge-persistent.mjs", import.meta.url),
+);
+const MAX_CONFIG_BYTES = 64 * 1024;
+const MAX_BODY_BYTES = 32 * 1024 * 1024;
+const MAX_IPC_PAYLOAD_BYTES = 32 * 1024 * 1024;
+const CLEANUP_ACK_MS = 750;
+const MAX_TIMEOUT_MS = 2_147_483_647 - CLEANUP_ACK_MS;
 
-// --- Typed message protocol constants ---
-const IN_NEW_REQUEST = 0x00;
-const IN_WRITE = 0x01;
-const IN_END_WRITES = 0x02;
-const IN_SHUTDOWN = 0x03;
+const IN_REQUEST_CONFIG = 0x01;
+const IN_REQUEST_BODY = 0x02;
+const IN_CANCEL = 0x03;
+const IN_PAUSE = 0x04;
+const IN_RESUME = 0x05;
+const IN_SHUTDOWN = 0x06;
 
-const OUT_DATA = 0x00;
-const OUT_STREAM_DONE = 0x01;
+const OUT_RESPONSE = 0x11;
+const OUT_DATA = 0x12;
+const OUT_TRAILERS = 0x13;
+const OUT_DONE = 0x14;
+const OUT_ERROR = 0x15;
+const OUT_CANCELLED = 0x16;
+const OUT_TIMEOUT = 0x17;
+const OUT_FATAL = 0x18;
 
-// --- Typed framing helpers ---
+export type BridgeContentType =
+  | "application/connect+proto"
+  | "application/json"
+  | "application/proto";
 
-/** Encode a typed message: [4B len][1B type][payload] */
-function encodeTyped(type: number, payload: Uint8Array): Buffer {
-  const totalLen = 1 + payload.length;
-  const buf = Buffer.alloc(4 + totalLen);
-  buf.writeUInt32BE(totalLen, 0);
-  buf[4] = type;
-  if (payload.length > 0) buf.set(payload, 5);
-  return buf;
+export interface BridgePoolRequest {
+  accessToken: string;
+  path: string;
+  body: Uint8Array;
+  url: string;
+  contentType: BridgeContentType;
+  connectProtocolVersion?: "1";
+  timeoutMs: number;
+  machineId: string;
 }
 
-// --- Worker ---
-
-interface WorkerCallbacks {
-  data: ((chunk: Buffer) => void) | null;
-  streamDone: ((code: number) => void) | null;
+export interface BridgePoolResponse {
+  status: number;
+  headers: Headers;
+  trailers: Promise<Headers>;
+  body: ReadableStream<Uint8Array>;
 }
-
-interface PersistentWorker {
-  proc: ReturnType<typeof Bun.spawn>;
-  state: "idle" | "active" | "dead";
-  cbs: WorkerCallbacks;
-  /** True while the child process is still running. */
-  alive: boolean;
-}
-
-function spawnWorker(): PersistentWorker {
-  const proc = Bun.spawn(["node", PERSISTENT_BRIDGE_PATH], {
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "ignore",
-  });
-
-  const worker: PersistentWorker = {
-    proc,
-    state: "idle",
-    alive: true,
-    cbs: { data: null, streamDone: null },
-  };
-
-  // Read stdout — parse typed messages
-  (async () => {
-    const reader = proc.stdout.getReader();
-    let pending = Buffer.alloc(0);
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        pending = Buffer.concat([pending, Buffer.from(value)]);
-
-        while (pending.length >= 5) {
-          const totalLen = pending.readUInt32BE(0);
-          if (totalLen === 0) {
-            pending = pending.subarray(4);
-            continue;
-          }
-          if (pending.length < 4 + totalLen) break;
-
-          const type = pending[4]!;
-          const payload = pending.subarray(5, 4 + totalLen);
-          pending = pending.subarray(4 + totalLen);
-
-          if (type === OUT_DATA) {
-            worker.cbs.data?.(Buffer.from(payload));
-          } else if (type === OUT_STREAM_DONE) {
-            const success = payload.length > 0 ? payload[0] === 0 : true;
-            const cb = worker.cbs.streamDone;
-            // Clear callbacks before firing — the worker is now idle
-            worker.cbs.data = null;
-            worker.cbs.streamDone = null;
-            cb?.(success ? 0 : 1);
-          }
-          // OUT_ERROR is handled via process exit below
-        }
-      }
-    } catch {
-      // Stream ended
-    }
-
-    await proc.exited;
-    worker.alive = false;
-    worker.state = "dead";
-    // Fire streamDone if we were mid-stream
-    const cb = worker.cbs.streamDone;
-    worker.cbs.data = null;
-    worker.cbs.streamDone = null;
-    cb?.(1);
-  })();
-
-  return worker;
-}
-
-function workerSend(worker: PersistentWorker, type: number, payload: Uint8Array): void {
-  if (!worker.alive) return;
-  try {
-    const stdin = worker.proc.stdin as import("bun").FileSink;
-    stdin.write(encodeTyped(type, payload));
-  } catch {
-    // stdin closed — worker is dying
-  }
-}
-
-function workerSendNewRequest(worker: PersistentWorker, config: object): void {
-  const configBytes = new TextEncoder().encode(JSON.stringify(config));
-  workerSend(worker, IN_NEW_REQUEST, configBytes);
-}
-
-function workerSendWrite(worker: PersistentWorker, data: Uint8Array): void {
-  workerSend(worker, IN_WRITE, data);
-}
-
-function workerSendEndWrites(worker: PersistentWorker): void {
-  workerSend(worker, IN_END_WRITES, new Uint8Array(0));
-}
-
-function workerSendShutdown(worker: PersistentWorker): void {
-  workerSend(worker, IN_SHUTDOWN, new Uint8Array(0));
-}
-
-function workerKill(worker: PersistentWorker): void {
-  worker.state = "dead";
-  worker.alive = false;
-  try {
-    worker.proc.kill();
-  } catch {}
-}
-
-// --- Public handle interface (matches spawnBridge return type) ---
-
-export interface BridgeHandle {
-  write: (data: Uint8Array) => void;
-  end: () => void;
-  kill: () => void;
-  onData: (cb: (chunk: Buffer) => void) => void;
-  onClose: (cb: (code: number) => void) => void;
-  /** True while the bridge stream is still active. */
-  get alive(): boolean;
-}
-
-// --- Bridge Pool ---
 
 export interface BridgePoolOptions {
   minSize?: number;
   maxSize?: number;
 }
 
-export interface BridgeAcquireOptions {
+interface WireRequestConfig {
+  requestId: string;
   accessToken: string;
-  rpcPath: string;
-  url?: string;
-  unary?: boolean;
+  path: string;
+  bodyLength: number;
+  url: string;
+  contentType: BridgeContentType;
+  connectProtocolVersion?: "1";
+  timeoutMs: number;
+  machineId: string;
+}
+
+type WorkerProcess = Bun.Subprocess<"pipe", "pipe", "ignore">;
+
+interface PersistentWorker {
+  proc: WorkerProcess;
+  state: "idle" | "active" | "dead";
+  alive: boolean;
+  active?: PoolJob;
+  writeChain: Promise<void>;
+}
+
+interface PoolJob {
+  request: BridgePoolRequest;
+  deadlineMs: number;
+  requestId: Buffer;
+  requestIdHex: string;
+  state: "queued" | "active" | "terminal";
+  worker?: PersistentWorker;
+  resolveResponse: (response: BridgePoolResponse) => void;
+  rejectResponse: (error: Error) => void;
+  responseSettled: boolean;
+  responseReceived: boolean;
+  body: ReadableStream<Uint8Array>;
+  bodyController: ReadableStreamDefaultController<Uint8Array>;
+  bodyTerminated: boolean;
+  trailers: Promise<Headers>;
+  resolveTrailers: (headers: Headers) => void;
+  rejectTrailers: (error: Error) => void;
+  trailersSettled: boolean;
+  paused: boolean;
+  cancelling: boolean;
+  signal?: AbortSignal;
+  abortHandler?: () => void;
+  cleanupTimer?: ReturnType<typeof setTimeout>;
+  timeoutWatchdog?: ReturnType<typeof setTimeout>;
+}
+
+function namedError(name: "AbortError" | "CursorTransportError" | "TimeoutError", message: string): Error {
+  if (name === "AbortError") return new DOMException(message, name);
+  const error = new Error(message);
+  error.name = name;
+  return error;
+}
+
+function transportError(): Error {
+  return namedError("CursorTransportError", "Cursor HTTP/2 transport failed");
+}
+
+function timeoutError(): Error {
+  return namedError("TimeoutError", "Cursor HTTP/2 request timed out");
+}
+
+function abortError(): Error {
+  return namedError("AbortError", "The operation was aborted");
+}
+
+function encodeTyped(
+  type: number,
+  payload: Uint8Array<ArrayBufferLike> = new Uint8Array(),
+): Buffer {
+  if (payload.byteLength > MAX_IPC_PAYLOAD_BYTES) {
+    throw new RangeError("IPC payload exceeds the 32 MiB limit");
+  }
+  const frame = Buffer.alloc(5 + payload.byteLength);
+  frame.writeUInt32BE(1 + payload.byteLength, 0);
+  frame[4] = type;
+  frame.set(payload, 5);
+  return frame;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseHeaders(value: unknown): Headers {
+  if (!Array.isArray(value)) throw transportError();
+  const headers = new Headers();
+  for (const entry of value) {
+    if (!Array.isArray(entry) || entry.length !== 2) throw transportError();
+    const name: unknown = entry[0];
+    const headerValue: unknown = entry[1];
+    if (typeof name !== "string" || typeof headerValue !== "string" || name.startsWith(":")) {
+      throw transportError();
+    }
+    headers.append(name, headerValue);
+  }
+  return headers;
+}
+
+function parseResponse(payload: Uint8Array): { status: number; headers: Headers } {
+  if (payload.byteLength > MAX_CONFIG_BYTES) throw transportError();
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder().decode(payload));
+  } catch {
+    throw transportError();
+  }
+  if (!isRecord(value) || typeof value.status !== "number" || !Number.isInteger(value.status)) {
+    throw transportError();
+  }
+  const status = value.status;
+  if (status < 100 || status > 599) throw transportError();
+  return { status, headers: parseHeaders(value.headers) };
+}
+
+function parseTrailers(payload: Uint8Array): Headers {
+  if (payload.byteLength > MAX_CONFIG_BYTES) throw transportError();
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder().decode(payload));
+  } catch {
+    throw transportError();
+  }
+  return parseHeaders(value);
+}
+
+function validatePoolSize(name: string, value: number, allowZero: boolean): void {
+  if (!Number.isInteger(value) || value < (allowZero ? 0 : 1)) {
+    throw new RangeError(`${name} must be ${allowZero ? "a non-negative" : "a positive"} integer`);
+  }
 }
 
 export class BridgePool {
-  private idle: PersistentWorker[] = [];
-  private allWorkers = new Set<PersistentWorker>();
   private readonly minSize: number;
   private readonly maxSize: number;
-  private shuttingDown = false;
+  private readonly idle: PersistentWorker[] = [];
+  private readonly workers = new Set<PersistentWorker>();
+  private readonly queue: PoolJob[] = [];
+  private closing = false;
 
   constructor(options: BridgePoolOptions = {}) {
-    this.minSize = options.minSize ?? 2;
+    this.minSize = options.minSize ?? 1;
     this.maxSize = options.maxSize ?? 4;
+    validatePoolSize("minSize", this.minSize, true);
+    validatePoolSize("maxSize", this.maxSize, false);
+    if (this.minSize > this.maxSize) throw new RangeError("minSize cannot exceed maxSize");
   }
 
-  /** Pre-warm the pool with minSize idle workers. */
   warmup(): void {
-    for (let i = 0; i < this.minSize; i++) {
-      this.addWorker();
+    if (this.closing) return;
+    while (this.workers.size < this.minSize) {
+      if (!this.addWorker()) break;
     }
   }
 
-  /** Acquire a bridge handle for a new request. */
-  acquire(options: BridgeAcquireOptions): BridgeHandle {
-    if (this.shuttingDown) {
-      throw new Error("BridgePool is shutting down");
+  request(request: BridgePoolRequest, signal?: AbortSignal): Promise<BridgePoolResponse> {
+    if (this.closing) return Promise.reject(transportError());
+    if (request.body.byteLength > MAX_BODY_BYTES) {
+      return Promise.reject(new RangeError("Request body exceeds the 32 MiB limit"));
     }
+    if (!Number.isInteger(request.timeoutMs) || request.timeoutMs < 1 || request.timeoutMs > MAX_TIMEOUT_MS) {
+      return Promise.reject(new RangeError("Request timeout is outside the supported range"));
+    }
+    if (signal?.aborted) return Promise.reject(abortError());
 
-    let worker = this.idle.pop();
-    if (!worker || !worker.alive) {
-      // Try to find any alive idle worker
-      while (this.idle.length > 0) {
-        worker = this.idle.pop()!;
-        if (worker.alive) break;
-        this.allWorkers.delete(worker);
-        worker = undefined;
+    return new Promise<BridgePoolResponse>((resolve, reject) => {
+      let bodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
+      let job: PoolJob;
+      const trailersState: {
+        resolve?: (headers: Headers) => void;
+        reject?: (error: Error) => void;
+      } = {};
+      const trailers = new Promise<Headers>((resolveTrailers, rejectTrailers) => {
+        trailersState.resolve = resolveTrailers;
+        trailersState.reject = rejectTrailers;
+      });
+      void trailers.catch(() => {});
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          bodyController = controller;
+        },
+        pull: () => this.resumeJob(job),
+        cancel: () => this.cancelJob(job, true),
+      });
+      if (!bodyController || !trailersState.resolve || !trailersState.reject) {
+        reject(transportError());
+        return;
       }
-    }
 
-    if (!worker) {
-      if (this.allWorkers.size < this.maxSize) {
+      const requestId = randomBytes(16);
+      job = {
+        request,
+        deadlineMs: performance.now() + request.timeoutMs,
+        requestId,
+        requestIdHex: requestId.toString("hex"),
+        state: "queued",
+        resolveResponse: resolve,
+        rejectResponse: reject,
+        responseSettled: false,
+        responseReceived: false,
+        body,
+        bodyController,
+        bodyTerminated: false,
+        trailers,
+        resolveTrailers: trailersState.resolve,
+        rejectTrailers: trailersState.reject,
+        trailersSettled: false,
+        paused: false,
+        cancelling: false,
+        signal,
+      };
+      if (signal) {
+        job.abortHandler = () => this.cancelJob(job, false);
+        signal.addEventListener("abort", job.abortHandler, { once: true });
+      }
+      job.timeoutWatchdog = setTimeout(
+        () => this.expireQueuedJob(job),
+        request.timeoutMs,
+      );
+      this.queue.push(job);
+      this.pump();
+    });
+  }
+
+  close(): void {
+    if (this.closing) return;
+    this.closing = true;
+    const error = transportError();
+    for (const job of this.queue.splice(0)) {
+      this.failConsumer(job, error, false);
+      this.finishJob(job);
+    }
+    this.idle.length = 0;
+    for (const worker of this.workers) {
+      if (worker.active) {
+        this.failConsumer(worker.active, error, false);
+        this.finishJob(worker.active);
+      }
+      void this.writeFrames(worker, [encodeTyped(IN_SHUTDOWN)]).catch(() => {});
+      const timer = setTimeout(() => this.killWorker(worker), CLEANUP_ACK_MS);
+      timer.unref?.();
+    }
+  }
+
+  stats(): { idle: number; active: number; queued: number; total: number; maxSize: number } {
+    let active = 0;
+    for (const worker of this.workers) if (worker.state === "active") active += 1;
+    return { idle: this.idle.length, active, queued: this.queue.length, total: this.workers.size, maxSize: this.maxSize };
+  }
+
+  private pump(): void {
+    while (!this.closing && this.queue.length > 0) {
+      let worker = this.idle.pop();
+      while (worker && (!worker.alive || worker.state !== "idle")) worker = this.idle.pop();
+      if (!worker) {
+        if (this.workers.size >= this.maxSize) return;
         worker = this.addWorker();
-      } else {
-        // Pool full — spawn an ephemeral worker not tracked by pool
-        worker = spawnWorker();
-        // Don't add to allWorkers — it won't be returned to pool
+        if (!worker) {
+          const job = this.queue.shift();
+          if (job) {
+            this.failConsumer(job, transportError(), false);
+            this.finishJob(job);
+          }
+          continue;
+        }
+        this.idle.pop();
       }
-    }
 
+      const job = this.queue.shift();
+      if (!job) {
+        this.idle.push(worker);
+        return;
+      }
+      if (job.signal?.aborted) {
+        this.idle.push(worker);
+        this.cancelJob(job, false);
+        continue;
+      }
+      this.startJob(worker, job);
+    }
+  }
+
+  private startJob(worker: PersistentWorker, job: PoolJob): void {
     worker.state = "active";
-    const config = {
-      accessToken: options.accessToken,
-      url: options.url,
-      path: options.rpcPath,
-      unary: options.unary ?? false,
-    };
-    const handle = this.createHandle(worker);
-    workerSendNewRequest(worker, config);
-
-    return handle;
-  }
-
-  /** Shut down the pool, killing all workers. */
-  shutdown(): void {
-    this.shuttingDown = true;
-    for (const worker of this.allWorkers) {
-      workerSendShutdown(worker);
-      // Give 500ms for graceful exit, then force kill
-      setTimeout(() => {
-        if (worker.alive) workerKill(worker);
-      }, 500);
+    worker.active = job;
+    job.state = "active";
+    job.worker = worker;
+    if (job.timeoutWatchdog) {
+      clearTimeout(job.timeoutWatchdog);
+      job.timeoutWatchdog = undefined;
     }
-    this.idle = [];
-    this.allWorkers.clear();
-  }
-
-  /** Current pool stats for telemetry. */
-  stats(): { idle: number; active: number; total: number; maxSize: number } {
-    return {
-      idle: this.idle.length,
-      active: this.allWorkers.size - this.idle.length,
-      total: this.allWorkers.size,
-      maxSize: this.maxSize,
-    };
-  }
-
-  private addWorker(): PersistentWorker {
-    const worker = spawnWorker();
-    this.allWorkers.add(worker);
-    this.idle.push(worker);
-    return worker;
-  }
-
-  private release(worker: PersistentWorker): void {
-    if (this.shuttingDown || !worker.alive) {
-      if (worker.alive) workerKill(worker);
-      this.allWorkers.delete(worker);
+    const remainingMs = Math.ceil(job.deadlineMs - performance.now());
+    if (remainingMs <= 0) {
+      this.failConsumer(job, timeoutError(), false);
+      this.releaseWorker(worker, job);
       return;
     }
 
+    const config: WireRequestConfig = {
+      requestId: job.requestIdHex,
+      accessToken: job.request.accessToken,
+      path: job.request.path,
+      bodyLength: job.request.body.byteLength,
+      url: job.request.url,
+      contentType: job.request.contentType,
+      connectProtocolVersion: job.request.connectProtocolVersion,
+      timeoutMs: remainingMs,
+      machineId: job.request.machineId,
+    };
+    const configBytes = new TextEncoder().encode(JSON.stringify(config));
+    if (configBytes.byteLength > MAX_CONFIG_BYTES) {
+      this.failConsumer(job, new RangeError("Request configuration exceeds the 64 KiB limit"), false);
+      this.releaseWorker(worker, job);
+      return;
+    }
+
+    job.timeoutWatchdog = setTimeout(() => {
+      if (job.state !== "active") return;
+      this.failConsumer(job, timeoutError(), false);
+      this.failWorker(worker);
+    }, remainingMs + CLEANUP_ACK_MS);
+    void this.writeFrames(worker, [
+      encodeTyped(IN_REQUEST_CONFIG, configBytes),
+      encodeTyped(IN_REQUEST_BODY, job.request.body),
+    ]).catch(() => this.failWorker(worker));
+  }
+
+  private addWorker(): PersistentWorker | undefined {
+    let proc: WorkerProcess;
+    try {
+      proc = Bun.spawn({
+        cmd: ["node", BRIDGE_PATH],
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+    } catch {
+      return undefined;
+    }
+    const worker: PersistentWorker = {
+      proc,
+      state: "idle",
+      alive: true,
+      writeChain: Promise.resolve(),
+    };
+    this.workers.add(worker);
+    this.idle.push(worker);
+    void this.readWorker(worker);
+    return worker;
+  }
+
+  private async readWorker(worker: PersistentWorker): Promise<void> {
+    const reader = worker.proc.stdout.getReader();
+    let pending = Buffer.alloc(0);
+    try {
+      while (true) {
+        const result = await reader.read();
+        if (result.done) break;
+        pending = Buffer.concat([pending, Buffer.from(result.value)]);
+        while (pending.byteLength >= 4) {
+          const length = pending.readUInt32BE(0);
+          if (length < 1 || length > MAX_IPC_PAYLOAD_BYTES + 1) throw transportError();
+          if (pending.byteLength < 4 + length) break;
+          const type = pending[4];
+          if (type === undefined) throw transportError();
+          const payload = pending.subarray(5, 4 + length);
+          pending = pending.subarray(4 + length);
+          this.handleWorkerMessage(worker, type, payload);
+        }
+      }
+      if (pending.byteLength !== 0) throw transportError();
+    } catch {
+      this.failWorker(worker);
+    } finally {
+      reader.releaseLock();
+    }
+    await worker.proc.exited.catch(() => -1);
+    this.failWorker(worker);
+  }
+
+  private handleWorkerMessage(worker: PersistentWorker, type: number, payload: Buffer): void {
+    if (type === OUT_FATAL) {
+      this.failWorker(worker);
+      return;
+    }
+    const job = worker.active;
+    if (!job || payload.byteLength < 16 || !payload.subarray(0, 16).equals(job.requestId)) {
+      this.failWorker(worker);
+      return;
+    }
+    const content = payload.subarray(16);
+    try {
+      if (type === OUT_RESPONSE) this.receiveResponse(job, parseResponse(content));
+      else if (type === OUT_DATA) this.receiveData(job, content);
+      else if (type === OUT_TRAILERS) this.receiveTrailers(job, parseTrailers(content));
+      else if (type === OUT_DONE) this.receiveResult(worker, job, undefined);
+      else if (type === OUT_ERROR) this.receiveResult(worker, job, transportError());
+      else if (type === OUT_CANCELLED) this.receiveResult(worker, job, abortError());
+      else if (type === OUT_TIMEOUT) this.receiveResult(worker, job, timeoutError());
+      else this.failWorker(worker);
+    } catch {
+      this.failWorker(worker);
+    }
+  }
+
+  private receiveResponse(job: PoolJob, response: { status: number; headers: Headers }): void {
+    if (job.responseReceived) throw transportError();
+    job.responseReceived = true;
+    if (!job.responseSettled) {
+      job.responseSettled = true;
+      job.resolveResponse({ status: response.status, headers: response.headers, trailers: job.trailers, body: job.body });
+    }
+  }
+
+  private receiveData(job: PoolJob, content: Buffer): void {
+    if (!job.responseReceived) throw transportError();
+    if (job.bodyTerminated) return;
+    job.bodyController.enqueue(new Uint8Array(content));
+    if ((job.bodyController.desiredSize ?? 1) <= 0 && !job.paused) {
+      job.paused = true;
+      this.sendControl(job, IN_PAUSE);
+    }
+  }
+
+  private receiveTrailers(job: PoolJob, headers: Headers): void {
+    if (!job.responseReceived || job.trailersSettled) throw transportError();
+    job.trailersSettled = true;
+    job.resolveTrailers(headers);
+  }
+
+  private receiveResult(worker: PersistentWorker, job: PoolJob, error: Error | undefined): void {
+    if (error) this.failConsumer(job, error, false);
+    else if (!job.responseReceived) this.failConsumer(job, transportError(), false);
+    else {
+      if (!job.bodyTerminated) {
+        job.bodyTerminated = true;
+        job.bodyController.close();
+      }
+      if (!job.trailersSettled) {
+        job.trailersSettled = true;
+        job.resolveTrailers(new Headers());
+      }
+    }
+    this.releaseWorker(worker, job);
+  }
+
+  private cancelJob(job: PoolJob, bodyAlreadyCancelled: boolean): void {
+    if (job.state === "terminal" || job.cancelling) return;
+    job.cancelling = true;
+    const error = abortError();
+    if (job.state === "queued") {
+      const index = this.queue.indexOf(job);
+      if (index >= 0) this.queue.splice(index, 1);
+      this.failConsumer(job, error, bodyAlreadyCancelled);
+      this.finishJob(job);
+      return;
+    }
+    this.failConsumer(job, error, bodyAlreadyCancelled);
+    this.sendControl(job, IN_CANCEL);
+    job.cleanupTimer = setTimeout(() => {
+      if (job.state === "active" && job.worker) this.failWorker(job.worker);
+    }, CLEANUP_ACK_MS);
+  }
+
+  private expireQueuedJob(job: PoolJob): void {
+    if (job.state !== "queued") return;
+    const index = this.queue.indexOf(job);
+    if (index >= 0) this.queue.splice(index, 1);
+    this.failConsumer(job, timeoutError(), false);
+    this.finishJob(job);
+    this.pump();
+  }
+
+  private resumeJob(job: PoolJob): void {
+    if (job.state !== "active" || !job.paused) return;
+    job.paused = false;
+    this.sendControl(job, IN_RESUME);
+  }
+
+  private sendControl(job: PoolJob, type: number): void {
+    const worker = job.worker;
+    if (!worker?.alive || worker.active !== job) return;
+    void this.writeFrames(worker, [encodeTyped(type, job.requestId)]).catch(() => this.failWorker(worker));
+  }
+
+  private failConsumer(job: PoolJob, error: Error, bodyAlreadyCancelled: boolean): void {
+    if (!job.responseSettled) {
+      job.responseSettled = true;
+      job.rejectResponse(error);
+    }
+    if (!job.bodyTerminated) {
+      job.bodyTerminated = true;
+      if (!bodyAlreadyCancelled) job.bodyController.error(error);
+    }
+    if (!job.trailersSettled) {
+      job.trailersSettled = true;
+      job.rejectTrailers(error);
+    }
+  }
+
+  private releaseWorker(worker: PersistentWorker, job: PoolJob): void {
+    if (worker.active !== job) return;
+    this.finishJob(job);
+    worker.active = undefined;
+    if (!worker.alive || this.closing) {
+      this.killWorker(worker);
+      return;
+    }
     worker.state = "idle";
-    worker.cbs.data = null;
-    worker.cbs.streamDone = null;
+    this.idle.push(worker);
+    this.ensureMinimum();
+    this.pump();
+  }
 
-    if (this.allWorkers.has(worker)) {
-      this.idle.push(worker);
+  private finishJob(job: PoolJob): void {
+    job.state = "terminal";
+    if (job.cleanupTimer) clearTimeout(job.cleanupTimer);
+    if (job.timeoutWatchdog) clearTimeout(job.timeoutWatchdog);
+    if (job.signal && job.abortHandler) job.signal.removeEventListener("abort", job.abortHandler);
+  }
+
+  private failWorker(worker: PersistentWorker): void {
+    if (!worker.alive && !this.workers.has(worker)) return;
+    worker.alive = false;
+    worker.state = "dead";
+    const active = worker.active;
+    worker.active = undefined;
+    if (active) {
+      this.failConsumer(active, active.cancelling ? abortError() : transportError(), false);
+      this.finishJob(active);
     }
-
-    // Replenish pool if below minSize
-    this.replenish();
-  }
-
-  private remove(worker: PersistentWorker): void {
-    this.allWorkers.delete(worker);
-    const idx = this.idle.indexOf(worker);
-    if (idx !== -1) this.idle.splice(idx, 1);
-    if (worker.alive) workerKill(worker);
-
-    // Replenish pool
-    if (!this.shuttingDown) this.replenish();
-  }
-
-  private replenish(): void {
-    while (this.idle.length < this.minSize && this.allWorkers.size < this.maxSize) {
-      this.addWorker();
+    const idleIndex = this.idle.indexOf(worker);
+    if (idleIndex >= 0) this.idle.splice(idleIndex, 1);
+    this.workers.delete(worker);
+    this.killWorker(worker);
+    if (!this.closing) {
+      this.ensureMinimum();
+      this.pump();
     }
   }
 
-  private createHandle(worker: PersistentWorker): BridgeHandle {
-    let done = false;
-    /** Exit code recorded when STREAM_DONE/process-death completes before callers attach onClose. */
-    let recordedExitCode = 0;
-    const pool = this;
-    const isPooled = this.allWorkers.has(worker);
-    /** Buffer OUTPUT_DATA until the caller registers onData (stdout can beat ReadableStream wiring). */
-    const pendingData: Buffer[] = [];
-    let userDataCb: ((chunk: Buffer) => void) | null = null;
+  private killWorker(worker: PersistentWorker): void {
+    worker.alive = false;
+    worker.state = "dead";
+    try {
+      worker.proc.kill();
+    } catch {}
+  }
 
-    worker.cbs.data = (chunk: Buffer) => {
-      const copy = Buffer.from(chunk);
-      if (userDataCb) userDataCb(copy);
-      else pendingData.push(copy);
-    };
+  private ensureMinimum(): void {
+    while (!this.closing && this.workers.size < this.minSize) {
+      if (!this.addWorker()) break;
+    }
+  }
 
-    // When stream completes (bridge sends STREAM_DONE), fire onClose and return to pool
-    const originalStreamDoneCb = worker.cbs.streamDone;
-    let closeCb: ((code: number) => void) | null = null;
-
-    worker.cbs.streamDone = (code: number) => {
-      if (done) return;
-      done = true;
-      recordedExitCode = code;
-      originalStreamDoneCb?.(code);
-      const cbNow = closeCb;
-      closeCb = null;
-      cbNow?.(code);
-      if (isPooled) {
-        pool.release(worker);
-      } else {
-        // Ephemeral overflow worker (pool was saturated at acquire time): it is
-        // not tracked by the pool and will never be reused, so shut it down
-        // instead of leaking the child process.
-        workerSendShutdown(worker);
-        workerKill(worker);
-      }
-    };
-
-    // Handle unexpected process death
-    const checkDeath = () => {
-      if (done || worker.alive) return;
-      done = true;
-      recordedExitCode = 1;
-      const cbNow = closeCb;
-      closeCb = null;
-      cbNow?.(1);
-      if (isPooled) {
-        pool.remove(worker);
-      } else {
-        workerKill(worker);
-      }
-    };
-
-    return {
-      get alive() {
-        if (!worker.alive && !done) checkDeath();
-        return !done && worker.alive;
-      },
-      write(data: Uint8Array) {
-        workerSendWrite(worker, data);
-      },
-      end() {
-        workerSendEndWrites(worker);
-      },
-      kill() {
-        if (done) return;
-        done = true;
-        if (isPooled) {
-          pool.remove(worker);
-        } else {
-          workerKill(worker);
-        }
-      },
-      onData(cb: (chunk: Buffer) => void) {
-        const flushed = pendingData.splice(0, pendingData.length);
-        userDataCb = cb;
-        for (const pending of flushed) cb(pending);
-      },
-      onClose(cb: (code: number) => void) {
-        if (done) {
-          queueMicrotask(() => cb(recordedExitCode));
-        } else {
-          closeCb = cb;
-        }
-      },
-    };
+  private writeFrames(worker: PersistentWorker, frames: Buffer[]): Promise<void> {
+    const write = worker.writeChain.then(async () => {
+      if (!worker.alive) throw transportError();
+      for (const frame of frames) await worker.proc.stdin.write(frame);
+      await worker.proc.stdin.flush();
+    });
+    worker.writeChain = write.catch(() => {});
+    return write;
   }
 }

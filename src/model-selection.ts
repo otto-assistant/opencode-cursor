@@ -15,16 +15,21 @@ export interface CursorModelSelection {
   maxMode: boolean;
 }
 
-export function encodeCursorModelSelection(
-  selection: CursorModelSelection,
-): string {
-  return Buffer.from(JSON.stringify(selection), "utf8").toString("base64url");
+export interface CursorModelRequest {
+  modelId: string;
+  variant?: string;
 }
 
-export function decodeCursorModelSelection(
+export function encodeCursorModelRequest(
+  request: CursorModelRequest,
+): string {
+  return Buffer.from(JSON.stringify(request), "utf8").toString("base64url");
+}
+
+export function decodeCursorModelRequest(
   encoded: string | undefined,
-): CursorModelSelection | undefined {
-  if (!encoded || encoded.length > 8_192) return undefined;
+): CursorModelRequest | undefined {
+  if (!encoded || encoded.length > 1_024) return undefined;
   try {
     const value = JSON.parse(
       Buffer.from(encoded, "base64url").toString("utf8"),
@@ -32,42 +37,21 @@ export function decodeCursorModelSelection(
     if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
     const record = value as Record<string, unknown>;
     if (
-      typeof record.publicId !== "string" ||
-      !record.publicId.trim() ||
       typeof record.modelId !== "string" ||
       !record.modelId.trim() ||
-      typeof record.displayName !== "string" ||
-      typeof record.maxMode !== "boolean" ||
-      !Array.isArray(record.parameters) ||
-      record.parameters.length > 32
+      record.modelId.length > 256 ||
+      (record.variant !== undefined &&
+        (typeof record.variant !== "string" ||
+          !record.variant.trim() ||
+          record.variant.length > 128))
     ) {
       return undefined;
     }
-
-    const parameters: CursorModelParameter[] = [];
-    for (const parameter of record.parameters) {
-      if (!parameter || typeof parameter !== "object" || Array.isArray(parameter)) {
-        return undefined;
-      }
-      const item = parameter as Record<string, unknown>;
-      if (
-        typeof item.id !== "string" ||
-        !item.id.trim() ||
-        item.id.length > 128 ||
-        typeof item.value !== "string" ||
-        item.value.length > 256
-      ) {
-        return undefined;
-      }
-      parameters.push({ id: item.id, value: item.value });
-    }
-
     return {
-      publicId: record.publicId,
       modelId: record.modelId,
-      displayName: record.displayName,
-      parameters,
-      maxMode: record.maxMode,
+      ...(typeof record.variant === "string"
+        ? { variant: record.variant }
+        : {}),
     };
   } catch {
     return undefined;

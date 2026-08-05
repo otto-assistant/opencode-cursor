@@ -1,0 +1,79 @@
+{
+  "checkedAt": "2026-08-05",
+  "endpoint": "aiserver.v1.ChatService/StreamUnifiedChatWithTools",
+  "modelDiscovery": {
+    "endpoint": "aiserver.v1.AiService/AvailableModels",
+    "contentEncoding": "gzip",
+    "status": "pass"
+  },
+  "variantEncoding": "Exact public model IDs are sent directly; no separate model-parameter fields are inferred.",
+  "toolRouting": {
+    "responseServerName": "external-tool-name",
+    "responseWireName": "call_mcp_tool",
+    "typedResultReplay": "pass"
+  },
+  "oneMillionContext": {
+    "id": "gpt-5.4-medium",
+    "wireMaxMode": true,
+    "status": "pass",
+    "catalogExposure": "separate-1m-model",
+    "discovery": "returned when excludeMaxNamedModels was either true or false; no non-max 1M routes were returned",
+    "stages": ["text", "png-image", "history-replay", "tool-call", "fresh-id-tool-result-replay"],
+    "note": "Functional canaries passed; the advertised 1M context window was not stress-tested."
+  },
+  "imageFormats": {
+    "passed": ["png", "jpeg", "gif", "webp"],
+    "rejectedByEndpoint": ["heic"]
+  },
+  "models": [
+    {
+      "id": "claude-4.6-sonnet-medium",
+      "family": "claude",
+      "status": "pass",
+      "stages": ["text", "png-image", "history-replay", "tool-call", "fresh-id-tool-result-replay"]
+    },
+    {
+      "id": "gpt-5.4-medium",
+      "family": "gpt",
+      "status": "pass",
+      "stages": ["text", "png-image", "history-replay", "tool-call", "fresh-id-tool-result-replay"]
+    },
+    {
+      "id": "gemini-3.1-pro",
+      "family": "gemini",
+      "status": "pass",
+      "stages": ["text", "png-image", "history-replay", "tool-call", "fresh-id-tool-result-replay"]
+    },
+    {
+      "id": "default",
+      "family": "cursor",
+      "status": "reasoning-only-no-final-text",
+      "recoverableStages": ["text", "history-ack"],
+      "reasoningSuffix": "answer-after-single-closing-think-tag",
+      "imageInput": "description-missing",
+      "toolCalls": "model-native-text-protocol-not-structured"
+    },
+    {
+      "id": "composer-2",
+      "family": "composer",
+      "status": "not-discovered-invalid-argument-retired"
+    },
+    {
+      "id": "composer-2.5",
+      "family": "composer",
+      "status": "reasoning-only-no-final-text",
+      "recoverableStages": ["text", "history-ack"],
+      "reasoningSuffix": "answer-after-single-closing-think-tag",
+      "imageInput": "description-missing",
+      "toolCalls": "model-native-text-protocol-not-structured"
+    },
+    {
+      "id": "cursor-grok-4.5-high",
+      "family": "grok",
+      "status": "partial-no-image-input",
+      "passedStages": ["text", "history-replay", "tool-call", "fresh-id-tool-result-replay"],
+      "failedStages": ["png-image"],
+      "imageAttempts": 3
+    }
+  ]
+}

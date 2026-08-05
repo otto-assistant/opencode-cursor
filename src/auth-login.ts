@@ -5,7 +5,14 @@
  * Starts the same PKCE login as `opencode auth login`, logs the browser URL,
  * polls in the background, and writes tokens to OpenCode's auth.json.
  */
-import { writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -41,6 +48,15 @@ let pollTimer: ReturnType<typeof setTimeout> | null = null;
 let pollResolve: ((value: CursorBrowserLoginResult) => void) | null = null;
 let pollReject: ((reason?: unknown) => void) | null = null;
 let pollInFlight: Promise<CursorBrowserLoginResult> | null = null;
+let startInFlight: Promise<PendingCursorLogin> | null = null;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isMissingFile(error: unknown): boolean {
+  return isRecord(error) && error.code === "ENOENT";
+}
 
 function authJsonPath(): string {
   const xdg = process.env.XDG_DATA_HOME;
@@ -53,14 +69,15 @@ function writeCursorAuth(accessToken: string, refreshToken: string): number {
   mkdirSync(dirname(path), { recursive: true });
 
   let existing: Record<string, unknown> = {};
-  if (existsSync(path)) {
-    try {
-      existing = JSON.parse(readFileSync(path, "utf8")) as Record<
-        string,
-        unknown
-      >;
-    } catch {
-      existing = {};
+  try {
+    const decoded: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!isRecord(decoded)) {
+      throw new Error("OpenCode auth store root must be an object");
+    }
+    existing = decoded;
+  } catch (error) {
+    if (!isMissingFile(error)) {
+      throw new Error("OpenCode auth store could not be read safely");
     }
   }
 
@@ -72,7 +89,18 @@ function writeCursorAuth(accessToken: string, refreshToken: string): number {
     expires,
   };
 
-  writeFileSync(path, JSON.stringify(existing, null, 2) + "\n", "utf8");
+  const temporaryPath = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporaryPath, JSON.stringify(existing, null, 2) + "\n", {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    renameSync(temporaryPath, path);
+    chmodSync(path, 0o600);
+  } finally {
+    rmSync(temporaryPath, { force: true });
+  }
   return expires;
 }
 
@@ -115,17 +143,19 @@ function schedulePoll(delayMs: number): void {
 }
 
 async function runPollTick(): Promise<void> {
-  if (!pending || pending.completed) return;
+  const session = pending;
+  if (!session || session.completed) return;
 
-  if (Date.now() - pending.startedAt > POLL_MAX_MS) {
+  if (Date.now() - session.startedAt > POLL_MAX_MS) {
     const error = new Error("Cursor authentication polling timeout");
     log.error(`[opencode-cursor] Browser login failed: ${error.message}`);
-    failPending(error);
+    if (pending === session) failPending(error);
     return;
   }
 
   try {
-    const tokens = await tryPollCursorAuth(pending.uuid, pending.verifier);
+    const tokens = await tryPollCursorAuth(session.uuid, session.verifier);
+    if (pending !== session || session.completed) return;
     if (!tokens) {
       schedulePoll(POLL_INTERVAL_MS);
       return;
@@ -142,6 +172,7 @@ async function runPollTick(): Promise<void> {
       expires,
     });
   } catch (error) {
+    if (pending !== session || session.completed) return;
     const message = error instanceof Error ? error.message : String(error);
     // Transient network errors: keep trying.
     if (/fetch|network|timeout|ECONN|ENOTFOUND|429|5\d\d/i.test(message)) {
@@ -161,40 +192,50 @@ export async function startCursorBrowserLogin(): Promise<PendingCursorLogin> {
   if (
     pending &&
     !pending.completed &&
+    !pending.error &&
+    pollInFlight &&
     Date.now() - pending.startedAt < POLL_MAX_MS
   ) {
     return pending;
   }
+  if (startInFlight) return startInFlight;
 
-  resetPendingCursorLogin();
+  startInFlight = (async () => {
+    resetPendingCursorLogin();
+    const { verifier, uuid, loginUrl } = await generateCursorAuthParams();
 
-  const { verifier, uuid, loginUrl } = await generateCursorAuthParams();
+    pending = {
+      url: loginUrl,
+      uuid,
+      verifier,
+      startedAt: Date.now(),
+      polling: false,
+      completed: false,
+    };
 
-  pending = {
-    url: loginUrl,
-    uuid,
-    verifier,
-    startedAt: Date.now(),
-    polling: false,
-    completed: false,
-  };
+    pollInFlight = new Promise<CursorBrowserLoginResult>((resolve, reject) => {
+      pollResolve = resolve;
+      pollReject = reject;
+    });
+    // Prevent unhandled rejection when only the config hook starts login.
+    void pollInFlight.catch(() => {});
 
-  pollInFlight = new Promise<CursorBrowserLoginResult>((resolve, reject) => {
-    pollResolve = resolve;
-    pollReject = reject;
-  });
-  // Prevent unhandled rejection when only the config hook starts login.
-  void pollInFlight.catch(() => {});
+    console.log(
+      "\n[opencode-cursor] Open this URL in your browser to authorize Cursor:\n",
+    );
+    console.log(`  ${loginUrl}\n`);
+    console.log("[opencode-cursor] Waiting for authorization…\n");
+    log.info(`[opencode-cursor] Cursor login URL: ${loginUrl}`);
 
-  console.log(
-    "\n[opencode-cursor] Open this URL in your browser to authorize Cursor:\n",
-  );
-  console.log(`  ${loginUrl}\n`);
-  console.log("[opencode-cursor] Waiting for authorization…\n");
-  log.info(`[opencode-cursor] Cursor login URL: ${loginUrl}`);
+    schedulePoll(500);
+    return pending;
+  })();
 
-  schedulePoll(500);
-  return pending;
+  try {
+    return await startInFlight;
+  } finally {
+    startInFlight = null;
+  }
 }
 
 /** Await the in-flight browser login poll (shared with authorize callback). */
