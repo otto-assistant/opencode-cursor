@@ -274,7 +274,7 @@ let activeRequestCount = 0;
 let idleShutdownTimer: ReturnType<typeof setTimeout> | undefined;
 let maintenanceTimer: ReturnType<typeof setInterval> | undefined;
 
-const proxyTelemetry = {
+export const proxyTelemetry = {
   capRejects: 0,
   staleConversationEvictions: 0,
   staleMutexEvictions: 0,
@@ -3002,6 +3002,21 @@ const STALL_RECOVERY_BASE_DELAY_MS = Number(
 const STALL_TIMEOUT_POST_TOOL_MS = Number(
   process.env.OPENCODE_CURSOR_STALL_TIMEOUT_POST_TOOL_MS ?? 180_000,
 );
+/**
+ * Stall budget while the model has produced NO output at all yet (no text, no
+ * reasoning, no tool calls). Reasoning-heavy models (e.g. Cursor's auto-routed
+ * opus-class backends) can legitimately think 60-120s before the first delta.
+ * The standard 45s budget used to fire mid-thinking, discard the model's work
+ * and RE-RUN the whole request — roughly doubling the user-visible latency
+ * (observed: a 75s answer = 45s stall + 30s re-run). Before any output we now
+ * wait this long before declaring a stall. Read dynamically so it can be
+ * tuned at runtime; override with OPENCODE_CURSOR_PRE_OUTPUT_STALL_TIMEOUT_MS.
+ */
+function preOutputStallTimeoutMs(): number {
+  return Number(
+    process.env.OPENCODE_CURSOR_PRE_OUTPUT_STALL_TIMEOUT_MS ?? 180_000,
+  );
+}
 /** Override model for title-gen requests. When set, skips auto-discovery
  *  and uses this model directly. When unset (default), the proxy discovers
  *  a working free model from OpenCode Zen at startup. */
@@ -3641,16 +3656,22 @@ function createBridgeStreamResponse(
             return;
           }
           const noProgressMs = Date.now() - lastProgressAt;
-          // The extended post-tool stall budget exists for the model silently
-          // processing tool results BEFORE any output. Once visible text is
-          // flowing, a stall means a stuck model — switch to the standard short
-          // budget. Otherwise an uncompleted OpenCode step (message streamed
-          // but never finished) can block the whole session for minutes
-          // (post-tool budget 180s x up to 4 attempts ≈ 12 min), freezing the
-          // agent mid-sentence and refusing new prompts until an abort.
-          const effectiveStallTimeoutMs = anyVisibleTextSent
-            ? STALL_TIMEOUT_MS
-            : resolvedStallTimeoutMs;
+          // Adaptive stall budget by generation phase:
+          // - no output at all yet: the model may legitimately think for a
+          //   while (slow reasoning backends) — long pre-output budget so we
+          //   never discard its thinking and re-run the request (that roughly
+          //   doubles user-visible latency: 45s stall + re-run).
+          // - reasoning-only flowing: respect the configured budget (post-tool
+          //   resumes use the longer post-tool budget for silent processing).
+          // - visible text flowing: a stall is a stuck model — use the
+          //   standard short budget so an uncompleted OpenCode step cannot
+          //   block the whole session for minutes (message streamed but never
+          //   finished freezes the agent mid-sentence and refuses new prompts).
+          const effectiveStallTimeoutMs = !anyContentSent
+            ? preOutputStallTimeoutMs()
+            : anyVisibleTextSent
+              ? STALL_TIMEOUT_MS
+              : resolvedStallTimeoutMs;
           // Opt-in only: default STALL_WAIT_NOTICE_MS is 0 so Discord bots are
           // not interrupted by a mid-stream "[Info: ...]" content chunk.
           if (
@@ -3679,15 +3700,16 @@ function createBridgeStreamResponse(
           // merely re-streams the same prefix is not treated as progress.
           stallTextBaseline = visibleTextAccum.length;
           log.warn(
-            `[proxy] stall detected bridgeKey=${bridgeKey} attempt=${attempt} timeoutMs=${effectiveStallTimeoutMs} (postText=${anyVisibleTextSent}) allowForcedRecovery=${allowForcedStallRecovery}`,
+            `[proxy] stall detected bridgeKey=${bridgeKey} attempt=${attempt} timeoutMs=${effectiveStallTimeoutMs} (phase=${!anyContentSent ? "pre-output" : anyVisibleTextSent ? "post-text" : "reasoning"}) allowForcedRecovery=${allowForcedStallRecovery}`,
           );
 
           // Post-text stalls: the model already started answering; re-running it
-          // usually just re-streams the same partial answer. Allow one recovery
-          // (transient Cursor hiccup) then give an honest terminal error instead
-          // of burning the full multi-recovery budget on a stuck model.
+          // usually just re-streams the same partial answer. Allow at most one
+          // recovery (transient Cursor hiccup) then give an honest terminal
+          // error instead of burning the full multi-recovery budget on a stuck
+          // model. Other phases respect the configured MAX_STALL_RECOVERIES.
           const stallRecoveryLimit = anyVisibleTextSent
-            ? 1
+            ? Math.min(1, maxStallRecoveries())
             : maxStallRecoveries();
           const canRecover =
             !!retryCtx &&

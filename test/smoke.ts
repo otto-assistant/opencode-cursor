@@ -3444,6 +3444,48 @@ async function testAdaptivePostTextStallBudget(
   console.log("[test] Adaptive stall budget OK");
 }
 
+async function testPreOutputStallBudgetAllowsSlowThinking(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing pre-output stall budget (slow-thinking model)...");
+  const proxy = await import("../src/proxy");
+  // Standard budget is 1.2s in the test env. A model that silently "thinks"
+  // for ~3s before its first delta must NOT trip the stall watchdog — the
+  // pre-output phase uses a long budget (10s here), otherwise the proxy would
+  // discard the model's thinking and re-run the request, doubling latency
+  // (observed regression: 75s answer = 45s stall + 30s re-run).
+  process.env.OPENCODE_CURSOR_PRE_OUTPUT_STALL_TIMEOUT_MS = "10000";
+  modules.stopProxy();
+  proxy.proxyTelemetry.stallDetections = 0;
+  backend.setRunMode("stall-once-then-close"); // silence ~3s, then close
+  const port = await modules.startProxy(async () => "test-token");
+
+  const res = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "default",
+      messages: [
+        { role: "system", content: "You are opencode." },
+        { role: "user", content: "think slowly then answer" },
+      ],
+    }),
+  });
+  assertEqual(res.status, 200, "Silent-start request must succeed");
+  const body = await res.text();
+  assert(body.includes("data: [DONE]"), "Stream must finish");
+  assert(
+    proxy.proxyTelemetry.stallDetections === 0,
+    `A silent start within the pre-output budget must not stall; got ${proxy.proxyTelemetry.stallDetections} detections`,
+  );
+
+  delete process.env.OPENCODE_CURSOR_PRE_OUTPUT_STALL_TIMEOUT_MS;
+  backend.setRunMode("immediate-close");
+  modules.stopProxy();
+  console.log("[test] Pre-output stall budget OK");
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -3454,6 +3496,9 @@ async function main() {
   process.env.CURSOR_REFRESH_URL = backend.refreshUrl;
   process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS = "1200";
   process.env.OPENCODE_CURSOR_STALL_TICK_MS = "100";
+  // Stall-budget tests rely on the pre-output budget matching the short
+  // standard budget (the pre-output test overrides it explicitly).
+  process.env.OPENCODE_CURSOR_PRE_OUTPUT_STALL_TIMEOUT_MS = "1200";
   // Stall wait notices must stay off by default (Discord interruption).
   delete process.env.OPENCODE_CURSOR_STALL_WAIT_NOTICE_MS;
   // Use a dedicated proxy port so tests never collide with a live OpenCode
@@ -3499,6 +3544,7 @@ async function main() {
     await testUserSteerDetectionTailOnly(modules);
     await testSteerVsResumeThroughProxy(modules, backend);
     await testAdaptivePostTextStallBudget(modules, backend);
+    await testPreOutputStallBudgetAllowsSlowThinking(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exit(0);
   } catch (err) {

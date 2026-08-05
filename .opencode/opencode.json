@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "@otto-assistant/opencode-cursor-oauth@2.0.0"
+    "@otto-assistant/opencode-cursor-oauth@2.1.0"
   ]
 }
