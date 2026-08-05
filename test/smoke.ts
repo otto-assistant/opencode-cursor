@@ -284,6 +284,8 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
                   // ignore
                 }
               }
+              // "tool-call-then-silent-hang": stay completely silent after the
+              // tool result so the post-tool PRE-OUTPUT stall budget is hit.
             }
           } catch {
             // Other Connect frames are not relevant to model-routing assertions.
@@ -348,6 +350,48 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         // Emit an MCP tool call (bash) so the proxy streams tool_calls SSE and
         // parks the bridge; then keep the Run open until the proxy sends the
         // mcpResult (handled in the data listener above).
+        try {
+          const execMsg = create(ExecServerMessageSchema, {
+            id: 1,
+            execId: "exec-1",
+            message: {
+              case: "mcpArgs",
+              value: create(McpArgsSchema, {
+                name: "bash",
+                toolName: "bash",
+                toolCallId: "cursor-call-1",
+                providerIdentifier: "opencode",
+                args: {},
+              }),
+            },
+          });
+          stream.write(
+            frameConnectUnaryMessage(
+              toBinary(
+                AgentServerMessageSchema,
+                create(AgentServerMessageSchema, {
+                  message: { case: "execServerMessage", value: execMsg },
+                }),
+              ),
+            ),
+          );
+        } catch {
+          // ignore
+        }
+        setTimeout(() => {
+          try {
+            stream.end();
+          } catch {
+            // ignore
+          }
+        }, 12_000);
+        return;
+      }
+      if (runMode === "tool-call-then-silent-hang") {
+        // Same as tool-call-then-hang: emit a tool call so the proxy parks the
+        // bridge. On the mcpResult resume the data listener stays silent, so
+        // the post-tool PRE-OUTPUT stall budget must fire. (Recovery spawns a
+        // fresh stream which emits another tool call, letting the test end.)
         try {
           const execMsg = create(ExecServerMessageSchema, {
             id: 1,
@@ -3486,6 +3530,87 @@ async function testPreOutputStallBudgetAllowsSlowThinking(
   console.log("[test] Pre-output stall budget OK");
 }
 
+async function testPostToolPreOutputStallBudget(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing post-tool pre-output stall budget (silent resume)...");
+  const proxy = await import("../src/proxy");
+  // A post-tool resume that produces NOTHING must use the SHORT post-tool
+  // pre-output budget, not the long first-turn pre-output budget: the model
+  // was just active (it called a tool seconds ago), so minutes of total
+  // silence mean a stuck/dropped stream — the checkpoint-rebuild recovery is
+  // verified safe. If the resume wrongly used the long budget, the mock's
+  // 12s auto-close would end the stream with an error and no stall detection.
+  process.env.OPENCODE_CURSOR_POST_TOOL_PRE_OUTPUT_STALL_TIMEOUT_MS = "800";
+  process.env.OPENCODE_CURSOR_PRE_OUTPUT_STALL_TIMEOUT_MS = "600000";
+  modules.stopProxy();
+  proxy.proxyTelemetry.stallDetections = 0;
+  backend.setRunMode("tool-call-then-silent-hang");
+  const port = await modules.startProxy(async () => "test-token");
+
+  const tools = [
+    { type: "function", function: { name: "bash", description: "run shell", parameters: { type: "object", properties: {} } } },
+  ];
+  const base = [
+    { role: "system", content: "You are opencode." },
+    { role: "user", content: "run the command" },
+  ];
+
+  // Request 1: model emits a bash tool call → proxy parks the bridge.
+  const res1 = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "default", tools, messages: base }),
+  });
+  assertEqual(res1.status, 200, "Request 1 must succeed");
+  const body1 = await res1.text();
+  assert(body1.includes('"tool_calls"'), "Request 1 must stream tool_calls");
+  const idMatch = body1.match(/"id":"(call_[0-9a-f]+)"/);
+  assert(idMatch?.[1], "Request 1 must carry a proxy tool call id");
+  const callId = idMatch![1]!;
+
+  // Request 2: tool-result follow-up; the resumed stream stays SILENT. The
+  // post-tool pre-output stall budget must fire and recover (checkpoint
+  // rebuild) — the recovery's fresh stream emits a tool call, ending the test.
+  const res2 = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "default",
+      tools,
+      messages: [
+        ...base,
+        {
+          role: "assistant",
+          content: "Running.",
+          tool_calls: [{ id: callId, type: "function", function: { name: "bash", arguments: "{}" } }],
+        },
+        { role: "tool", content: "ok", tool_call_id: callId },
+      ],
+    }),
+  });
+  assertEqual(res2.status, 200, "Silent-resume request must succeed");
+  const t0 = Date.now();
+  const body2 = await res2.text();
+  const elapsed = Date.now() - t0;
+  assert(body2.includes("data: [DONE]"), "Silent-resume stream must finish with DONE");
+  assert(
+    proxy.proxyTelemetry.stallDetections >= 1,
+    `Silent post-tool resume must trip the stall watchdog; got ${proxy.proxyTelemetry.stallDetections} detections`,
+  );
+  assert(
+    elapsed < 10_000,
+    `Post-tool pre-output stall budget must recover quickly; took ${elapsed}ms`,
+  );
+
+  delete process.env.OPENCODE_CURSOR_POST_TOOL_PRE_OUTPUT_STALL_TIMEOUT_MS;
+  delete process.env.OPENCODE_CURSOR_PRE_OUTPUT_STALL_TIMEOUT_MS;
+  backend.setRunMode("immediate-close");
+  modules.stopProxy();
+  console.log("[test] Post-tool pre-output stall budget OK");
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -3545,6 +3670,7 @@ async function main() {
     await testSteerVsResumeThroughProxy(modules, backend);
     await testAdaptivePostTextStallBudget(modules, backend);
     await testPreOutputStallBudgetAllowsSlowThinking(modules, backend);
+    await testPostToolPreOutputStallBudget(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exit(0);
   } catch (err) {

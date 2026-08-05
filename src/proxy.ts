@@ -74,7 +74,9 @@ import {
   type McpToolDefinition,
 } from "./proto/agent_pb.js";
 import { createHash } from "node:crypto";
-import { resolve as pathResolve } from "node:path";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join as pathJoin, resolve as pathResolve } from "node:path";
 import { Mutex, isAbortError } from "./promise-queue.js";
 import { BridgePool, type BridgeHandle } from "./bridge-pool.js";
 import { log } from "./log.js";
@@ -1018,15 +1020,21 @@ export async function startProxy(
 
   maintenanceTimer = setInterval(runMaintenanceSweep, MAINTENANCE_INTERVAL_MS);
 
-  // Kick off background discovery of Zen free model for title-gen.
-  // First title-gen request will await the result if not yet ready.
-  discoverZenFreeModel().then((model) => {
-    if (model) {
-      log.info(`[proxy] title-gen ready: using ${model}`);
-    } else {
-      log.warn(`[proxy] title-gen: no free model discovered at startup`);
-    }
-  }).catch(() => {});
+  // Hydrate the title-gen model from the disk cache. When the cache is fresh
+  // we skip the background probe entirely — the first title-gen request then
+  // resolves instantly instead of racing a slow Zen probe. Only fall back to
+  // background discovery when there is no usable cached model.
+  if (!hydrateTitleGenModelFromDisk()) {
+    // Kick off background discovery of Zen free model for title-gen.
+    // First title-gen request will await the result if not yet ready.
+    discoverZenFreeModel().then((model) => {
+      if (model) {
+        log.info(`[proxy] title-gen ready: using ${model}`);
+      } else {
+        log.warn(`[proxy] title-gen: no free model discovered at startup`);
+      }
+    }).catch(() => {});
+  }
 
   proxyPort = proxyServer.port;
   clearSharedProxyMonitor();
@@ -2975,6 +2983,18 @@ const PRESSURE_ACTIVE_BRIDGES_THRESHOLD = Math.max(4, Math.floor(MAX_ACTIVE_BRID
 const ADMISSION_MAX_ACTIVE_REQUESTS = 12;
 const ADMISSION_MAX_ACTIVE_BRIDGES = MAX_ACTIVE_BRIDGES;
 const STALL_TIMEOUT_MS = Number(process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS ?? 45_000);
+/**
+ * Debounce window after the LAST tool call before finishing the stream with
+ * finish_reason=tool_calls. Collects tool calls that arrive in one burst while
+ * keeping the agent loop snappy: OpenCode can only start executing tools once
+ * the stream closes, so this is added latency per tool iteration. 500ms was
+ * conservative; models emit a burst of tool calls within a few ms of each
+ * other, so 250ms still collects batches while cutting ~250ms off every
+ * single-tool-call iteration (the common agent case).
+ */
+const TOOL_CALL_DEBOUNCE_MS = Number(
+  process.env.OPENCODE_CURSOR_TOOL_DEBOUNCE_MS ?? 250,
+);
 const STALL_TICK_MS = Number(process.env.OPENCODE_CURSOR_STALL_TICK_MS ?? 1_000);
 /**
  * Optional user-visible "still processing" marker. Default 0 (disabled): emitting
@@ -3017,6 +3037,21 @@ function preOutputStallTimeoutMs(): number {
     process.env.OPENCODE_CURSOR_PRE_OUTPUT_STALL_TIMEOUT_MS ?? 180_000,
   );
 }
+/**
+ * Pre-output stall budget for POST-TOOL resumes specifically. The model was
+ * just active in this conversation (it called a tool seconds earlier), so a
+ * long total silence after a tool result is more likely a stuck/dropped
+ * Cursor stream than legitimate deep thinking — and the recovery restart
+ * (checkpoint + tool results re-attached) is verified safe: it rebuilt a
+ * hung session and completed the task. 180s of silence here made chats look
+ * hung for 3 minutes; 90s halves that while still covering slow processing.
+ * Read dynamically; override with OPENCODE_CURSOR_POST_TOOL_PRE_OUTPUT_STALL_TIMEOUT_MS.
+ */
+function postToolPreOutputStallTimeoutMs(): number {
+  return Number(
+    process.env.OPENCODE_CURSOR_POST_TOOL_PRE_OUTPUT_STALL_TIMEOUT_MS ?? 90_000,
+  );
+}
 /** Override model for title-gen requests. When set, skips auto-discovery
  *  and uses this model directly. When unset (default), the proxy discovers
  *  a working free model from OpenCode Zen at startup. */
@@ -3042,6 +3077,39 @@ const ZEN_FAST_TRACK_MODELS = [
   "nemotron-3-super-free",
   "big-pickle",
 ];
+
+/** Disk cache for the discovered title-gen model. In-memory discovery is lost
+ *  on every process restart (deploys/reboots), forcing a fresh ~2-3s probe on
+ *  the first chat afterwards. Persisting the model id + timestamp skips that
+ *  probe while keeping the same 8h freshness window. */
+const TITLE_GEN_CACHE_PATH = process.env.OPENCODE_CURSOR_TITLE_GEN_CACHE_PATH ??
+  pathJoin(homedir(), ".cache", "opencode-cursor", "title-gen-model.json");
+
+function loadTitleGenModelCache(): { model: string; ts: number } | undefined {
+  try {
+    const raw = readFileSync(TITLE_GEN_CACHE_PATH, "utf8");
+    const data = JSON.parse(raw) as { model?: unknown; ts?: unknown };
+    if (typeof data.model === "string" && data.model && typeof data.ts === "number") {
+      return { model: data.model, ts: data.ts };
+    }
+  } catch {
+    // missing/corrupt cache — treat as empty
+  }
+  return undefined;
+}
+
+function saveTitleGenModelCache(model: string): void {
+  try {
+    mkdirSync(dirname(TITLE_GEN_CACHE_PATH), { recursive: true });
+    writeFileSync(
+      TITLE_GEN_CACHE_PATH,
+      JSON.stringify({ model, ts: Date.now() }),
+      "utf8",
+    );
+  } catch {
+    // cache is best-effort
+  }
+}
 
 /** Probe a single Zen model with a tiny completion request (no auth).
  *  Returns the model ID if it responds with HTTP 200 and non-empty content,
@@ -3106,6 +3174,7 @@ async function discoverZenFreeModel(): Promise<string | undefined> {
   if (fastResult) {
     resolvedTitleGenModel = fastResult;
     lastDiscoveryMs = Date.now();
+    saveTitleGenModelCache(fastResult);
     return fastResult;
   }
 
@@ -3130,6 +3199,7 @@ async function discoverZenFreeModel(): Promise<string | undefined> {
     if (scanResult) {
       resolvedTitleGenModel = scanResult;
       lastDiscoveryMs = Date.now();
+      saveTitleGenModelCache(scanResult);
       return scanResult;
     }
 
@@ -3141,20 +3211,45 @@ async function discoverZenFreeModel(): Promise<string | undefined> {
   }
 }
 
-/** Get the title-gen model to use. Resolves from override, cached discovery,
- *  or triggers a fresh discovery if the cache is stale. */
+/** Restore the title-gen model from the disk cache if it is still fresh.
+ *  Returns the restored model id or undefined. Idempotent — does not re-read
+ *  once `resolvedTitleGenModel` is set. */
+function hydrateTitleGenModelFromDisk(): string | undefined {
+  if (TITLE_GEN_MODEL_OVERRIDE) return TITLE_GEN_MODEL_OVERRIDE;
+  if (resolvedTitleGenModel) return resolvedTitleGenModel;
+  const disk = loadTitleGenModelCache();
+  if (disk && Date.now() - disk.ts < DISCOVERY_TTL_MS) {
+    resolvedTitleGenModel = disk.model;
+    lastDiscoveryMs = disk.ts;
+    log.info(`[proxy] title-gen model restored from disk cache: ${disk.model}`);
+    return resolvedTitleGenModel;
+  }
+  return undefined;
+}
+
+/** Get the title-gen model to use. Resolves from override, cached discovery
+ *  (memory, then disk), or triggers a fresh discovery if the cache is stale. */
 async function resolveTitleGenModel(): Promise<string> {
   // Explicit override always wins
   if (TITLE_GEN_MODEL_OVERRIDE) return TITLE_GEN_MODEL_OVERRIDE;
 
-  // Use cached model if still fresh
-  if (resolvedTitleGenModel && Date.now() - lastDiscoveryMs < DISCOVERY_TTL_MS) {
+  const now = Date.now();
+  // Use in-memory cached model if still fresh
+  if (resolvedTitleGenModel && now - lastDiscoveryMs < DISCOVERY_TTL_MS) {
     return resolvedTitleGenModel;
   }
 
+  // Hydrate from the disk cache so a fresh process skips the ~2-3s probe
+  // (discovery result survives restarts within the same 8h window).
+  const fromDisk = hydrateTitleGenModelFromDisk();
+  if (fromDisk) return fromDisk;
+
   // Discover (or re-discover)
   const discovered = await discoverZenFreeModel();
-  if (discovered) return discovered;
+  if (discovered) {
+    saveTitleGenModelCache(discovered);
+    return discovered;
+  }
 
   // Last resort: fall back to gpt-5-nano (will likely 401 but better than crashing)
   log.warn(`[proxy] title-gen: no free model discovered, falling back to gpt-5-nano`);
@@ -3254,7 +3349,7 @@ function createBridgeStreamResponse(
   /**
    * Snapshot of the in-flight attempt so abort-during-debounce can still park
    * the bridge after tool_calls SSE was already sent. OpenCode often aborts the
-   * HTTP request as soon as it sees tool_calls, before our 500ms debounce fires.
+   * HTTP request as soon as it sees tool_calls, before our debounce fires.
    */
   let parkableToolAttempt:
     | {
@@ -3552,9 +3647,9 @@ function createBridgeStreamResponse(
                       }],
                     }));
 
-                    // Debounce: wait 500ms after the LAST tool call before
-                    // parking the bridge and finishing the stream.  When the
-                    // model emits multiple tool calls in quick succession
+                    // Debounce: wait a short window after the LAST tool call
+                    // before parking the bridge and finishing the stream. When
+                    // the model emits multiple tool calls in quick succession
                     // they are all collected first; when it emits tool calls
                     // then sits in reasoning, the debounce fires and
                     // OpenCode can start executing without waiting forever.
@@ -3574,7 +3669,7 @@ function createBridgeStreamResponse(
                         return;
                       }
                       finishStream("tool_calls");
-                    }, 500);
+                    }, TOOL_CALL_DEBOUNCE_MS);
                   },
                 (checkpointBytes) => {
                   const stored = conversationStates.get(convKey);
@@ -3668,7 +3763,9 @@ function createBridgeStreamResponse(
           //   block the whole session for minutes (message streamed but never
           //   finished freezes the agent mid-sentence and refuses new prompts).
           const effectiveStallTimeoutMs = !anyContentSent
-            ? preOutputStallTimeoutMs()
+            ? allowForcedStallRecovery
+              ? preOutputStallTimeoutMs()
+              : postToolPreOutputStallTimeoutMs()
             : anyVisibleTextSent
               ? STALL_TIMEOUT_MS
               : resolvedStallTimeoutMs;
@@ -3700,7 +3797,7 @@ function createBridgeStreamResponse(
           // merely re-streams the same prefix is not treated as progress.
           stallTextBaseline = visibleTextAccum.length;
           log.warn(
-            `[proxy] stall detected bridgeKey=${bridgeKey} attempt=${attempt} timeoutMs=${effectiveStallTimeoutMs} (phase=${!anyContentSent ? "pre-output" : anyVisibleTextSent ? "post-text" : "reasoning"}) allowForcedRecovery=${allowForcedStallRecovery}`,
+            `[proxy] stall detected bridgeKey=${bridgeKey} attempt=${attempt} timeoutMs=${effectiveStallTimeoutMs} (phase=${!anyContentSent ? (allowForcedStallRecovery ? "pre-output" : "post-tool-pre-output") : anyVisibleTextSent ? "post-text" : "reasoning"}) allowForcedRecovery=${allowForcedStallRecovery}`,
           );
 
           // Post-text stalls: the model already started answering; re-running it

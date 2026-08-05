@@ -121,6 +121,7 @@ let idleTimeout = null;
 
 const STREAM_TIMEOUT_MS = 120_000;
 const IDLE_CONNECTION_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_API_URL = "https://api2.cursor.sh";
 
 function resetStreamTimeout() {
   if (streamTimeout) clearTimeout(streamTimeout);
@@ -207,7 +208,7 @@ function handleStreamComplete(success) {
 
 function openStream(config) {
   const { accessToken, url, path: rpcPath, unary } = config;
-  const apiUrl = url || "https://api2.cursor.sh";
+  const apiUrl = url || DEFAULT_API_URL;
   streamDone = false;
   clearIdleTimeout();
 
@@ -267,6 +268,17 @@ function openStream(config) {
 // --- Main message loop ---
 
 async function main() {
+  // Pre-warm the HTTP/2 connection to Cursor at startup so the first request
+  // does not pay the TLS + H2 handshake latency on the critical path. The
+  // connection itself needs no auth — auth is carried per-stream headers;
+  // if the connect fails (no network yet, server rejects idle conns) the
+  // lazy path inside openStream() simply reconnects on demand.
+  try {
+    getOrCreateClient(DEFAULT_API_URL);
+  } catch {
+    // ignore — lazy reconnect covers this
+  }
+
   while (true) {
     const msg = await readTypedMessage();
     if (!msg) break; // stdin closed
