@@ -6,13 +6,9 @@ const CURSOR_REFRESH_URL =
   process.env.CURSOR_REFRESH_URL ??
   "https://api2.cursor.sh/auth/exchange_user_api_key";
 
-const POLL_MAX_ATTEMPTS = 150;
-const POLL_BASE_DELAY = 1000;
-const POLL_MAX_DELAY = 10_000;
-const POLL_BACKOFF_MULTIPLIER = 1.2;
 /** Per-request network timeout for a single poll attempt. */
 const POLL_REQUEST_TIMEOUT_MS = 30_000;
-/** Network timeout for the token refresh exchange (runs inside provider/auth loading). */
+/** Network timeout for the token refresh exchange. */
 const REFRESH_REQUEST_TIMEOUT_MS = 30_000;
 
 export interface CursorAuthParams {
@@ -28,7 +24,6 @@ export interface CursorCredentials {
   expires: number;
 }
 
-
 export async function generateCursorAuthParams(): Promise<CursorAuthParams> {
   const { verifier, challenge } = await generatePKCE();
   const uuid = crypto.randomUUID();
@@ -42,39 +37,6 @@ export async function generateCursorAuthParams(): Promise<CursorAuthParams> {
 
   const loginUrl = `${CURSOR_LOGIN_URL}?${params.toString()}`;
   return { verifier, challenge, uuid, loginUrl };
-}
-
-export async function pollCursorAuth(
-  uuid: string,
-  verifier: string,
-): Promise<{ accessToken: string; refreshToken: string }> {
-  let delay = POLL_BASE_DELAY;
-  let consecutiveErrors = 0;
-
-  for (let attempt = 0; attempt < POLL_MAX_ATTEMPTS; attempt++) {
-    // OpenChamber calls callback() after the user clicks Complete — often once
-    // browser login already finished. Poll immediately on the first attempt so
-    // the auth link flow does not wait an extra second before succeeding.
-    try {
-      const result = await tryPollCursorAuth(uuid, verifier);
-      if (result) return result;
-
-      consecutiveErrors = 0;
-      delay = Math.min(delay * POLL_BACKOFF_MULTIPLIER, POLL_MAX_DELAY);
-      await Bun.sleep(delay);
-    } catch (err) {
-      consecutiveErrors++;
-      if (consecutiveErrors >= 3) {
-        const detail = err instanceof Error ? err.message : String(err);
-        throw new Error(
-          `Too many consecutive errors during Cursor auth polling: ${detail}`,
-        );
-      }
-      await Bun.sleep(delay);
-    }
-  }
-
-  throw new Error("Cursor authentication polling timeout");
 }
 
 /** Single Cursor auth poll attempt. Returns null while the user has not approved yet (HTTP 404). */
@@ -108,8 +70,6 @@ export async function tryPollCursorAuth(
 /**
  * RefreshTokenInvalidError — Cursor refused the refresh token (4xx).
  * The stored credential is unusable; re-login is required.
- * Thrown so callers can distinguish permanent failures from transient ones
- * (5xx, network errors) and stop retrying / mark the provider unauthenticated.
  */
 export class RefreshTokenInvalidError extends Error {
   readonly status: number;
@@ -145,8 +105,6 @@ export async function refreshCursorToken(
 
   if (!response.ok) {
     const body = await response.text().catch(() => "");
-    // 4xx (except 408/429) = permanent: refresh token is invalid/revoked/expired.
-    // 5xx, 408, 429 = transient: server-side or rate-limit, safe to retry.
     const isPermanent =
       response.status >= 400 &&
       response.status < 500 &&
@@ -165,11 +123,8 @@ export async function refreshCursorToken(
     refreshToken?: string;
   };
 
-  // Cursor's /auth/exchange_user_api_key historically returns an API key
-  // string (not a JWT) for `accessToken`, and sometimes echoes the value
-  // back as `refreshToken`. Persisting that as the new refresh would clobber
-  // the original long-lived OAuth JWT and break every subsequent refresh.
-  // Only adopt `data.refreshToken` when it actually looks like a JWT.
+  // Only adopt `data.refreshToken` when it actually looks like a JWT —
+  // Cursor sometimes echoes a non-JWT API key that would clobber the OAuth refresh.
   const nextRefresh = looksLikeJwt(data.refreshToken)
     ? data.refreshToken
     : refreshToken;
@@ -180,7 +135,6 @@ export async function refreshCursorToken(
     expires: getTokenExpiry(data.accessToken),
   };
 }
-
 
 /**
  * Extract JWT expiry with 5-minute safety margin.

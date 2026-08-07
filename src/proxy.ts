@@ -80,15 +80,10 @@ import { dirname, join as pathJoin, resolve as pathResolve } from "node:path";
 import { Mutex, isAbortError } from "./promise-queue.js";
 import {
   type ChatCompletionRequest,
-  type ContentPart,
   type ExtractedImage,
-  type OpenAIMessage,
-  type OpenAIToolCall,
   type OpenAIToolDef,
-  type ParsedMessages,
   type ToolResultInfo,
   shouldBlockTool,
-  textContent,
 } from "./openai/types.js";
 import { extractImagesFromContent } from "./openai/images.js";
 import { parseMessages } from "./openai/message-parser.js";
@@ -100,24 +95,21 @@ import {
   isPostCompactHistory,
   isSummaryGenerationRequest,
   isTitleGenerationRequest,
-  requestKeyNamespace,
 } from "./openai/request-classifier.js";
 import {
   buildPostToolBridgeLossContinuation,
-  buildPostToolStallContinuation,
   truncateToolResultForCursor,
 } from "./openai/tool-results.js";
 import { sanitizeCheckpointAfterInterrupt } from "./openai/checkpoint.js";
 import { extractWorkspaceRoot } from "./openai/workspace.js";
 import {
-  buildConversationIdentity,
   deriveBridgeKey,
   deriveConversationKey,
   deterministicConversationId,
   selectionIdentity,
 } from "./conversation/identity.js";
 import { BridgePool, type BridgeHandle } from "./bridge-pool.js";
-import { log } from "./log.js";
+import { log } from "./shared/log.js";
 import {
   CURSOR_SELECTION_HEADER,
   decodeCursorModelSelection,
@@ -264,7 +256,6 @@ const convMutexLastUsedMs = new Map<string, number>();
 const systemBlobCache = new Map<string, { blobId: string; bytes: Uint8Array }>();
 
 let activeRequestCount = 0;
-let idleShutdownTimer: ReturnType<typeof setTimeout> | undefined;
 let maintenanceTimer: ReturnType<typeof setInterval> | undefined;
 
 export const proxyTelemetry = {
@@ -294,7 +285,6 @@ function getOrCreateMutex(convKey: string): Mutex {
 
 function deleteActiveBridge(bridgeKey: string): void {
   if (activeBridges.delete(bridgeKey)) {
-    scheduleIdleShutdown();
   }
 }
 
@@ -503,20 +493,6 @@ function runMaintenanceSweep(): void {
       poolInfo,
     );
   }
-}
-
-function clearIdleShutdownTimer(): void {
-  if (!idleShutdownTimer) return;
-  clearTimeout(idleShutdownTimer);
-  idleShutdownTimer = undefined;
-}
-
-function scheduleIdleShutdown(): void {
-  // Idle shutdown disabled — the proxy must stay alive as long as the opencode
-  // process is running.  Previously, after 10 min idle the proxy would stop()
-  // and the port would become invalid, but opencode's provider config still
-  // referenced the dead port → ConnectionRefused on every subsequent request.
-  // The maintenance sweep + admission control are sufficient for resource mgmt.
 }
 
 /** Length-prefix a message: [4-byte BE length][payload] */
@@ -817,7 +793,6 @@ export async function startProxy(
     id: model.id,
     name: model.name,
   }));
-  clearIdleShutdownTimer();
   if (proxyServer && proxyPort) return proxyPort;
 
   // Initialize bridge pool for connection reuse
@@ -835,7 +810,6 @@ export async function startProxy(
     port: CURSOR_PROXY_PORT,
     idleTimeout: 255, // max — Cursor responses can take 30s+
     async fetch(req) {
-      clearIdleShutdownTimer();
       const url = new URL(req.url);
 
       // Fast-path: admission control BEFORE incrementing activeRequestCount.
@@ -935,15 +909,13 @@ export async function startProxy(
             const selectedModel = decodeCursorModelSelection(
               req.headers.get(CURSOR_SELECTION_HEADER) ?? undefined,
             );
-            const rawResponse = handleChatCompletion(
+            const resolvedResponse = await handleChatCompletion(
               body,
               accessToken,
               release,
               selectedModel,
               req.signal,
             );
-            const resolvedResponse =
-              rawResponse instanceof Promise ? await rawResponse : rawResponse;
             // OpenCode/Bun may abort while we were awaiting setup (bridge spawn,
             // etc.) before the stream's abort listener was attached — or after
             // the Response is built but before the body is consumed. Cancel the
@@ -978,7 +950,6 @@ export async function startProxy(
       } finally {
         activeRequestCount = Math.max(0, activeRequestCount - 1);
         runMaintenanceSweep();
-        scheduleIdleShutdown();
       }
     },
     });
@@ -1046,7 +1017,6 @@ export function resolveProxyModelId(
 }
 
 export function stopProxy(): void {
-  clearIdleShutdownTimer();
   clearSharedProxyMonitor();
   resolvedTitleGenModel = undefined;
   lastDiscoveryMs = 0;
@@ -1061,10 +1031,10 @@ export function stopProxy(): void {
   if (proxyServer) {
     proxyServer.stop();
     proxyServer = undefined;
-    proxyPort = undefined;
-    proxyAccessTokenProvider = undefined;
-    proxyModels = [];
   }
+  proxyPort = undefined;
+  proxyAccessTokenProvider = undefined;
+  proxyModels = [];
   // Clean up any lingering bridges
   for (const active of activeBridges.values()) {
     killActiveBridge(active);
@@ -1222,17 +1192,7 @@ function buildEmptyTitleResponse(completionId: string, created: number, modelId:
   });
 }
 
-function handleChatCompletion(
-  body: ChatCompletionRequest,
-  accessToken: string,
-  release: () => void,
-  selectedModel?: CursorModelSelection,
-  abortSignal?: AbortSignal,
-): Response | Promise<Response> {
-  return doHandleChatCompletion(body, accessToken, release, selectedModel, abortSignal);
-}
-
-async function doHandleChatCompletion(
+async function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
   release: () => void,
@@ -1280,8 +1240,16 @@ async function doHandleChatCompletion(
   const isTitleGen = isTitleGenerationRequest(body.messages);
   if (isTitleGen) {
     const titleModelId = await resolveTitleGenModel();
-    log.info(`[proxy] title-gen request model=${modelId} → zen ${titleModelId}`);
     release();
+    if (!titleModelId) {
+      log.warn("[proxy] title-gen: no Zen model available, returning empty title");
+      return buildEmptyTitleResponse(
+        `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`,
+        Math.floor(Date.now() / 1000),
+        modelId,
+      );
+    }
+    log.info(`[proxy] title-gen request model=${modelId} → zen ${titleModelId}`);
     return handleTitleGenViaZen(titleModelId, body);
   }
 
@@ -1327,7 +1295,6 @@ async function doHandleChatCompletion(
         release,
         workspaceRoot,
         abortSignal,
-        body.messages,
       );
     }
 
@@ -2466,14 +2433,27 @@ async function probeZenModel(modelId: string): Promise<string | undefined> {
   }
 }
 
-/** Probe a list of model IDs concurrently. Returns the first model ID that
- *  responds successfully, or undefined if all fail. */
-async function raceProbeModels(modelIds: string[]): Promise<string | undefined> {
+/** Probe model IDs concurrently; return the first success (true race). */
+async function firstSuccessfulProbe(
+  modelIds: string[],
+): Promise<string | undefined> {
   if (modelIds.length === 0) return undefined;
-  const results = await Promise.all(
-    modelIds.map((id) => probeZenModel(id)),
-  );
-  return results.find((r) => r !== undefined);
+  return new Promise((resolve) => {
+    let pending = modelIds.length;
+    let settled = false;
+    for (const id of modelIds) {
+      void probeZenModel(id).then((result) => {
+        if (settled) return;
+        if (result) {
+          settled = true;
+          resolve(result);
+          return;
+        }
+        pending -= 1;
+        if (pending === 0) resolve(undefined);
+      });
+    }
+  });
 }
 
 /** Discover a working free model from Zen by probing all available models
@@ -2487,14 +2467,14 @@ async function raceProbeModels(modelIds: string[]): Promise<string | undefined> 
  *  Returns undefined if nothing works. */
 async function discoverZenFreeModel(): Promise<string | undefined> {
   const now = Date.now();
-  if (now - lastDiscoveryAttemptMs < DISCOVERY_COOLDOWN_MS && resolvedTitleGenModel) {
+  if (now - lastDiscoveryAttemptMs < DISCOVERY_COOLDOWN_MS) {
     return resolvedTitleGenModel;
   }
   lastDiscoveryAttemptMs = now;
 
   // Phase 1: Fast-track — probe known good models
   log.info(`[proxy] title-gen discovery: fast-track probing ${ZEN_FAST_TRACK_MODELS.join(", ")}`);
-  const fastResult = await raceProbeModels(ZEN_FAST_TRACK_MODELS);
+  const fastResult = await firstSuccessfulProbe(ZEN_FAST_TRACK_MODELS);
   if (fastResult) {
     resolvedTitleGenModel = fastResult;
     lastDiscoveryMs = Date.now();
@@ -2519,7 +2499,7 @@ async function discoverZenFreeModel(): Promise<string | undefined> {
     const remaining = allModels.filter((id) => !ZEN_FAST_TRACK_MODELS.includes(id));
     log.info(`[proxy] title-gen discovery: probing ${remaining.length} remaining models (parallel)`);
 
-    const scanResult = await raceProbeModels(remaining);
+    const scanResult = await firstSuccessfulProbe(remaining);
     if (scanResult) {
       resolvedTitleGenModel = scanResult;
       lastDiscoveryMs = Date.now();
@@ -2553,31 +2533,25 @@ function hydrateTitleGenModelFromDisk(): string | undefined {
 
 /** Get the title-gen model to use. Resolves from override, cached discovery
  *  (memory, then disk), or triggers a fresh discovery if the cache is stale. */
-async function resolveTitleGenModel(): Promise<string> {
-  // Explicit override always wins
+async function resolveTitleGenModel(): Promise<string | undefined> {
   if (TITLE_GEN_MODEL_OVERRIDE) return TITLE_GEN_MODEL_OVERRIDE;
 
   const now = Date.now();
-  // Use in-memory cached model if still fresh
   if (resolvedTitleGenModel && now - lastDiscoveryMs < DISCOVERY_TTL_MS) {
     return resolvedTitleGenModel;
   }
 
-  // Hydrate from the disk cache so a fresh process skips the ~2-3s probe
-  // (discovery result survives restarts within the same 8h window).
   const fromDisk = hydrateTitleGenModelFromDisk();
   if (fromDisk) return fromDisk;
 
-  // Discover (or re-discover)
   const discovered = await discoverZenFreeModel();
   if (discovered) {
     saveTitleGenModelCache(discovered);
     return discovered;
   }
 
-  // Last resort: fall back to gpt-5-nano (will likely 401 but better than crashing)
-  log.warn(`[proxy] title-gen: no free model discovered, falling back to gpt-5-nano`);
-  return "gpt-5-nano";
+  log.warn("[proxy] title-gen: no free model discovered");
+  return undefined;
 }
 
 /** Create an SSE streaming Response that reads from a live bridge.
@@ -2831,10 +2805,6 @@ function createBridgeStreamResponse(
           fallbackPromptTokens: conversationStates.get(convKey)?.lastPromptTokens ?? 0,
         };
         const tagFilter = createThinkingTagFilter();
-        // Title-gen requests use convKey starting with "title:".
-        // Suppress error-as-content for these to prevent error messages
-        // from becoming Discord thread titles.
-        const isTitleGenStream = convKey.startsWith("title:");
         let mcpExecReceived = false;
         let anyContentSent = false;
         /** Visible assistant text (not thinking/reasoning). Thinking-only
@@ -2845,7 +2815,6 @@ function createBridgeStreamResponse(
         let connectError = false;
         let emptyCloseRetry = false;
         let watchdogHandled = false;
-        let attemptSuperseded = false;
         let lastProgressAt = Date.now();
         const markProgress = () => {
           lastProgressAt = Date.now();
@@ -2986,9 +2955,7 @@ function createBridgeStreamResponse(
                       toolCallDebounceTimer = undefined;
                       if (closed) return;
                       if (!parkBridgeForToolCalls("debounce")) {
-                        if (!isTitleGenStream) {
-                          sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
-                        }
+                        sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
                         finishStream("stop");
                         return;
                       }
@@ -3053,16 +3020,11 @@ function createBridgeStreamResponse(
               }
 
               anyContentSent = true;
-              // For title-gen requests, suppress error-as-content to prevent
-              // error messages (e.g. "Connect error resource_exhausted") from
-              // becoming the Discord thread title. An empty response is better.
-              if (!isTitleGenStream) {
-                // Map known gRPC codes to user-friendly messages.
-                const displayMsg = isRateLimit
-                  ? `Cursor responded with "resource exhausted" after ${attempt + 1} attempt(s). This may be a temporary server overload or a rate limit. If the model usually works for you, please retry; if the error persists, try switching to a different model.`
-                  : formatConnectErrorForUser(endError.message, modelId);
-                sendSSE(makeChunk({ content: `\n[Error: ${displayMsg}]` }));
-              }
+              // Map known gRPC codes to user-friendly messages.
+              const displayMsg = isRateLimit
+                ? `Cursor responded with "resource exhausted" after ${attempt + 1} attempt(s). This may be a temporary server overload or a rate limit. If the model usually works for you, please retry; if the error persists, try switching to a different model.`
+                : formatConnectErrorForUser(endError.message, modelId);
+              sendSSE(makeChunk({ content: `\n[Error: ${displayMsg}]` }));
             }
           },
         );
@@ -3098,7 +3060,6 @@ function createBridgeStreamResponse(
           if (
             STALL_WAIT_NOTICE_MS > 0 &&
             !stallWaitUserNoticeEmittedThisResponse &&
-            !isTitleGenStream &&
             noProgressMs >= STALL_WAIT_NOTICE_MS &&
             noProgressMs < effectiveStallTimeoutMs
           ) {
@@ -3172,7 +3133,7 @@ function createBridgeStreamResponse(
               // Run from the latest checkpoint and re-attach tool results as a
               // continuation user message. Restarting the original requestBytes
               // would drop mcpResults already written to the dead bridge.
-              const continuation = buildPostToolStallContinuation(postedToolResults);
+              const continuation = buildPostToolBridgeLossContinuation(postedToolResults);
               const freshPayload = buildCursorRequest(
                 retryCtx.selection,
                 retryCtx.systemPrompt,
@@ -3206,11 +3167,9 @@ function createBridgeStreamResponse(
           // Honest terminal error — do NOT claim "retrying" when we are not.
           // OpenCode will not auto-retry a finished stop stream; a fake
           // "retrying..." message left agents hung until the user nudged them.
-          if (!isTitleGenStream) {
-            sendSSE(makeChunk({
-              content: "\n[Error: stream stalled; automatic recovery exhausted. Please resend your message.]",
-            }));
-          }
+          sendSSE(makeChunk({
+            content: "\n[Error: stream stalled; automatic recovery exhausted. Please resend your message.]",
+          }));
           finishStream("stop");
           deleteActiveBridge(bridgeKey);
           clearInterval(attemptHeartbeat);
@@ -3220,9 +3179,6 @@ function createBridgeStreamResponse(
         attemptBridge.onClose((code) => {
           clearInterval(stallTimer);
           clearInterval(attemptHeartbeat);
-          if (attemptSuperseded) {
-            return;
-          }
           if (watchdogHandled) {
             return;
           }
@@ -3265,9 +3221,6 @@ function createBridgeStreamResponse(
           // The setTimeout is scoped inside the ReadableStream — if the client
           // aborts (otto abort), the stream closes and safeRelease fires,
           // so no further retries will execute.
-          // Note: !retryCtx?.fallbackAttempted removed intentionally — the
-          // fallback model may also hit resource_exhausted, and we still want
-          // connect-error retries (with backoff) before surfacing the error.
           if (connectError && !anyContentSent && attempt < maxConnectRetries && liveAccessToken && liveRequestBytes) {
             deleteActiveBridge(bridgeKey);
             attemptBridge.kill();
@@ -3367,8 +3320,7 @@ function createBridgeStreamResponse(
           if (!mcpExecReceived) {
             // If no visible content was ever sent, surface an explicit error instead of
             // a silent empty completion that looks like "instant empty reply" in Discord.
-            // Suppress for title-gen to avoid polluting Discord thread names.
-            if (!anyVisibleTextSent && !isTitleGenStream) {
+            if (!anyVisibleTextSent) {
               log.warn(`[proxy] All retries exhausted; sending empty-stream error (bridgeKey=${bridgeKey})`);
               sendSSE(makeChunk({ content: "\n[Error: Cursor returned empty response. Try sending your message again.]" }));
             }
@@ -3393,9 +3345,7 @@ function createBridgeStreamResponse(
                 pendingExecs: state.pendingExecs,
               };
               if (!parkBridgeForToolCalls("bridge-close")) {
-                if (!isTitleGenStream) {
-                  sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
-                }
+                sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
                 finishStream("stop");
                 clearInterval(attemptHeartbeat);
                 attemptBridge.kill();
@@ -3407,9 +3357,7 @@ function createBridgeStreamResponse(
               if (currentAttemptIsActive) {
                 deleteActiveBridge(bridgeKey);
               }
-              if (!isTitleGenStream) {
-                sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
-              }
+              sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
               finishStream("stop");
               clearInterval(attemptHeartbeat);
               attemptBridge.kill();
@@ -3488,7 +3436,6 @@ function handleToolResultResume(
   release: () => void,
   workspaceRoot?: string,
   abortSignal?: AbortSignal,
-  messages: OpenAIMessage[] = [],
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
   active.lastAccessMs = Date.now();
@@ -3776,7 +3723,17 @@ async function collectFullResponse(
             const { content } = tagFilter.process(text);
             fullText += content;
           },
-          () => {},
+          (exec) => {
+            // Non-streaming cannot park a tool bridge — fail closed instead of hanging.
+            clearInterval(heartbeatTimer);
+            bridge.kill();
+            resolve({
+              text:
+                fullText +
+                `\n[Error: tool call "${exec.toolName}" requires streaming mode]`,
+              usage: computeUsage(state),
+            });
+          },
           (checkpointBytes) => {
             const stored = conversationStates.get(convKey);
             if (stored) {

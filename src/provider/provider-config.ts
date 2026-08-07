@@ -70,11 +70,11 @@ export function ensureCursorProviderConfig(
   };
 }
 
-export function isLoginPlaceholderCatalog(models: CursorModel[]): boolean {
+function isLoginPlaceholderCatalog(models: CursorModel[]): boolean {
   return models.length === 1 && isLoginPlaceholderModel(models[0]);
 }
 
-export function extractLoginUrlFromPlaceholder(
+function extractLoginUrlFromPlaceholder(
   name: string | undefined,
 ): string | undefined {
   if (!name) return undefined;

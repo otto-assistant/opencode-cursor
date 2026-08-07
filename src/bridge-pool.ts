@@ -43,7 +43,6 @@ interface WorkerCallbacks {
 
 interface PersistentWorker {
   proc: ReturnType<typeof Bun.spawn>;
-  state: "idle" | "active" | "dead";
   cbs: WorkerCallbacks;
   /** True while the child process is still running. */
   alive: boolean;
@@ -58,7 +57,6 @@ function spawnWorker(): PersistentWorker {
 
   const worker: PersistentWorker = {
     proc,
-    state: "idle",
     alive: true,
     cbs: { data: null, streamDone: null },
   };
@@ -105,7 +103,6 @@ function spawnWorker(): PersistentWorker {
 
     await proc.exited;
     worker.alive = false;
-    worker.state = "dead";
     // Fire streamDone if we were mid-stream
     const cb = worker.cbs.streamDone;
     worker.cbs.data = null;
@@ -144,7 +141,6 @@ function workerSendShutdown(worker: PersistentWorker): void {
 }
 
 function workerKill(worker: PersistentWorker): void {
-  worker.state = "dead";
   worker.alive = false;
   try {
     worker.proc.kill();
@@ -223,7 +219,6 @@ export class BridgePool {
       }
     }
 
-    worker.state = "active";
     const config = {
       accessToken: options.accessToken,
       url: options.url,
@@ -274,7 +269,6 @@ export class BridgePool {
       return;
     }
 
-    worker.state = "idle";
     worker.cbs.data = null;
     worker.cbs.streamDone = null;
 
@@ -319,14 +313,12 @@ export class BridgePool {
     };
 
     // When stream completes (bridge sends STREAM_DONE), fire onClose and return to pool
-    const originalStreamDoneCb = worker.cbs.streamDone;
     let closeCb: ((code: number) => void) | null = null;
 
     worker.cbs.streamDone = (code: number) => {
       if (done) return;
       done = true;
       recordedExitCode = code;
-      originalStreamDoneCb?.(code);
       const cbNow = closeCb;
       closeCb = null;
       cbNow?.(code);

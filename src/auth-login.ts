@@ -10,11 +10,9 @@ import {
   getTokenExpiry,
   tryPollCursorAuth,
 } from "./auth.js";
-import {
-  writeStoredCursorAuth,
-} from "./auth/opencode-auth-store.js";
+import { writeStoredCursorAuth } from "./auth/opencode-auth-store.js";
 import { clearModelCache } from "./models.js";
-import { log } from "./log.js";
+import { log } from "./shared/log.js";
 
 export type PendingCursorLogin = {
   url: string;
@@ -22,9 +20,7 @@ export type PendingCursorLogin = {
   /** PKCE verifier — needed if the official OAuth callback shares this session. */
   verifier: string;
   startedAt: number;
-  polling: boolean;
   completed: boolean;
-  error?: string;
 };
 
 export type CursorBrowserLoginResult = {
@@ -62,10 +58,6 @@ function clearPollTimer(): void {
 
 function failPending(error: Error): void {
   clearPollTimer();
-  if (pending) {
-    pending.error = error.message;
-    pending.polling = false;
-  }
   pollReject?.(error);
   pollResolve = null;
   pollReject = null;
@@ -75,7 +67,6 @@ function completePending(result: CursorBrowserLoginResult): void {
   clearPollTimer();
   if (pending) {
     pending.completed = true;
-    pending.polling = false;
   }
   pollResolve?.(result);
   pollResolve = null;
@@ -85,7 +76,6 @@ function completePending(result: CursorBrowserLoginResult): void {
 function schedulePoll(delayMs: number): void {
   clearPollTimer();
   if (!pending || pending.completed) return;
-  pending.polling = true;
   pollTimer = setTimeout(() => {
     void runPollTick();
   }, delayMs);
@@ -120,7 +110,6 @@ async function runPollTick(): Promise<void> {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    // Transient network errors: keep trying.
     if (/fetch|network|timeout|ECONN|ENOTFOUND|429|5\d\d/i.test(message)) {
       schedulePoll(POLL_INTERVAL_MS + 1000);
       return;
@@ -152,7 +141,6 @@ export async function startCursorBrowserLogin(): Promise<PendingCursorLogin> {
     uuid,
     verifier,
     startedAt: Date.now(),
-    polling: false,
     completed: false,
   };
 
@@ -160,7 +148,6 @@ export async function startCursorBrowserLogin(): Promise<PendingCursorLogin> {
     pollResolve = resolve;
     pollReject = reject;
   });
-  // Prevent unhandled rejection when only the config hook starts login.
   void pollInFlight.catch(() => {});
 
   console.log(

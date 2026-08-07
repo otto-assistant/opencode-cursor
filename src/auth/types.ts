@@ -1,5 +1,3 @@
-import { CURSOR_PROVIDER_ID } from "../shared/constants.js";
-
 /** Canonical Cursor OAuth credential shape stored in OpenCode auth.json. */
 export type CursorOAuthCredential = {
   type: "oauth";

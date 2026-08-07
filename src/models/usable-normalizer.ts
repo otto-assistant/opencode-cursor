@@ -114,7 +114,7 @@ interface VariantCandidate {
   key: string;
 }
 
-export function groupCursorModelVariants(models: CursorModel[]): CursorModel[] {
+function groupCursorModelVariants(models: CursorModel[]): CursorModel[] {
   const byId = new Map(models.map((model) => [model.id, model]));
   const groups = new Map<string, VariantCandidate[]>();
 

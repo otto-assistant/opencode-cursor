@@ -5,7 +5,6 @@ import {
   GetUsableModelsResponseSchema,
 } from "../proto/agent_pb.js";
 import { normalizeAvailableModels } from "./available-normalizer.js";
-import { FALLBACK_MODELS } from "./fallback-catalog.js";
 import type { CursorModel } from "./types.js";
 import { normalizeCursorModels } from "./usable-normalizer.js";
 
@@ -13,8 +12,7 @@ const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
 const AVAILABLE_MODELS_PATH = "/aiserver.v1.AiService/AvailableModels";
 
 // Cursor's AvailableModels omits some catalog entries unless they are named
-// explicitly. Grok models (including Grok 4.5 / grok-4-5) are user-added
-// named models and never appear with an empty additionalModelNames list.
+// explicitly. Grok models are user-added and never appear with an empty list.
 const ADDITIONAL_MODEL_NAMES = [
   "grok-4-5",
   "grok-4.20",
@@ -92,32 +90,20 @@ async function fetchCursorUsableModels(
 
 let cachedModels: CursorModel[] | null = null;
 
-export type GetCursorModelsOptions = {
-  /**
-   * When false, return an empty list instead of the hardcoded FALLBACK_MODELS
-   * catalog. Use this for provider/config UI seeding so OpenChamber never shows
-   * the bundled ~14 models as if they were the live Cursor catalog (~50).
-   */
-  allowFallback?: boolean;
-};
-
-export async function getCursorModels(
-  apiKey: string,
-  options?: GetCursorModelsOptions,
-): Promise<CursorModel[]> {
+/**
+ * Discover the live Cursor model catalog for this account.
+ * Returns [] on failure — never invents a hardcoded catalog.
+ */
+export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
   if (cachedModels) return cachedModels;
   const discovered =
     (await fetchCursorAvailableModels(apiKey)) ??
     (await fetchCursorUsableModels(apiKey));
-  // Only cache a successful discovery. Caching FALLBACK_MODELS would pin the
-  // whole process to the bundled list after a single transient failure; instead
-  // return the fallback for this call and let the next call retry discovery.
   if (discovered && discovered.length > 0) {
     cachedModels = discovered;
     return cachedModels;
   }
-  if (options?.allowFallback === false) return [];
-  return FALLBACK_MODELS;
+  return [];
 }
 
 async function filterAgentRunnableModels(
@@ -142,7 +128,7 @@ async function filterAgentRunnableModels(
   );
 }
 
-/** @internal Test-only. */
+/** Invalidate the in-memory catalog (after login or account change). */
 export function clearModelCache(): void {
   cachedModels = null;
 }
@@ -178,10 +164,8 @@ function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
     const frameEnd = offset + 5 + messageLength;
     if (frameEnd > payload.length) return null;
 
-    // Compression flag
     if ((flags & 0b0000_0001) !== 0) return null;
 
-    // End-of-stream flag — skip trailer frames
     if ((flags & 0b0000_0010) === 0) {
       return payload.subarray(offset + 5, frameEnd);
     }

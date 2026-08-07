@@ -10,7 +10,7 @@ import {
 } from "../shared/constants.js";
 import { estimateModelCost } from "./pricing.js";
 
-export function selectDefaultCursorModel(
+function selectDefaultCursorModel(
   models: CursorModel[],
 ): CursorModel | undefined {
   return (
@@ -22,7 +22,7 @@ export function selectDefaultCursorModel(
   );
 }
 
-export function buildRuntimeVariants(
+function buildRuntimeVariants(
   model: CursorModel,
 ): Record<string, Record<string, string>> {
   return Object.fromEntries(
@@ -33,7 +33,7 @@ export function buildRuntimeVariants(
   );
 }
 
-export function buildConfigVariants(
+function buildConfigVariants(
   model: CursorModel,
 ): Record<string, Record<string, string | boolean>> {
   const variants: Record<string, Record<string, string | boolean>> =
@@ -44,7 +44,7 @@ export function buildConfigVariants(
   return variants;
 }
 
-export function buildProviderModel(
+function buildProviderModel(
   model: CursorModel,
   id: string,
   port: number,

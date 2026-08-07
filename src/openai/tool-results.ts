@@ -5,11 +5,6 @@ export interface ToolResultContent {
   content: string;
 }
 
-/**
- * Max chars of a single mcpResult payload sent back to Cursor.
- * Huge shell/build logs can stall or kill the H2 bridge mid-resume.
- * Override with OPENCODE_CURSOR_MCP_RESULT_MAX_CHARS.
- */
 const MCP_RESULT_MAX_CHARS = Number(
   process.env.OPENCODE_CURSOR_MCP_RESULT_MAX_CHARS ?? 24_000,
 );
@@ -38,35 +33,9 @@ export function truncateToolResultForCursor(content: string): string {
   return `${head}\n\n…[truncated ${omitted} chars of tool output for Cursor bridge stability]…\n\n${tail}`;
 }
 
-/** Append tool-result payloads to an internal recovery continuation prompt. */
-function appendToolResultsToContinuation(
-  parts: string[],
-  toolResults?: ToolResultContent[],
-): void {
-  if (!toolResults || toolResults.length === 0) return;
-  for (const result of toolResults) {
-    const content = result.content.trim() || "(no output)";
-    parts.push(truncateToolResultForCursor(content));
-  }
-}
-
 /**
- * Continuation when a post-tool stream stalls and we rebuild a fresh Run from
- * the stored checkpoint (mcpResults cannot be replayed).
- */
-export function buildPostToolStallContinuation(
-  toolResults?: ToolResultContent[],
-): string {
-  const parts: string[] = [
-    "Continue from the current conversation checkpoint.",
-  ];
-  appendToolResultsToContinuation(parts, toolResults);
-  return parts.join("\n");
-}
-
-/**
- * Continuation when the parked tool bridge died/expired before OpenCode returned
- * results. Always lead with an explicit continue cue.
+ * Continuation when a parked tool bridge is lost or a post-tool stream stalls
+ * and must rebuild from checkpoint. Always lead with an explicit continue cue.
  */
 export function buildPostToolBridgeLossContinuation(
   toolResults?: ToolResultContent[],
@@ -74,6 +43,11 @@ export function buildPostToolBridgeLossContinuation(
   const parts: string[] = [
     "Continue from the current conversation checkpoint.",
   ];
-  appendToolResultsToContinuation(parts, toolResults);
+  if (toolResults && toolResults.length > 0) {
+    for (const result of toolResults) {
+      const content = result.content.trim() || "(no output)";
+      parts.push(truncateToolResultForCursor(content));
+    }
+  }
   return parts.join("\n");
 }

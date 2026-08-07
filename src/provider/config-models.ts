@@ -21,11 +21,11 @@ import { withTimeout } from "../shared/timeout.js";
  * When logged out — or when a stored token cannot discover models — seeds a
  * single login placeholder. OpenCode drops providers with zero models from
  * `provider.list()`, which would hide Cursor in OpenChamber. We intentionally
- * never seed the hardcoded FALLBACK_MODELS catalog into the provider UI.
+ * never invent a fake offline catalog for the provider UI.
  *
  * Never throws.
  */
-export async function resolveLoggedOutPlaceholder(): Promise<CursorModel[]> {
+async function resolveLoggedOutPlaceholder(): Promise<CursorModel[]> {
   // OpenChamber's provider detail page often skips plugin OAuth methods and
   // shows a misleading API-key field. Start the same browser OAuth as
   // `opencode auth login` and embed the URL in the placeholder model name.
@@ -67,7 +67,7 @@ export async function resolveConfigModels(): Promise<CursorModel[]> {
     }
     try {
       discovered = await withTimeout(
-        getCursorModels(accessToken, { allowFallback: false }),
+        getCursorModels(accessToken),
         15_000,
       );
     } catch (err) {

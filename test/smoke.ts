@@ -1123,11 +1123,10 @@ async function testConfigHookSeedsProvider(
   assert("my-model" in c2.models, "Expected user model to be preserved");
   assert(
     !("composer-1" in c2.models),
-    "Expected fallback models not to be merged when logged out",
+    "Expected offline placeholder only when logged out",
   );
 
-  // Logged in with empty discovery: never advertise the hardcoded FALLBACK
-  // catalog (~14 models) in the provider UI — keep the login placeholder.
+  // Logged in with empty discovery: seed login placeholder, never a fake catalog.
   await mkdir(join(loggedInDir, "opencode"), { recursive: true });
   await writeFile(
     join(loggedInDir, "opencode", "auth.json"),
@@ -1153,7 +1152,7 @@ async function testConfigHookSeedsProvider(
   assertEqual(
     Object.keys(degradedCursor.models ?? {}).length,
     1,
-    "Expected login placeholder instead of hardcoded fallback catalog when discovery fails",
+    "Expected login placeholder instead of a fake catalog when discovery fails",
   );
   assert(
     "default" in degradedCursor.models,
@@ -1204,7 +1203,7 @@ async function testConfigHookSeedsProvider(
   );
   assert(
     !("composer-1" in liveCursor.models) || liveCursor.models["composer-2"],
-    "Expected live discovery catalog rather than only hardcoded fallbacks",
+    "Expected live discovery catalog rather than only placeholders",
   );
 
   backend.setDiscoveryMode("success");
@@ -1487,11 +1486,11 @@ async function testRefreshRotatesWhenResponseRefreshIsJwt(
   console.log("[test] JWT refresh rotation OK");
 }
 
-async function testDiscoveryFallbackAndSuccess(
+async function testDiscoveryPlaceholderAndSuccess(
   modules: TestModules,
   backend: TestCursorBackend,
 ) {
-  console.log("[test] Testing discovery fallback and success...");
+  console.log("[test] Testing discovery placeholder and success...");
 
   const authState = {
     type: "oauth" as const,
@@ -1508,13 +1507,13 @@ async function testDiscoveryFallbackAndSuccess(
   } as any);
   const provider = { models: { stale: { id: "stale" } } } as any;
 
-  // Failed discovery should fall back to hardcoded models
+  // Failed discovery should seed the login placeholder (never a fake catalog)
   modules.clearModelCache();
   backend.setDiscoveryMode("empty");
   const degradedConfig = await hooks.auth!.loader(async () => authState, provider);
   assert(
     Object.keys(provider.models).length > 0,
-    "Expected fallback models to be registered when discovery fails",
+    "Expected placeholder models when discovery fails",
   );
   assert(
     !("stale" in provider.models),
@@ -1523,14 +1522,14 @@ async function testDiscoveryFallbackAndSuccess(
   assertDefaultProviderModel(
     provider,
     "default",
-    "Expected cursor/default to pass 'default' literally (fallback models)",
+    "Expected cursor/default to pass 'default' literally (placeholder)",
   );
   const degradedModelsRes = await fetch(`${degradedConfig.baseURL}/models`);
   assertEqual(degradedModelsRes.status, 200, "Expected degraded /v1/models to succeed");
   const degradedModelsBody = await degradedModelsRes.json();
   assert(
     degradedModelsBody.data.length > 0,
-    "Expected proxy /v1/models to expose fallback models",
+    "Expected proxy /v1/models to expose placeholder models",
   );
 
   // Successful discovery should replace with real models
@@ -1541,10 +1540,9 @@ async function testDiscoveryFallbackAndSuccess(
     { id: "real-model-b", name: "Real Model B", reasoning: true },
   ]);
   const discoveredConfig = await hooks.auth!.loader(async () => authState, provider);
-  // Check that we got models (be flexible about exact list due to API changes)
   assert(
     Object.keys(provider.models).length > 0,
-    "Expected successful discovery to replace fallback models",
+    "Expected successful discovery to replace placeholder models",
   );
   assertDefaultProviderModel(
     provider,
@@ -1560,7 +1558,7 @@ async function testDiscoveryFallbackAndSuccess(
   );
 
   modules.stopProxy();
-  console.log("[test] Discovery fallback and success OK");
+  console.log("[test] Discovery placeholder and success OK");
 }
 
 // ---------------------------------------------------------------------------
@@ -3051,7 +3049,7 @@ async function main() {
     await testRefreshFailureKeepsProviderListable(modules, backend);
     await testRefreshPreservesOriginalWhenResponseRefreshIsNotJwt(modules, backend);
     await testRefreshRotatesWhenResponseRefreshIsJwt(modules, backend);
-    await testDiscoveryFallbackAndSuccess(modules, backend);
+    await testDiscoveryPlaceholderAndSuccess(modules, backend);
     await testPersistentBridgeSessionIsolation();
     await testPoolRecoveryAfterServerRestart();
     await testPoolSequentialRequests();

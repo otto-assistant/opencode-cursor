@@ -37,7 +37,6 @@ export interface TestCursorBackend {
   setAvailableModels: (models: unknown[] | undefined) => void;
   resetObservations: () => void;
   getDiscoveryAuthHeaders: () => string[];
-  getDiscoveryRequestBodies: () => Uint8Array[];
   getRefreshAuthHeaders: () => string[];
   /**
    * Override the value the refresh server places in `refreshToken` of a
@@ -86,7 +85,6 @@ export async function startTestCursorBackend(): Promise<TestCursorBackend> {
     parameters: Record<string, string>;
   }> = [];
   const discoveryAuthHeaders: string[] = [];
-  const discoveryRequestBodies: Uint8Array[] = [];
   const refreshAuthHeaders: string[] = [];
 
   let refreshResponseRefreshTokenOverride: string | null | undefined;
@@ -359,7 +357,6 @@ export async function startTestCursorBackend(): Promise<TestCursorBackend> {
 
       if (path === "/agent.v1.AgentService/GetUsableModels") {
         discoveryAuthHeaders.push(authHeader);
-        discoveryRequestBodies.push(new Uint8Array(Buffer.concat(chunks)));
 
         if (discoveryMode === "auth-error") {
           stream.respond({
@@ -425,14 +422,10 @@ export async function startTestCursorBackend(): Promise<TestCursorBackend> {
     },
     resetObservations() {
       discoveryAuthHeaders.length = 0;
-      discoveryRequestBodies.length = 0;
       refreshAuthHeaders.length = 0;
     },
     getDiscoveryAuthHeaders() {
       return [...discoveryAuthHeaders];
-    },
-    getDiscoveryRequestBodies() {
-      return discoveryRequestBodies.map((body) => new Uint8Array(body));
     },
     getRefreshAuthHeaders() {
       return [...refreshAuthHeaders];

@@ -17,5 +17,3 @@ export const GENERATED_VARIANT_KEYS = [
   "xhigh",
   "max",
 ] as const;
-
-export type GeneratedVariantKey = (typeof GENERATED_VARIANT_KEYS)[number];

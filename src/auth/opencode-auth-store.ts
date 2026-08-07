@@ -18,7 +18,7 @@ import {
   type CursorOAuthCredential,
 } from "./types.js";
 
-export function getOpencodeAuthPath(): string {
+function getOpencodeAuthPath(): string {
   const base =
     process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
   return join(base, "opencode", "auth.json");

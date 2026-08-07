@@ -63,10 +63,8 @@ export async function loadCursorRuntime(
   }
   if (!accessToken) return undefined;
 
-  // Never advertise the hardcoded FALLBACK catalog through the provider hook.
-  const discovered = await getCursorModels(accessToken, {
-    allowFallback: false,
-  });
+  // Never advertise a fake catalog through the provider hook.
+  const discovered = await getCursorModels(accessToken);
   const models =
     discovered.length > 0 ? discovered : LOGIN_PLACEHOLDER_MODELS;
   onModels?.(models);

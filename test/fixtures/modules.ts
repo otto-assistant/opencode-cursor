@@ -11,7 +11,6 @@ export interface TestModules {
   generateCursorAuthParams: typeof import("../../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../../src/index").CursorAuthPlugin;
-  getCursorModels: typeof import("../../src/models").getCursorModels;
   clearModelCache: typeof import("../../src/models").clearModelCache;
   normalizeCursorModels: typeof import("../../src/models").normalizeCursorModels;
   normalizeAvailableModels: typeof import("../../src/models").normalizeAvailableModels;
@@ -39,7 +38,6 @@ export async function loadTestModules(): Promise<TestModules> {
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
-    getCursorModels: models.getCursorModels,
     clearModelCache: models.clearModelCache,
     normalizeCursorModels: models.normalizeCursorModels,
     normalizeAvailableModels: models.normalizeAvailableModels,
