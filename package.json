@@ -1,7 +1,7 @@
 {
   "name": "@otto-assistant/opencode-cursor-oauth",
   "version": "2.2.0",
-  "description": "OpenCode plugin that connects Cursor's API to OpenCode via OAuth, model discovery, and a local OpenAI-compatible proxy.",
+  "description": "Cursor models in OpenCode — native OAuth, live catalog discovery, agent-grade streaming. Direct API, no cursor-agent binary.",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
@@ -26,7 +26,7 @@
     "type": "git",
     "url": "git+https://github.com/otto-assistant/opencode-cursor.git"
   },
-  "homepage": "https://github.com/otto-assistant/opencode-cursor#readme",
+  "homepage": "https://www.npmjs.com/package/@otto-assistant/opencode-cursor-oauth",
   "bugs": {
     "url": "https://github.com/otto-assistant/opencode-cursor/issues"
   },
@@ -34,8 +34,13 @@
     "opencode",
     "opencode-plugin",
     "cursor",
+    "cursor-pro",
     "oauth",
-    "openai-compatible"
+    "openai-compatible",
+    "ai",
+    "llm",
+    "streaming",
+    "agent"
   ],
   "engines": {
     "node": ">=18"
