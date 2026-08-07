@@ -78,6 +78,44 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join as pathJoin, resolve as pathResolve } from "node:path";
 import { Mutex, isAbortError } from "./promise-queue.js";
+import {
+  type ChatCompletionRequest,
+  type ContentPart,
+  type ExtractedImage,
+  type OpenAIMessage,
+  type OpenAIToolCall,
+  type OpenAIToolDef,
+  type ParsedMessages,
+  type ToolResultInfo,
+  shouldBlockTool,
+  textContent,
+} from "./openai/types.js";
+import { extractImagesFromContent } from "./openai/images.js";
+import { parseMessages } from "./openai/message-parser.js";
+import {
+  buildInterruptSteerUserText,
+  extractAnchoredSummary,
+  hasUserSteerAfterTools,
+  isCompactionContinueUserText,
+  isPostCompactHistory,
+  isSummaryGenerationRequest,
+  isTitleGenerationRequest,
+  requestKeyNamespace,
+} from "./openai/request-classifier.js";
+import {
+  buildPostToolBridgeLossContinuation,
+  buildPostToolStallContinuation,
+  truncateToolResultForCursor,
+} from "./openai/tool-results.js";
+import { sanitizeCheckpointAfterInterrupt } from "./openai/checkpoint.js";
+import { extractWorkspaceRoot } from "./openai/workspace.js";
+import {
+  buildConversationIdentity,
+  deriveBridgeKey,
+  deriveConversationKey,
+  deterministicConversationId,
+  selectionIdentity,
+} from "./conversation/identity.js";
 import { BridgePool, type BridgeHandle } from "./bridge-pool.js";
 import { log } from "./log.js";
 import {
@@ -87,6 +125,22 @@ import {
   type CursorModelSelection,
 } from "./model-selection.js";
 
+// Re-export pure helpers so existing tests can import from ./proxy
+export {
+  extractImagesFromContent,
+  parseMessages,
+  isTitleGenerationRequest,
+  isSummaryGenerationRequest,
+  hasUserSteerAfterTools,
+  buildInterruptSteerUserText,
+  isCompactionContinueUserText,
+  extractAnchoredSummary,
+  isPostCompactHistory,
+  truncateToolResultForCursor,
+  sanitizeCheckpointAfterInterrupt,
+  buildPostToolBridgeLossContinuation,
+};
+
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
@@ -95,69 +149,6 @@ const SSE_HEADERS = {
   "Cache-Control": "no-cache",
   Connection: "keep-alive",
 } as const;
-
-interface OpenAIToolCall {
-  id: string;
-  type: "function";
-  function: { name: string; arguments: string };
-}
-
-/** A single element in an OpenAI multi-part content array. */
-interface ContentPart {
-  type: string;
-  text?: string;
-  /** OpenAI vision part: string URL or `{ url }`. */
-  image_url?: string | { url?: string; detail?: string };
-  /** Some OpenCode paths use explicit mime + data/url fields. */
-  mime?: string;
-  mime_type?: string;
-  data?: string;
-  url?: string;
-  filename?: string;
-  name?: string;
-}
-
-interface ExtractedImage {
-  bytes: Uint8Array;
-  mimeType: string;
-  filename: string;
-}
-
-interface OpenAIMessage {
-  role: "system" | "user" | "assistant" | "tool";
-  content: string | null | ContentPart[];
-  tool_call_id?: string;
-  tool_calls?: OpenAIToolCall[];
-}
-
-interface OpenAIToolDef {
-  type: "function";
-  function: {
-    name: string;
-    description?: string;
-    parameters?: Record<string, unknown>;
-  };
-}
-
-function shouldBlockTool(tool: OpenAIToolDef): boolean {
-  return tool.function.name.trim().toLowerCase() === "task";
-}
-
-interface ChatCompletionRequest {
-  model: string;
-  messages: OpenAIMessage[];
-  stream?: boolean;
-  temperature?: number;
-  max_tokens?: number;
-  tools?: OpenAIToolDef[];
-  tool_choice?: unknown;
-  user?: string;
-  metadata?: Record<string, unknown>;
-  thread_id?: string;
-  conversation_id?: string;
-  session_id?: string;
-}
-
 
 interface CursorRequestPayload {
   requestBytes: Uint8Array;
@@ -1530,318 +1521,6 @@ async function doHandleChatCompletion(
   );
 }
 
-interface ToolResultInfo {
-  toolCallId: string;
-  content: string;
-}
-
-interface ParsedMessages {
-  systemPrompt: string;
-  userText: string;
-  /** Images attached to the current user turn (OpenAI vision / file parts). */
-  images: ExtractedImage[];
-  turns: Array<{ userText: string; assistantText: string }>;
-  toolResults: ToolResultInfo[];
-}
-
-/** Normalize OpenAI message content to a plain string. */
-function textContent(content: OpenAIMessage["content"]): string {
-  if (content == null) return "";
-  if (typeof content === "string") return content;
-  return content
-    .filter((p) => p.type === "text" && p.text)
-    .map((p) => p.text!)
-    .join("\n");
-}
-
-function imageUrlFromPart(part: ContentPart): string | undefined {
-  if (typeof part.image_url === "string" && part.image_url.trim()) {
-    return part.image_url.trim();
-  }
-  if (
-    part.image_url &&
-    typeof part.image_url === "object" &&
-    typeof part.image_url.url === "string" &&
-    part.image_url.url.trim()
-  ) {
-    return part.image_url.url.trim();
-  }
-  if (typeof part.url === "string" && part.url.trim()) {
-    return part.url.trim();
-  }
-  return undefined;
-}
-
-function guessMimeFromName(name: string): string {
-  const lower = name.toLowerCase();
-  if (lower.endsWith(".png")) return "image/png";
-  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
-  if (lower.endsWith(".gif")) return "image/gif";
-  if (lower.endsWith(".webp")) return "image/webp";
-  if (lower.endsWith(".bmp")) return "image/bmp";
-  if (lower.endsWith(".svg")) return "image/svg+xml";
-  return "application/octet-stream";
-}
-
-function decodeDataUrl(dataUrl: string): ExtractedImage | undefined {
-  const match = /^data:([^;,]+)?(?:;charset=[^;,]+)?;base64,([A-Za-z0-9+/=\s]+)$/i.exec(
-    dataUrl.trim(),
-  );
-  if (!match) return undefined;
-  const mimeType = (match[1] || "application/octet-stream").trim() || "application/octet-stream";
-  try {
-    const bytes = Buffer.from(match[2].replace(/\s+/g, ""), "base64");
-    if (bytes.byteLength === 0) return undefined;
-    const ext = mimeType.includes("png")
-      ? "png"
-      : mimeType.includes("jpeg") || mimeType.includes("jpg")
-        ? "jpg"
-        : mimeType.includes("gif")
-          ? "gif"
-          : mimeType.includes("webp")
-            ? "webp"
-            : "bin";
-    return {
-      bytes: new Uint8Array(bytes),
-      mimeType,
-      filename: `attachment.${ext}`,
-    };
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Extract image attachments from an OpenAI / OpenCode content payload.
- * Supports `image_url` parts (data URLs) and file-like parts with base64 `data`.
- */
-export function extractImagesFromContent(
-  content: OpenAIMessage["content"],
-): ExtractedImage[] {
-  if (content == null || typeof content === "string") return [];
-  const images: ExtractedImage[] = [];
-  for (const part of content) {
-    const type = (part.type || "").toLowerCase();
-    const filename =
-      (typeof part.filename === "string" && part.filename) ||
-      (typeof part.name === "string" && part.name) ||
-      "attachment";
-
-    if (type === "image_url" || type === "image" || type === "input_image") {
-      const url = imageUrlFromPart(part);
-      if (url?.startsWith("data:")) {
-        const decoded = decodeDataUrl(url);
-        if (decoded) {
-          images.push({
-            ...decoded,
-            filename: filename.includes(".") ? filename : decoded.filename,
-          });
-        }
-      } else if (typeof part.data === "string" && part.data.trim()) {
-        try {
-          const bytes = new Uint8Array(
-            Buffer.from(part.data.replace(/^data:[^,]*,/, "").replace(/\s+/g, ""), "base64"),
-          );
-          if (bytes.byteLength > 0) {
-            const mimeType =
-              part.mime_type || part.mime || guessMimeFromName(filename) || "image/png";
-            images.push({ bytes, mimeType, filename });
-          }
-        } catch {
-          // skip undecodable
-        }
-      }
-      continue;
-    }
-
-    // OpenCode sometimes emits generic file parts for image attachments.
-    if (type === "file" || type === "input_file") {
-      const mime = (part.mime_type || part.mime || "").toLowerCase();
-      const looksImage =
-        mime.startsWith("image/") ||
-        /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(filename);
-      if (!looksImage) continue;
-      if (typeof part.data === "string" && part.data.trim()) {
-        try {
-          const bytes = new Uint8Array(
-            Buffer.from(part.data.replace(/^data:[^,]*,/, "").replace(/\s+/g, ""), "base64"),
-          );
-          if (bytes.byteLength > 0) {
-            images.push({
-              bytes,
-              mimeType: mime || guessMimeFromName(filename) || "image/png",
-              filename,
-            });
-          }
-        } catch {
-          // skip
-        }
-        continue;
-      }
-      const url = imageUrlFromPart(part);
-      if (url?.startsWith("data:")) {
-        const decoded = decodeDataUrl(url);
-        if (decoded) {
-          images.push({
-            ...decoded,
-            filename: filename.includes(".") ? filename : decoded.filename,
-            mimeType: mime || decoded.mimeType,
-          });
-        }
-      }
-    }
-  }
-  return images;
-}
-
-/** Extract the real workspace root from OpenCode's system prompt.
- *  OpenCode includes "Working directory: /path/to/dir" in its env block. */
-function extractWorkspaceRoot(systemPrompt: string): string | undefined {
-  // Try "Working directory: /path" pattern (OpenCode env block)
-  const wdMatch = systemPrompt.match(/Working directory:\s*(\S+)/i);
-  if (wdMatch?.[1]) return wdMatch[1];
-  // Try "Workspace root folder: /path" pattern
-  const wsMatch = systemPrompt.match(/Workspace root folder:\s*(\S+)/i);
-  if (wsMatch?.[1]) return wsMatch[1];
-  return undefined;
-}
-
-/**
- * Parse OpenAI chat messages into Cursor request inputs.
- *
- * Critical invariant for tool loops: when the latest assistant message still
- * has open `tool_calls` (results are trailing `tool` messages), keep that user
- * text as `userText` and return ONLY those trailing tool results. Flushing the
- * turn early made `userText` empty mid-loop; if the parked bridge was also
- * missing, Cursor then received an empty/continuation UserMessage and models
- * hallucinated "the user sent an empty message".
- *
- * OpenCode history replay sometimes omits `assistant.tool_calls` while still
- * sending the matching `role:tool` results (anomalyco/opencode#24090). Those
- * orphaned tool messages must still open a tool batch — otherwise we return
- * `toolResults=[]` + the original `userText`, kill the parked bridge, and
- * re-prompt Cursor with the same task (infinite re-plan loop).
- */
-export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
-  let systemPrompt = "You are a helpful assistant.";
-  const pairs: Array<{ userText: string; assistantText: string }> = [];
-  const trailingToolResults: ToolResultInfo[] = [];
-
-  // Collect system messages
-  const systemParts = messages
-    .filter((m) => m.role === "system")
-    .map((m) => textContent(m.content));
-  if (systemParts.length > 0) {
-    systemPrompt = systemParts.join("\n");
-  }
-
-  // OpenAI tool-call pattern interleaves assistant(tool_calls) → tool → assistant(text):
-  //   user → assistant(tool_calls) → tool → assistant(text+tool_calls) → tool → assistant(text) → user
-  // Accumulate assistant text after each user message, but do NOT close the turn
-  // while tool_calls are still unresolved.
-  const nonSystem = messages.filter((m) => m.role !== "system");
-  let pendingUser = "";
-  let pendingUserContent: OpenAIMessage["content"] = null;
-  let pendingAssistantTexts: string[] = [];
-  let openToolCallBatch = false;
-  let currentImages: ExtractedImage[] = [];
-
-  function flushPair() {
-    if (pendingUser) {
-      pairs.push({
-        userText: pendingUser,
-        assistantText: pendingAssistantTexts.join("\n"),
-      });
-    }
-    pendingUser = "";
-    pendingUserContent = null;
-    pendingAssistantTexts = [];
-    openToolCallBatch = false;
-  }
-
-  for (const msg of nonSystem) {
-    if (msg.role === "tool") {
-      // Infer an open batch when OpenCode dropped assistant.tool_calls on replay.
-      if (!openToolCallBatch) {
-        openToolCallBatch = true;
-        trailingToolResults.length = 0;
-      }
-      trailingToolResults.push({
-        toolCallId: msg.tool_call_id ?? "",
-        content: textContent(msg.content),
-      });
-      continue;
-    }
-
-    if (msg.role === "user") {
-      flushPair();
-      trailingToolResults.length = 0;
-      pendingUser = textContent(msg.content);
-      pendingUserContent = msg.content;
-      currentImages = extractImagesFromContent(msg.content);
-      continue;
-    }
-
-    if (msg.role === "assistant") {
-      const text = textContent(msg.content);
-      const hasToolCalls =
-        Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-      if (text) {
-        pendingAssistantTexts.push(text);
-      }
-      if (hasToolCalls) {
-        // New open batch — older tool results are already historical.
-        trailingToolResults.length = 0;
-        openToolCallBatch = true;
-      } else if (openToolCallBatch) {
-        // Assistant completed the tool loop without further tool_calls.
-        // Subsequent orphaned tool messages (missing tool_calls on the next
-        // assistant) will reopen a fresh trailing batch.
-        openToolCallBatch = false;
-        trailingToolResults.length = 0;
-      }
-    }
-  }
-
-  // Determine the current user message to send to Cursor
-  let lastUserText = "";
-  let lastUserImages: ExtractedImage[] = [];
-  if (openToolCallBatch) {
-    // Mid tool-loop: preserve the user text and only the unresolved tool results.
-    lastUserText = pendingUser;
-    lastUserImages = currentImages;
-  } else if (pendingUser && pendingAssistantTexts.length > 0) {
-    pairs.push({
-      userText: pendingUser,
-      assistantText: pendingAssistantTexts.join("\n"),
-    });
-    pendingUser = "";
-    pendingUserContent = null;
-    // Regeneration path: last completed turn without a newer user/tool payload.
-    if (pairs.length > 0 && trailingToolResults.length === 0) {
-      const last = pairs.pop()!;
-      lastUserText = last.userText;
-      // Images from a completed turn are already in Cursor checkpoint history;
-      // only re-attach when we still hold the original content for this request.
-      lastUserImages = extractImagesFromContent(pendingUserContent);
-    }
-  } else if (pendingUser || currentImages.length > 0) {
-    lastUserText = pendingUser;
-    lastUserImages = currentImages;
-  } else if (pairs.length > 0 && trailingToolResults.length === 0) {
-    const last = pairs.pop()!;
-    lastUserText = last.userText;
-  }
-
-  return {
-    systemPrompt,
-    userText: lastUserText,
-    images: lastUserImages,
-    turns: pairs,
-    toolResults: trailingToolResults,
-  };
-}
-
 /** Convert OpenAI tool definitions to Cursor's MCP tool protobuf format. */
 function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
   return tools.map((t) => {
@@ -2599,361 +2278,6 @@ function sendExecResult(
     message: { case: "execClientMessage", value: execClientMessage },
   });
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
-}
-
-function buildConversationIdentity(body: ChatCompletionRequest): string {
-  const rawIds = [
-    body.conversation_id,
-    body.thread_id,
-    body.session_id,
-    body.user,
-  ];
-  for (const id of rawIds) {
-    if (typeof id === "string" && id.trim().length > 0) {
-      return `id:${id.trim()}`;
-    }
-  }
-
-  const metadata = body.metadata && typeof body.metadata === "object"
-    ? body.metadata
-    : undefined;
-  if (metadata) {
-    const candidateKeys = ["conversation_id", "thread_id", "session_id", "chat_id", "id"];
-    for (const key of candidateKeys) {
-      const value = metadata[key];
-      if (typeof value === "string" && value.trim().length > 0) {
-        return `meta:${key}:${value.trim()}`;
-      }
-    }
-  }
-
-  return "";
-}
-
-/** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
-function selectionIdentity(selection: CursorModelSelection): string {
-  return JSON.stringify({
-    modelId: selection.modelId,
-    maxMode: selection.maxMode,
-    parameters: selection.parameters,
-  });
-}
-
-function deriveBridgeKey(modelId: string, body: ChatCompletionRequest): string {
-  const identity = buildConversationIdentity(body);
-  const firstUserMsg = body.messages.find((m) => m.role === "user");
-  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  const ns = requestKeyNamespace(body.messages);
-  let base = identity ? `${ns}${identity}` : `fallback:${ns}${firstUserText}`;
-  if (!identity && isPostCompactHistory(body.messages)) {
-    const summary = extractAnchoredSummary(body.messages);
-    const fingerprint = createHash("sha256")
-      .update(summary || `user:${firstUserText}`)
-      .digest("hex")
-      .slice(0, 16);
-    base = `${ns}postcompact:${fingerprint}:fallback:${firstUserText}`;
-  }
-  return createHash("sha256")
-    .update(`bridge:${modelId}:${base}`)
-    .digest("hex")
-    .slice(0, 24);
-}
-
-/** Detect if this is a title generation request by checking for title-gen system prompt. */
-export function isTitleGenerationRequest(messages: OpenAIMessage[]): boolean {
-  const systemText = messages
-    .filter((m) => m.role === "system")
-    .map((m) => textContent(m.content))
-    .join(" ");
-  return systemText.toLowerCase().includes("title generator") ||
-         systemText.toLowerCase().includes("generate a short title");
-}
-
-/**
- * Detect OpenCode /compact (compaction) and summary-agent requests.
- * These must not share the live agent conversation checkpoint and must not
- * advertise or emit tools — otherwise Cursor continues the coding agent and
- * OpenCode throws "Tool call not allowed while generating summary".
- */
-export function isSummaryGenerationRequest(messages: OpenAIMessage[]): boolean {
-  const systemText = messages
-    .filter((m) => m.role === "system")
-    .map((m) => textContent(m.content))
-    .join(" ")
-    .toLowerCase();
-  if (
-    systemText.includes("anchored context summarization") ||
-    systemText.includes("summarizing, compacting, or merging context") ||
-    systemText.includes("tasked with summarizing conversations") ||
-    systemText.includes("write like a pull request description") ||
-    systemText.includes("summarize what was done in this conversation")
-  ) {
-    return true;
-  }
-
-  // Compaction user prompts (when agent.prompt is absent from system for any reason).
-  const userText = messages
-    .filter((m) => m.role === "user")
-    .map((m) => textContent(m.content))
-    .join(" ")
-    .toLowerCase();
-  return (
-    userText.includes("this summary will be the only context available when the conversation continues") ||
-    userText.includes("create a detailed summary for continuing this coding session") ||
-    // OpenCode 1.18+ compaction can send the anchored-summary instruction as a
-    // bare user message with no system prompt (and tools: []), e.g.:
-    //   "Create a new anchored summary from the conversation history."
-    //   "Update the anchored summary below using the conversation history above.\n<previous-summary>…"
-    // Missing these leaves tools enabled and Cursor's agentic engine emits tool
-    // calls that OpenCode rejects with "Tool call not allowed while generating
-    // summary".
-    userText.includes("anchored summary from the conversation history") ||
-    userText.includes("anchored summary below using the conversation history") ||
-    userText.includes("<previous-summary>")
-  );
-}
-
-/** Namespace prefix so title/summary requests never collide with live agent state. */
-function requestKeyNamespace(messages: OpenAIMessage[]): string {
-  if (isTitleGenerationRequest(messages)) return "title:";
-  if (isSummaryGenerationRequest(messages)) return "summary:";
-  return "";
-}
-
-/**
- * True when OpenAI history has a user message after one or more tool results.
- * That pattern means the user interrupted/steered during a tool loop — the new
- * text must win over resuming the parked MCP bridge.
- */
-/**
- * True only when the user genuinely INTERRUPTED an unresolved tool batch.
- *
- * OpenCode always appends the current user prompt at the END of the replayed
- * message array, so after every completed tool round the tail looks like
- * `[…, assistant(tool_calls), tool(result), user("current prompt")]`. The old
- * implementation returned true for ANY user message after ANY tool message in
- * the whole history, which misclassified every normal continuation as an
- * interrupt — the proxy abandoned the parked bridge together with the tool
- * results and re-prompted Cursor with interrupt framing, so the model never
- * saw its tool output and restated the same plan forever (regression from
- * "honor user interrupts instead of bare cancel/resume", Jul 25).
- *
- * A steer exists only when the tool batch opened by the LAST assistant message
- * is still unresolved (no `role: tool` results after it) AND a trailing user
- * message is present. A user message after a completed round (results present,
- * or the last assistant made no tool calls) is a normal next turn.
- */
-export function hasUserSteerAfterTools(messages: OpenAIMessage[]): boolean {
-  let tailUserText = "";
-  let sawToolResult = false;
-  let sawAssistant = false;
-  let lastAssistantHasToolCalls = false;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg.role === "system") continue;
-    if (msg.role === "user") {
-      if (!tailUserText) {
-        tailUserText = textContent(msg.content).trim();
-      }
-      continue;
-    }
-    if (msg.role === "tool") {
-      sawToolResult = true;
-      continue;
-    }
-    if (msg.role === "assistant") {
-      lastAssistantHasToolCalls =
-        Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-      sawAssistant = true;
-      break;
-    }
-  }
-  if (!sawAssistant || !tailUserText) return false;
-  return lastAssistantHasToolCalls && !sawToolResult;
-}
-
-const INTERRUPT_STEER_PREFIX =
-  "Please follow this new instruction:";
-
-/** Frame a follow-up so Cursor treats it as a steer, not a bare cancel/resume.
- *  Kept natural — the previous "[User interrupted the previous turn...]" prefix
- *  made the model hallucinate "previous run was interrupted" responses. */
-export function buildInterruptSteerUserText(userText: string): string {
-  return `${INTERRUPT_STEER_PREFIX}\n\n${userText}`;
-}
-
-/**
- * True when the user message is OpenCode's synthetic post-compaction
- * "Continue if you have next steps…" prompt. Kept as a helper for
- * `isPostCompactHistory` / convKey stability (post-compact sessions must not
- * collide on one Cursor conversation), not for re-framing user prompts.
- */
-export function isCompactionContinueUserText(userText: string): boolean {
-  const text = userText.trim().toLowerCase();
-  if (!text) return false;
-  return (
-    text.startsWith("continue if you have next steps") ||
-    text.includes(
-      "continue if you have next steps, or stop and ask for clarification",
-    )
-  );
-}
-
-/**
- * Pull OpenCode's anchored compaction summary from history (assistant
- * "## Objective" …), if present.
- */
-export function extractAnchoredSummary(messages: OpenAIMessage[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg.role !== "assistant") continue;
-    const text = textContent(msg.content).trim();
-    if (
-      /^##\s*objective\b/im.test(text) &&
-      (/##\s*work state\b/im.test(text) ||
-        /\bimportant details\b/i.test(text) ||
-        /\bcompleted\b/i.test(text))
-    ) {
-      return text;
-    }
-  }
-  return "";
-}
-
-/**
- * True when OpenCode history is in the post-compaction shape:
- * either the synthetic continue prompt appears, or the session was rewritten
- * to "What did we do so far?" + anchored summary (OpenCode 1.18+).
- */
-export function isPostCompactHistory(messages: OpenAIMessage[]): boolean {
-  let sawContinue = false;
-  let sawWhatDidWeDo = false;
-  let sawObjectiveSummary = false;
-
-  for (const msg of messages) {
-    const text = textContent(msg.content).trim();
-    if (!text) continue;
-    if (msg.role === "user") {
-      if (isCompactionContinueUserText(text)) sawContinue = true;
-      if (/^what did we do so far\??$/i.test(text)) sawWhatDidWeDo = true;
-    }
-    if (msg.role === "assistant") {
-      // Anchored summaries from the compaction agent.
-      if (
-        /^##\s*objective\b/im.test(text) &&
-        (/##\s*work state\b/im.test(text) ||
-          /\bcompleted\b/i.test(text) ||
-          /\bremaining\b/i.test(text) ||
-          /\bimportant details\b/i.test(text))
-      ) {
-        sawObjectiveSummary = true;
-      }
-    }
-  }
-
-  return sawContinue || (sawWhatDidWeDo && sawObjectiveSummary);
-}
-
-
-/**
- * Max chars of a single mcpResult payload sent back to Cursor.
- * Huge shell/build logs (vite/webpack) can stall or kill the H2 bridge mid-resume;
- * OpenCode then marks the session idle with unsettled tool parts.
- * Override with OPENCODE_CURSOR_MCP_RESULT_MAX_CHARS.
- */
-const MCP_RESULT_MAX_CHARS = Number(
-  process.env.OPENCODE_CURSOR_MCP_RESULT_MAX_CHARS ?? 24_000,
-);
-const MCP_RESULT_HEAD_CHARS = Number(
-  process.env.OPENCODE_CURSOR_MCP_RESULT_HEAD_CHARS ?? 16_000,
-);
-const MCP_RESULT_TAIL_CHARS = Number(
-  process.env.OPENCODE_CURSOR_MCP_RESULT_TAIL_CHARS ?? 6_000,
-);
-
-/**
- * Truncate oversized tool output for Cursor mcpResult / continuation prompts.
- * Keeps head + tail so build success lines near the end stay visible.
- */
-export function truncateToolResultForCursor(content: string): string {
-  const text = content ?? "";
-  if (text.length <= MCP_RESULT_MAX_CHARS) return text;
-  const headN = Math.min(MCP_RESULT_HEAD_CHARS, MCP_RESULT_MAX_CHARS);
-  const tailN = Math.min(
-    MCP_RESULT_TAIL_CHARS,
-    Math.max(0, MCP_RESULT_MAX_CHARS - headN),
-  );
-  const head = text.slice(0, headN);
-  const tail = tailN > 0 ? text.slice(-tailN) : "";
-  const omitted = Math.max(0, text.length - head.length - tail.length);
-  return `${head}\n\n…[truncated ${omitted} chars of tool output for Cursor bridge stability]…\n\n${tail}`;
-}
-
-/** Drop unresolved pending tool calls from a checkpoint after user interrupt. */
-export function sanitizeCheckpointAfterInterrupt(
-  checkpoint: Uint8Array | null,
-): Uint8Array | null {
-  if (!checkpoint) return null;
-  try {
-    const state = fromBinary(ConversationStateStructureSchema, checkpoint);
-    if (!state.pendingToolCalls.length) return checkpoint;
-    state.pendingToolCalls = [];
-    return toBinary(ConversationStateStructureSchema, state);
-  } catch {
-    return checkpoint;
-  }
-}
-
-/** Derive a key for conversation state. Model-independent so context survives model switches.
- *
- * Priority:
- * 1) Explicit conversation identity passed by caller (conversation/thread/session/user)
- * 2) Fallback hash from stable message anchors (system + first user text)
- */
-function deriveConversationKey(body: ChatCompletionRequest): string {
-  const identity = buildConversationIdentity(body);
-  const firstUserMsg = body.messages.find((m) => m.role === "user");
-  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  const ns = requestKeyNamespace(body.messages);
-  // NOTE: Do NOT include full system prompt in fallback key — OpenCode's system
-  // prompt changes every request (dynamic context, per-turn metadata), which would
-  // cause convKey to rotate and lose the stored conversation checkpoint.
-  // Only firstUserText is used — it's the stable initial user message.
-  // Always apply ns so /compact and title-gen never reuse the live agent checkpoint.
-  let fallbackSeed = `${ns}user:${firstUserText}`;
-  // After compact, OpenCode rewrites history so every session starts with the
-  // same synthetic user ("What did we do so far?"). Without a fingerprint,
-  // concurrent sessions collide on one Cursor conversationId and cross-talk.
-  if (!identity && isPostCompactHistory(body.messages)) {
-    const summary = extractAnchoredSummary(body.messages);
-    const fingerprint = createHash("sha256")
-      .update(summary || `user:${firstUserText}`)
-      .digest("hex")
-      .slice(0, 16);
-    fallbackSeed = `${ns}postcompact:${fingerprint}:user:${firstUserText}`;
-  }
-  const seed = identity ? `${ns}${identity}` : `fallback:${fallbackSeed}`;
-  return createHash("sha256")
-    .update(`conv:${seed}`)
-    .digest("hex")
-    .slice(0, 24);
-}
-
-/** Deterministic UUID derived from convKey so Cursor's server-side conversation
- *  persists across proxy restarts. Formats 16 bytes of SHA-256 as a v4-shaped UUID. */
-function deterministicConversationId(convKey: string): string {
-  const hex = createHash("sha256")
-    .update(`cursor-conv-id:${convKey}`)
-    .digest("hex")
-    .slice(0, 32);
-  // Format as UUID: xxxxxxxx-xxxx-4xxx-Nxxx-xxxxxxxxxxxx
-  return [
-    hex.slice(0, 8),
-    hex.slice(8, 12),
-    `4${hex.slice(13, 16)}`,
-    `${(0x8 | (parseInt(hex[16], 16) & 0x3)).toString(16)}${hex.slice(17, 20)}`,
-    hex.slice(20, 32),
-  ].join("-");
 }
 
 /** Context for retrying a streaming request after "Blob not found" errors. */
@@ -4100,48 +3424,6 @@ function createBridgeStreamResponse(
   });
 
   return new Response(stream, { headers: SSE_HEADERS });
-}
-
-/** Append tool-result payloads to an internal recovery continuation prompt. */
-function appendToolResultsToContinuation(
-  parts: string[],
-  toolResults?: ToolResultInfo[],
-): void {
-  if (!toolResults || toolResults.length === 0) return;
-  for (const result of toolResults) {
-    const content = result.content.trim() || "(no output)";
-    // Head+tail truncation keeps build success lines near the end.
-    parts.push(truncateToolResultForCursor(content));
-  }
-}
-
-/** User-facing continuation prompt used when a post-tool stream stalls and we
- *  rebuild a fresh Run from the stored checkpoint (mcpResults cannot be replayed).
- *  Kept natural — technical "[Internal stream recovery]" prefixes confused the
- *  model into hallucinating "empty message" responses. */
-function buildPostToolStallContinuation(toolResults?: ToolResultInfo[]): string {
-  const parts: string[] = [
-    "Continue from the current conversation checkpoint.",
-  ];
-  appendToolResultsToContinuation(parts, toolResults);
-  return parts.join("\n");
-}
-
-/**
- * Continuation when the parked tool bridge died/expired before OpenCode returned
- * results (typical after long shells/builds that outlive the old 5m TTL).
- * Always lead with an explicit continue cue — raw tool payloads alone (e.g.
- * TodoWrite status lines) were being misread as a brand-new user task, which
- * restarted planning every hop.
- */
-export function buildPostToolBridgeLossContinuation(
-  toolResults?: ToolResultInfo[],
-): string {
-  const parts: string[] = [
-    "Continue from the current conversation checkpoint.",
-  ];
-  appendToolResultsToContinuation(parts, toolResults);
-  return parts.join("\n");
 }
 
 /** Spawn a bridge, send the initial request frame, and start heartbeat. */

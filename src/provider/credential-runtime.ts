@@ -1,8 +1,9 @@
 import type { PluginInput } from "@opencode-ai/plugin";
+import { RefreshTokenInvalidError } from "../auth.js";
 import {
-  refreshCursorToken,
-  RefreshTokenInvalidError,
-} from "../auth.js";
+  createAccessTokenProvider,
+  ensureValidAccessToken,
+} from "../auth/credential-manager.js";
 import { isCursorOAuthCredential } from "../auth/types.js";
 import {
   getCursorModels,
@@ -29,38 +30,40 @@ export async function loadCursorRuntime(
   const auth = await getAuth();
   if (!isCursorOAuthCredential(auth)) return undefined;
 
-  // Ensure we have a valid access token, refreshing if expired.
-  // Refresh failures must NOT throw out of provider/auth hooks, or
-  // OpenCode's provider.list() fails entirely and every Discord /model and
-  // /login call surfaces "Failed to fetch providers". Return undefined so
-  // Cursor is simply treated as unavailable until the user re-runs login.
-  let accessToken = auth.access;
-  if (!accessToken || auth.expires < Date.now()) {
-    try {
-      const refreshed = await refreshCursorToken(auth.refresh);
-      await input.client.auth.set({
-        path: { id: CURSOR_PROVIDER_ID },
-        body: {
-          type: "oauth",
-          refresh: refreshed.refresh,
-          access: refreshed.access,
-          expires: refreshed.expires,
-        },
-      });
-      accessToken = refreshed.access;
-    } catch (err) {
-      const permanent = err instanceof RefreshTokenInvalidError;
-      const summary = err instanceof Error ? err.message : String(err);
-      log.error(
-        `[opencode-cursor] Cursor token refresh ${permanent ? "rejected (re-login required)" : "failed (transient)"}: ${summary}`,
-      );
-      return undefined;
-    }
-  }
+  const persist = async (cred: {
+    type: "oauth";
+    access?: string;
+    refresh: string;
+    expires: number;
+  }) => {
+    await input.client.auth.set({
+      path: { id: CURSOR_PROVIDER_ID },
+      body: {
+        type: "oauth",
+        refresh: cred.refresh,
+        access: cred.access ?? "",
+        expires: cred.expires,
+      },
+    });
+  };
 
-  // Never advertise the hardcoded FALLBACK catalog through the provider hook —
-  // OpenChamber's provider page would show ~14 stale models instead of the live
-  // Cursor catalog. If discovery fails, keep a login placeholder until retry.
+  // Refresh failures must NOT throw out of provider/auth hooks, or
+  // OpenCode's provider.list() fails entirely. Return undefined so Cursor is
+  // simply treated as unavailable until the user re-runs login.
+  let accessToken: string | undefined;
+  try {
+    accessToken = await ensureValidAccessToken({ auth, persist });
+  } catch (err) {
+    const permanent = err instanceof RefreshTokenInvalidError;
+    const summary = err instanceof Error ? err.message : String(err);
+    log.error(
+      `[opencode-cursor] Cursor token refresh ${permanent ? "rejected (re-login required)" : "failed (transient)"}: ${summary}`,
+    );
+    return undefined;
+  }
+  if (!accessToken) return undefined;
+
+  // Never advertise the hardcoded FALLBACK catalog through the provider hook.
   const discovered = await getCursorModels(accessToken, {
     allowFallback: false,
   });
@@ -68,34 +71,16 @@ export async function loadCursorRuntime(
     discovered.length > 0 ? discovered : LOGIN_PLACEHOLDER_MODELS;
   onModels?.(models);
 
-  // startProxy() is idempotent: if the proxy is already running on the same
-  // port it returns immediately. If it was stopped, it binds a new random port.
-  const port = await startProxy(async () => {
-    const currentAuth = await getAuth();
-    if (!isCursorOAuthCredential(currentAuth)) {
-      throw new Error("Cursor auth not configured");
-    }
-
-    if (!currentAuth.access || currentAuth.expires < Date.now()) {
-      const refreshed = await refreshCursorToken(currentAuth.refresh);
-      await input.client.auth.set({
-        path: { id: CURSOR_PROVIDER_ID },
-        body: {
-          type: "oauth",
-          refresh: refreshed.refresh,
-          access: refreshed.access,
-          expires: refreshed.expires,
-        },
-      });
-      return refreshed.access;
-    }
-
-    return currentAuth.access;
-  }, models);
+  // startProxy() is idempotent: if the proxy is already running it returns
+  // immediately. Fixed-port binding (see proxy.ts).
+  const port = await startProxy(
+    createAccessTokenProvider(getAuth, persist),
+    models,
+  );
 
   const providerModels = buildCursorProviderModels(models, port);
   if (provider) {
-    (provider as any).models = providerModels;
+    (provider as { models?: Record<string, unknown> }).models = providerModels;
   }
 
   return { port, providerModels };

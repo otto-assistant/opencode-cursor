@@ -5,14 +5,14 @@
  * Starts the same PKCE login as `opencode auth login`, logs the browser URL,
  * polls in the background, and writes tokens to OpenCode's auth.json.
  */
-import { writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { homedir } from "node:os";
 import {
   generateCursorAuthParams,
   getTokenExpiry,
   tryPollCursorAuth,
 } from "./auth.js";
+import {
+  writeStoredCursorAuth,
+} from "./auth/opencode-auth-store.js";
 import { clearModelCache } from "./models.js";
 import { log } from "./log.js";
 
@@ -42,37 +42,14 @@ let pollResolve: ((value: CursorBrowserLoginResult) => void) | null = null;
 let pollReject: ((reason?: unknown) => void) | null = null;
 let pollInFlight: Promise<CursorBrowserLoginResult> | null = null;
 
-function authJsonPath(): string {
-  const xdg = process.env.XDG_DATA_HOME;
-  const base = xdg ? xdg : join(homedir(), ".local", "share");
-  return join(base, "opencode", "auth.json");
-}
-
 function writeCursorAuth(accessToken: string, refreshToken: string): number {
-  const path = authJsonPath();
-  mkdirSync(dirname(path), { recursive: true });
-
-  let existing: Record<string, unknown> = {};
-  if (existsSync(path)) {
-    try {
-      existing = JSON.parse(readFileSync(path, "utf8")) as Record<
-        string,
-        unknown
-      >;
-    } catch {
-      existing = {};
-    }
-  }
-
   const expires = getTokenExpiry(accessToken);
-  existing.cursor = {
+  writeStoredCursorAuth({
     type: "oauth",
-    refresh: refreshToken,
     access: accessToken,
+    refresh: refreshToken,
     expires,
-  };
-
-  writeFileSync(path, JSON.stringify(existing, null, 2) + "\n", "utf8");
+  });
   return expires;
 }
 

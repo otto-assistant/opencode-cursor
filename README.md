@@ -16,10 +16,11 @@
 </p>
 
 <p align="center">
-  <a href="#install">Install</a> ·
+  <a href="#quick-start">Quick start</a> ·
   <a href="#authenticate">Authenticate</a> ·
   <a href="#why-this-plugin">Why this plugin</a> ·
   <a href="#architecture">Architecture</a> ·
+  <a href="#troubleshooting">Troubleshooting</a> ·
   <a href="CHANGELOG.md">Changelog</a>
 </p>
 
@@ -29,13 +30,17 @@ Use every model on your Cursor subscription from OpenCode: Claude, GPT, Gemini, 
 
 No `cursor-agent` binary. No SDK child-process gymnastics. Direct Cursor API over HTTP/2.
 
-## Install
+## Quick start
+
+**1. Install the plugin**
 
 ```bash
 npm install -g @otto-assistant/opencode-cursor-oauth
 ```
 
-Add the plugin to `~/.config/opencode/opencode.json`:
+**2. Register it in OpenCode**
+
+Add (or merge) this into `~/.config/opencode/opencode.json`:
 
 ```jsonc
 {
@@ -47,7 +52,23 @@ Add the plugin to `~/.config/opencode/opencode.json`:
 }
 ```
 
-Or build from source:
+**3. Sign in with Cursor (browser OAuth — not an API key)**
+
+```bash
+opencode auth login --provider cursor
+```
+
+A browser window opens. Approve access. Tokens land in `~/.local/share/opencode/auth.json` and refresh automatically.
+
+**4. Use a Cursor model**
+
+```bash
+opencode run "Summarise this repository in five bullets." --model cursor/default
+```
+
+In the TUI: pick provider **cursor**, then a model (including Thinking / Fast / effort variants when Cursor exposes them).
+
+### From source (optional)
 
 ```bash
 git clone https://github.com/otto-assistant/opencode-cursor.git
@@ -58,17 +79,16 @@ npm install -g .
 
 ## Authenticate
 
-```bash
-opencode auth login --provider cursor
-```
+| Step | What happens |
+|------|----------------|
+| `opencode auth login --provider cursor` | Starts PKCE browser OAuth |
+| You approve in the browser | Cursor returns access + refresh tokens |
+| Plugin stores credentials | `~/.local/share/opencode/auth.json` |
+| Access expires | Plugin refreshes silently; permanent 4xx → re-login |
 
-A browser window opens Cursor OAuth. Tokens land in `~/.local/share/opencode/auth.json` and refresh automatically.
+If you use OpenChamber and never see an OAuth button, the plugin still prints a login URL and embeds it in the placeholder model name — open that URL, then reload.
 
-Then start OpenCode, pick provider **cursor**, and choose a model (including Thinking / Fast / effort variants when Cursor exposes them).
-
-```bash
-opencode run "Summarise this repository in five bullets." --model cursor/default
-```
+**You do not need a Cursor API key.** Browser OAuth is the only supported path.
 
 ## Why this plugin
 
@@ -86,10 +106,16 @@ opencode run "Summarise this repository in five bullets." --model cursor/default
 ```text
 OpenCode
   └─ /v1/chat/completions
-       └─ Bun.serve proxy
+       └─ Local OpenAI-compatible proxy
             └─ Node HTTP/2 bridge
                  └─ Cursor API (api2.cursor.sh)
 ```
+
+| Layer | Responsibility |
+|-------|----------------|
+| **Plugin hooks** | OAuth, provider config, model catalog, selection headers |
+| **Proxy** | OpenAI ↔ Cursor protocol, tool loops, stalls, checkpoints |
+| **Transport** | Persistent / one-shot HTTP/2 bridges to Cursor |
 
 Model listings map Cursor's variant catalog into OpenCode-native choices (`Opus 4.8`, `Opus 4.8 Thinking`, effort `low`→`max`, Fast, …). Selection is encoded for the proxy so Cursor receives the exact `RequestedModel` parameters your account supports.
 
@@ -105,6 +131,8 @@ From the [v2.2.0](https://github.com/otto-assistant/opencode-cursor/releases/tag
 
 Knobs (optional): `OPENCODE_CURSOR_PRE_OUTPUT_STALL_TIMEOUT_MS`, `OPENCODE_CURSOR_POST_TOOL_PRE_OUTPUT_STALL_TIMEOUT_MS`, `OPENCODE_CURSOR_TOOL_DEBOUNCE_MS`.
 
+Debug logs: `OPENCODE_CURSOR_DEBUG=1`.
+
 ## Requirements
 
 - [OpenCode](https://opencode.ai)
@@ -118,6 +146,16 @@ bun install
 bun run build
 bun run test
 ```
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| Cursor missing from provider list | Confirm `plugin` includes `@otto-assistant/opencode-cursor-oauth` and restart OpenCode |
+| "sign in required" / login URL in model name | Open the printed URL, approve OAuth, reload |
+| Refresh rejected / re-login required | Run `opencode auth login --provider cursor` again |
+| Model not found | Wait for live discovery after login; avoid relying on stale offline catalogs |
+| Tool loop restates forever | Update to latest plugin — post-tool resume + phase-aware stalls are required |
 
 ## FAQ
 

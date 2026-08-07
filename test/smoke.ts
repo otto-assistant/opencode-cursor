@@ -24,6 +24,7 @@ import {
   loadTestModules,
   type TestModules,
 } from "./fixtures/modules";
+import { runExtractedHelperUnitTests } from "./unit/extracted-helpers";
 
 async function testProxyStartStop(modules: TestModules) {
   console.log("[test] Starting proxy...");
@@ -3035,6 +3036,7 @@ async function main() {
   const modules = await loadTestModules();
 
   try {
+    await runExtractedHelperUnitTests();
     await testProxyStartStop(modules);
     await testAuthParams(modules);
     await testTokenExpiry(modules);

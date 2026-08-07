@@ -2,8 +2,8 @@ import {
   readStoredCursorAuth,
   writeStoredCursorAuth,
 } from "../auth/opencode-auth-store.js";
+import { ensureValidAccessToken } from "../auth/credential-manager.js";
 import { startCursorBrowserLogin } from "../auth-login.js";
-import { refreshCursorToken } from "../auth.js";
 import {
   getCursorModels,
   loginPlaceholderModels,
@@ -21,8 +21,7 @@ import { withTimeout } from "../shared/timeout.js";
  * When logged out — or when a stored token cannot discover models — seeds a
  * single login placeholder. OpenCode drops providers with zero models from
  * `provider.list()`, which would hide Cursor in OpenChamber. We intentionally
- * never seed the hardcoded FALLBACK_MODELS catalog into the provider UI: that
- * advertised ~14 stale models as if they were the live Cursor list (~50).
+ * never seed the hardcoded FALLBACK_MODELS catalog into the provider UI.
  *
  * Never throws.
  */
@@ -44,38 +43,29 @@ export async function resolveConfigModels(): Promise<CursorModel[]> {
   const stored = readStoredCursorAuth();
   if (!stored) return resolveLoggedOutPlaceholder();
 
-  let accessToken = stored.access;
-  if (!accessToken || stored.expires < Date.now()) {
-    try {
-      const refreshed = await refreshCursorToken(stored.refresh);
-      writeStoredCursorAuth({
-        type: "oauth",
-        access: refreshed.access,
-        refresh: refreshed.refresh,
-        expires: refreshed.expires,
-      });
-      accessToken = refreshed.access;
-    } catch (err) {
-      const summary = err instanceof Error ? err.message : String(err);
-      log.warn(
-        `[opencode-cursor] config model discovery refresh failed: ${summary}`,
-      );
-      return resolveLoggedOutPlaceholder();
-    }
+  let accessToken: string | undefined;
+  try {
+    accessToken = await ensureValidAccessToken({
+      auth: stored,
+      persist: writeStoredCursorAuth,
+    });
+  } catch (err) {
+    const summary = err instanceof Error ? err.message : String(err);
+    log.warn(
+      `[opencode-cursor] config model discovery refresh failed: ${summary}`,
+    );
+    return resolveLoggedOutPlaceholder();
   }
+  if (!accessToken) return resolveLoggedOutPlaceholder();
 
   // Transient h2-bridge / Cursor API hiccups at plugin load used to fall
-  // straight to the login placeholder, leaving the provider with zero real
-  // models until the next restart (every model request fails with
-  // "Model not found"). Retry discovery briefly before giving up.
+  // straight to the login placeholder. Retry discovery briefly before giving up.
   let discovered: CursorModel[] = [];
   for (let attempt = 0; attempt < 3 && discovered.length === 0; attempt++) {
     if (attempt > 0) {
       await new Promise((r) => setTimeout(r, 1_000 * attempt));
     }
     try {
-      // Allow enough time for the HTTP/2 bridge + AvailableModels round-trip.
-      // The previous 4s budget often fell through to the hardcoded fallback list.
       discovered = await withTimeout(
         getCursorModels(accessToken, { allowFallback: false }),
         15_000,
