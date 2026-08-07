@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 828 180" width="828" height="180" role="img" aria-label="opencode-cursor - Cursor models in OpenCode, direct API, native OAuth">
+  <style>
+    .mono { font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace; }
+    .sans { font-family: ui-sans-serif, "Segoe UI", system-ui, sans-serif; }
+    .pulse { animation: pulse 2.4s ease-in-out infinite; }
+    .rise1 { animation: rise 900ms cubic-bezier(0.16,1,0.3,1) 100ms both; }
+    .rise2 { animation: rise 900ms cubic-bezier(0.16,1,0.3,1) 200ms both; }
+    .rise3 { animation: rise 900ms cubic-bezier(0.16,1,0.3,1) 300ms both; }
+    .sweep { transform-origin: 40px 0; transform: scaleX(0); animation: sweep 850ms cubic-bezier(0.16,1,0.3,1) 400ms forwards; }
+    .scan { animation: scan 3.6s cubic-bezier(0.45,0,0.55,1) 1.3s infinite; }
+    .blink { animation: blink 1.05s steps(1) infinite; }
+    @keyframes pulse {
+      0%, 100% { opacity: 0.35; }
+      50% { opacity: 1; }
+    }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes sweep { to { transform: scaleX(1); } }
+    @keyframes scan {
+      0% { transform: translateX(0); opacity: 0; }
+      8% { opacity: 1; }
+      62% { transform: translateX(748px); opacity: 1; }
+      72%, 100% { transform: translateX(748px); opacity: 0; }
+    }
+    @keyframes blink { 50% { opacity: 0; } }
+    @media (prefers-reduced-motion: reduce) {
+      .pulse, .rise1, .rise2, .rise3, .sweep, .scan, .blink { animation: none; }
+      .rise1, .rise2, .rise3 { opacity: 1; transform: none; }
+      .sweep { transform: scaleX(1); }
+      .scan { opacity: 0; }
+    }
+  </style>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1220"/>
+      <stop offset="55%" stop-color="#0e1729"/>
+      <stop offset="100%" stop-color="#111a2e"/>
+    </linearGradient>
+    <linearGradient id="title" x1="92" y1="0" x2="560" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#f4f7fb"/>
+      <stop offset="75%" stop-color="#e8eef7"/>
+      <stop offset="100%" stop-color="#8fa3bf"/>
+    </linearGradient>
+    <linearGradient id="scan_g" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#3dd6c6" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#5eead4" stop-opacity="1"/>
+      <stop offset="1" stop-color="#3dd6c6" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="bar" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#5eead4"/>
+      <stop offset="100%" stop-color="#2a9d8f"/>
+    </linearGradient>
+    <clipPath id="rc"><rect x="40" y="138" width="748" height="4"/></clipPath>
+  </defs>
+
+  <rect width="828" height="180" rx="10" fill="url(#bg)"/>
+  <rect x="12" y="12" width="804" height="156" rx="8" fill="none" stroke="#243249" stroke-width="1.25"/>
+
+  <rect x="28" y="6" width="118" height="14" fill="#0b1220"/>
+  <text class="mono" x="34" y="17" fill="#6b7c94" font-size="11" letter-spacing="0.08em">OTTO · CURSOR</text>
+
+  <!-- geometric mark: open ring + cursor tip -->
+  <g transform="translate(40, 44)">
+    <rect width="36" height="36" rx="8" fill="#152033" stroke="#2c405c" stroke-width="1"/>
+    <circle cx="17" cy="18" r="8.5" fill="none" stroke="#5eead4" stroke-width="2.25" stroke-dasharray="40 14" stroke-linecap="round" transform="rotate(-35 17 18)"/>
+    <path d="M24.5 24.5 L30 30" stroke="#5eead4" stroke-width="2.25" stroke-linecap="round"/>
+    <circle class="pulse" cx="27.5" cy="11.5" r="2" fill="#5eead4"/>
+  </g>
+
+  <text class="sans rise1" x="92" y="68" fill="url(#title)" font-size="34" font-weight="700" letter-spacing="-0.03em">opencode-cursor</text>
+  <text class="mono rise2" x="92" y="98" fill="#a8b8cc" font-size="15">Cursor models in OpenCode — direct API, native OAuth</text>
+  <text class="mono rise3" x="92" y="122" fill="#6b7c94" font-size="12">no agent binary  ·  live catalog  ·  agent-grade streams</text>
+
+  <g transform="translate(690, 40)" aria-hidden="true">
+    <text class="mono" x="0" y="0" fill="#6b7c94" font-size="10">latency</text>
+    <rect x="0" y="42" width="10" height="22" rx="2" fill="#243249"/>
+    <rect x="16" y="32" width="10" height="32" rx="2" fill="#243249"/>
+    <rect class="rise1" x="32" y="22" width="10" height="42" rx="2" fill="url(#bar)" opacity="0.7"/>
+    <rect class="rise2" x="48" y="12" width="10" height="52" rx="2" fill="url(#bar)" opacity="0.9"/>
+    <rect class="rise3" x="64" y="6" width="10" height="58" rx="2" fill="url(#bar)"/>
+    <text class="mono" x="0" y="78" fill="#5eead4" font-size="11">-44% TTFB</text>
+  </g>
+
+  <rect class="sweep" x="40" y="139" width="748" height="2" fill="#3dd6c6" opacity="0.35"/>
+  <g clip-path="url(#rc)"><rect class="scan" x="-110" y="138" width="140" height="4" fill="url(#scan_g)"/></g>
+
+  <text class="mono" x="40" y="162" fill="#8fa3bf" font-size="12">oauth -&gt; proxy -&gt; cursor api · thinking · tools · no hangs</text>
+  <rect class="blink" x="478" y="151" width="7" height="13" fill="#5eead4"/>
+</svg>
