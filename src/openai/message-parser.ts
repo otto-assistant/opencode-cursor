@@ -7,6 +7,14 @@ import type {
 } from "./types.js";
 import { textContent } from "./types.js";
 
+/** Extract the real workspace root from OpenCode's system prompt. */
+export function extractWorkspaceRoot(systemPrompt: string): string | undefined {
+  return (
+    systemPrompt.match(/Working directory:\s*(\S+)/i)?.[1] ??
+    systemPrompt.match(/Workspace root folder:\s*(\S+)/i)?.[1]
+  );
+}
+
 /**
  * Parse OpenAI chat messages into Cursor request inputs.
  *

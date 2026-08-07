@@ -1,6 +1,9 @@
 /**
  * Truncate oversized tool output and build post-tool continuation prompts.
  */
+import { fromBinary, toBinary } from "@bufbuild/protobuf";
+import { ConversationStateStructureSchema } from "../proto/agent_pb.js";
+
 export interface ToolResultContent {
   content: string;
 }
@@ -14,6 +17,21 @@ const MCP_RESULT_HEAD_CHARS = Number(
 const MCP_RESULT_TAIL_CHARS = Number(
   process.env.OPENCODE_CURSOR_MCP_RESULT_TAIL_CHARS ?? 6_000,
 );
+
+/** Drop unresolved pending tool calls from a checkpoint after user interrupt. */
+export function sanitizeCheckpointAfterInterrupt(
+  checkpoint: Uint8Array | null,
+): Uint8Array | null {
+  if (!checkpoint) return null;
+  try {
+    const state = fromBinary(ConversationStateStructureSchema, checkpoint);
+    if (!state.pendingToolCalls.length) return checkpoint;
+    state.pendingToolCalls = [];
+    return toBinary(ConversationStateStructureSchema, state);
+  } catch {
+    return checkpoint;
+  }
+}
 
 /**
  * Truncate oversized tool output for Cursor mcpResult / continuation prompts.

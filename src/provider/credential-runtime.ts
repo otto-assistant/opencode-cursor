@@ -3,8 +3,8 @@ import { RefreshTokenInvalidError } from "../auth.js";
 import {
   createAccessTokenProvider,
   ensureValidAccessToken,
+  isCursorOAuthCredential,
 } from "../auth/credential-manager.js";
-import { isCursorOAuthCredential } from "../auth/types.js";
 import {
   getCursorModels,
   LOGIN_PLACEHOLDER_MODELS,

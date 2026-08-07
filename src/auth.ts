@@ -1,5 +1,3 @@
-import { generatePKCE } from "./pkce.js";
-
 const CURSOR_LOGIN_URL = "https://cursor.com/loginDeepControl";
 const CURSOR_POLL_URL = "https://api2.cursor.sh/auth/poll";
 const CURSOR_REFRESH_URL =
@@ -10,6 +8,23 @@ const CURSOR_REFRESH_URL =
 const POLL_REQUEST_TIMEOUT_MS = 30_000;
 /** Network timeout for the token refresh exchange. */
 const REFRESH_REQUEST_TIMEOUT_MS = 30_000;
+
+export async function generatePKCE(): Promise<{
+  verifier: string;
+  challenge: string;
+}> {
+  const verifierBytes = new Uint8Array(96);
+  crypto.getRandomValues(verifierBytes);
+  const verifier = Buffer.from(verifierBytes).toString("base64url");
+  const hashBuffer = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(verifier),
+  );
+  return {
+    verifier,
+    challenge: Buffer.from(hashBuffer).toString("base64url"),
+  };
+}
 
 export interface CursorAuthParams {
   verifier: string;

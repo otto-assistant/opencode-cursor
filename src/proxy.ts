@@ -74,10 +74,12 @@ import {
   type McpToolDefinition,
 } from "./proto/agent_pb.js";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join as pathJoin, resolve as pathResolve } from "node:path";
 import { Mutex, isAbortError } from "./promise-queue.js";
+import {
+  BRIDGE_PATH,
+  CURSOR_API_URL,
+  callCursorUnaryRpc,
+} from "./cursor-rpc.js";
 import {
   type ChatCompletionRequest,
   type ExtractedImage,
@@ -86,7 +88,10 @@ import {
   shouldBlockTool,
 } from "./openai/types.js";
 import { extractImagesFromContent } from "./openai/images.js";
-import { parseMessages } from "./openai/message-parser.js";
+import {
+  extractWorkspaceRoot,
+  parseMessages,
+} from "./openai/message-parser.js";
 import {
   buildInterruptSteerUserText,
   extractAnchoredSummary,
@@ -98,10 +103,9 @@ import {
 } from "./openai/request-classifier.js";
 import {
   buildPostToolBridgeLossContinuation,
+  sanitizeCheckpointAfterInterrupt,
   truncateToolResultForCursor,
 } from "./openai/tool-results.js";
-import { sanitizeCheckpointAfterInterrupt } from "./openai/checkpoint.js";
-import { extractWorkspaceRoot } from "./openai/workspace.js";
 import {
   deriveBridgeKey,
   deriveConversationKey,
@@ -119,6 +123,7 @@ import {
 
 // Re-export pure helpers so existing tests can import from ./proxy
 export {
+  callCursorUnaryRpc,
   extractImagesFromContent,
   parseMessages,
   isTitleGenerationRequest,
@@ -133,9 +138,7 @@ export {
   buildPostToolBridgeLossContinuation,
 };
 
-const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
-const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
@@ -316,14 +319,12 @@ function isProxyUnderPressure(): boolean {
     activeBridges.size >= PRESSURE_ACTIVE_BRIDGES_THRESHOLD
   );
 }
-
 function shouldRejectByAdmissionControl(): boolean {
   return (
     activeRequestCount > ADMISSION_MAX_ACTIVE_REQUESTS ||
     activeBridges.size >= ADMISSION_MAX_ACTIVE_BRIDGES
   );
 }
-
 function setActiveBridge(bridgeKey: string, active: ActiveBridge): boolean {
   if (activeBridges.size >= MAX_ACTIVE_BRIDGES && !activeBridges.has(bridgeKey)) {
     proxyTelemetry.capRejects += 1;
@@ -520,10 +521,6 @@ interface SpawnBridgeOptions {
   accessToken: string;
   rpcPath: string;
   url?: string;
-  /** When true, use application/proto for unary RPCs instead of Connect streaming. */
-  unary?: boolean;
-  contentType?: "application/proto" | "application/json";
-  connectProtocolVersion?: "1";
 }
 
 function spawnBridge(options: SpawnBridgeOptions): {
@@ -546,9 +543,6 @@ function spawnBridge(options: SpawnBridgeOptions): {
     accessToken: options.accessToken,
     url: options.url ?? CURSOR_API_URL,
     path: options.rpcPath,
-    unary: options.unary ?? false,
-    contentType: options.contentType,
-    connectProtocolVersion: options.connectProtocolVersion,
   });
   proc.stdin.write(lpEncode(new TextEncoder().encode(config)));
 
@@ -616,61 +610,6 @@ function spawnBridge(options: SpawnBridgeOptions): {
   };
 }
 
-interface CursorUnaryRpcOptions {
-  accessToken: string;
-  rpcPath: string;
-  requestBody: Uint8Array;
-  url?: string;
-  timeoutMs?: number;
-  contentType?: "application/proto" | "application/json";
-  connectProtocolVersion?: "1";
-}
-
-export async function callCursorUnaryRpc(
-  options: CursorUnaryRpcOptions,
- ): Promise<{ body: Uint8Array; exitCode: number; timedOut: boolean }> {
-  const bridge = spawnBridge({
-    accessToken: options.accessToken,
-    rpcPath: options.rpcPath,
-    url: options.url,
-    unary: true,
-    contentType: options.contentType,
-    connectProtocolVersion: options.connectProtocolVersion,
-  });
-  const chunks: Buffer[] = [];
-  const { promise, resolve } = Promise.withResolvers<{
-    body: Uint8Array;
-    exitCode: number;
-    timedOut: boolean;
-  }>();
-  let timedOut = false;
-  const timeoutMs = options.timeoutMs ?? 5_000;
-  const timeout = timeoutMs > 0
-    ? setTimeout(() => {
-        timedOut = true;
-        try { bridge.proc.kill(); } catch {}
-      }, timeoutMs)
-    : undefined;
-
-  bridge.onData((chunk) => {
-    chunks.push(Buffer.from(chunk));
-  });
-  bridge.onClose((exitCode) => {
-    if (timeout) clearTimeout(timeout);
-    resolve({
-      body: Buffer.concat(chunks),
-      exitCode,
-      timedOut,
-    });
-  });
-
-  // Unary: send raw protobuf body (no Connect framing)
-  bridge.write(options.requestBody);
-  bridge.end();
-
-  return promise;
-}
-
 let proxyServer: ReturnType<typeof Bun.serve> | undefined;
 let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
@@ -710,7 +649,6 @@ function isAddrInUseError(err: unknown): boolean {
     (typeof message === "string" && /eaddrinuse|address already in use|in use/i.test(message))
   );
 }
-
 async function isSharedProxyHealthy(): Promise<boolean> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SHARED_PROXY_HEALTH_TIMEOUT_MS);
@@ -853,9 +791,8 @@ export async function startProxy(
               data: buildOpenAIModelList(proxyModels),
             }),
             { headers: { "Content-Type": "application/json" } },
-          );
-        }
-
+  );
+}
         if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
           let release: (() => void) | undefined;
           try {
@@ -982,22 +919,6 @@ export async function startProxy(
 
   maintenanceTimer = setInterval(runMaintenanceSweep, MAINTENANCE_INTERVAL_MS);
 
-  // Hydrate the title-gen model from the disk cache. When the cache is fresh
-  // we skip the background probe entirely — the first title-gen request then
-  // resolves instantly instead of racing a slow Zen probe. Only fall back to
-  // background discovery when there is no usable cached model.
-  if (!hydrateTitleGenModelFromDisk()) {
-    // Kick off background discovery of Zen free model for title-gen.
-    // First title-gen request will await the result if not yet ready.
-    discoverZenFreeModel().then((model) => {
-      if (model) {
-        log.info(`[proxy] title-gen ready: using ${model}`);
-      } else {
-        log.warn(`[proxy] title-gen: no free model discovered at startup`);
-      }
-    }).catch(() => {});
-  }
-
   proxyPort = proxyServer.port;
   clearSharedProxyMonitor();
   if (!proxyPort) throw new Error("Failed to bind proxy to a port");
@@ -1018,8 +939,6 @@ export function resolveProxyModelId(
 
 export function stopProxy(): void {
   clearSharedProxyMonitor();
-  resolvedTitleGenModel = undefined;
-  lastDiscoveryMs = 0;
   if (maintenanceTimer) {
     clearInterval(maintenanceTimer);
     maintenanceTimer = undefined;
@@ -1049,118 +968,25 @@ export function stopProxy(): void {
   proxyTelemetry.lastSnapshotMs = 0;
 }
 
-/** Handle title-gen by calling OpenCode Zen's free API directly.
- *  Bypasses the Cursor bridge entirely. Uses auto-discovered free model
- *  (or explicit override via OPENCODE_CURSOR_TITLE_GEN_MODEL). */
+/** Handle title-gen through the explicitly configured OpenCode Zen model. */
 async function handleTitleGenViaZen(
   modelId: string,
   body: ChatCompletionRequest,
 ): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
-
   try {
-    // Build a minimal OpenAI-compatible request for Zen
-    const zenBody = {
-      model: modelId,
-      stream: true,
-      messages: body.messages.map((m) => ({
-        role: m.role,
-        content: typeof m.content === "string"
-          ? m.content
-          : m.content
-            ?.filter((p) => p.type === "text" && p.text)
-            .map((p) => p.text)
-            .join("\n") ?? "",
-      })),
-    };
-
     const zenResponse = await fetch(`${ZEN_BASE_URL}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(zenBody),
+      body: JSON.stringify({ ...body, model: modelId, stream: true }),
       signal: AbortSignal.timeout(30_000),
     });
-
     if (!zenResponse.ok) {
       log.warn(`[proxy] title-gen Zen returned ${zenResponse.status}, falling back to empty`);
       return buildEmptyTitleResponse(completionId, created, modelId);
     }
-
-    // Proxy the SSE stream from Zen, translating chunk format
-    const stream = new ReadableStream({
-      start(controller) {
-        const encoder = new TextEncoder();
-        const reader = zenResponse.body?.getReader();
-        if (!reader) {
-          controller.close();
-          return;
-        }
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        (async () => {
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-
-              buffer += decoder.decode(value, { stream: true });
-              const lines = buffer.split("\n");
-              buffer = lines.pop() ?? "";
-
-              for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed || !trimmed.startsWith("data: ")) continue;
-                const data = trimmed.slice(6);
-                if (data === "[DONE]") {
-                  controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                  continue;
-                }
-                try {
-                  const chunk = JSON.parse(data);
-                  // Normalize chunk format for OpenCode.
-                  // Strip reasoning/reasoning_details from delta to prevent
-                  // reasoning tokens from leaking into Discord thread titles.
-                  const normalized = {
-                    id: completionId,
-                    object: "chat.completion.chunk",
-                    created,
-                    model: modelId,
-                    choices: (chunk.choices ?? []).map(
-                      (c: { index?: number; delta?: Record<string, unknown>; finish_reason?: string }) => {
-                        const { reasoning, reasoning_details, ...cleanDelta } = c.delta ?? {};
-                        return {
-                          index: c.index ?? 0,
-                          delta: cleanDelta,
-                          finish_reason: c.finish_reason ?? null,
-                        };
-                      },
-                    ),
-                  };
-                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(normalized)}\n\n`));
-                } catch {
-                  // Skip unparseable chunks
-                }
-              }
-            }
-          } catch (err) {
-            log.warn(`[proxy] title-gen Zen stream error: ${err}`);
-          } finally {
-            reader.cancel().catch(() => {});
-            try { controller.close(); } catch {}
-          }
-        })();
-      },
-    });
-
-    return new Response(stream, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      },
-    });
+    return new Response(zenResponse.body, { headers: SSE_HEADERS });
   } catch (err) {
     log.warn(`[proxy] title-gen Zen failed: ${err}, returning empty`);
     return buildEmptyTitleResponse(completionId, created, modelId);
@@ -1199,6 +1025,19 @@ async function handleChatCompletion(
   selectedModel?: CursorModelSelection,
   abortSignal?: AbortSignal,
 ): Promise<Response> {
+  if (body.stream === false) {
+    release();
+    return new Response(
+      JSON.stringify({
+        error: {
+          message: "streaming required",
+          type: "invalid_request_error",
+        },
+      }),
+      { status: 400, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
   const parsed = parseMessages(body.messages);
   const systemPrompt = parsed.systemPrompt;
   // Treat whitespace-only user payloads as empty — Cursor models otherwise
@@ -1233,16 +1072,11 @@ async function handleChatCompletion(
     );
   }
 
-  // Title-generation requests are stateless one-shot calls — they don't need
-  // conversation state, checkpoints, MCP tools, or mutexes.
-  // Route to OpenCode Zen auto-discovered free model instead of Cursor to
-  // avoid resource_exhausted errors on premium models.
-  const isTitleGen = isTitleGenerationRequest(body.messages);
-  if (isTitleGen) {
-    const titleModelId = await resolveTitleGenModel();
+  if (isTitleGenerationRequest(body.messages)) {
+    const titleModelId =
+      process.env.OPENCODE_CURSOR_TITLE_GEN_MODEL?.trim();
     release();
     if (!titleModelId) {
-      log.warn("[proxy] title-gen: no Zen model available, returning empty title");
       return buildEmptyTitleResponse(
         `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`,
         Math.floor(Date.now() / 1000),
@@ -1462,9 +1296,6 @@ async function handleChatCompletion(
   );
   payload.mcpTools = mcpTools;
 
-  if (body.stream === false) {
-    return handleNonStreamingResponse(payload, accessToken, modelId, convKey, release, workspaceRoot, isSummary);
-  }
   const retryCtx: RetryContext = {
     stored,
     accessToken,
@@ -1487,7 +1318,6 @@ async function handleChatCompletion(
     abortSignal,
   );
 }
-
 /** Convert OpenAI tool definitions to Cursor's MCP tool protobuf format. */
 function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
   return tools.map((t) => {
@@ -2343,216 +2173,7 @@ function postToolPreOutputStallTimeoutMs(): number {
     process.env.OPENCODE_CURSOR_POST_TOOL_PRE_OUTPUT_STALL_TIMEOUT_MS ?? 90_000,
   );
 }
-/** Override model for title-gen requests. When set, skips auto-discovery
- *  and uses this model directly. When unset (default), the proxy discovers
- *  a working free model from OpenCode Zen at startup. */
-const TITLE_GEN_MODEL_OVERRIDE = process.env.OPENCODE_CURSOR_TITLE_GEN_MODEL ?? "";
-
 const ZEN_BASE_URL = process.env.OPENCODE_ZEN_BASE_URL ?? "https://opencode.ai/zen/v1";
-
-/** Cached result of free-model discovery. Undefined = not yet discovered. */
-let resolvedTitleGenModel: string | undefined;
-/** Timestamp (ms) of the last successful discovery. */
-let lastDiscoveryMs = 0;
-/** Re-discover after this many milliseconds (8 hours). */
-const DISCOVERY_TTL_MS = 8 * 60 * 60 * 1000;
-/** Minimum pause between discovery attempts to avoid hammering on repeated failures. */
-const DISCOVERY_COOLDOWN_MS = 60_000;
-let lastDiscoveryAttemptMs = 0;
-
-/** Models known to be fast and good at title-gen. Probed first to speed up
- *  discovery. This list is purely advisory — if none respond, the full scan
- *  tests every model on Zen. */
-const ZEN_FAST_TRACK_MODELS = [
-  "minimax-m2.5-free",
-  "nemotron-3-super-free",
-  "big-pickle",
-];
-
-/** Disk cache for the discovered title-gen model. In-memory discovery is lost
- *  on every process restart (deploys/reboots), forcing a fresh ~2-3s probe on
- *  the first chat afterwards. Persisting the model id + timestamp skips that
- *  probe while keeping the same 8h freshness window. */
-const TITLE_GEN_CACHE_PATH = process.env.OPENCODE_CURSOR_TITLE_GEN_CACHE_PATH ??
-  pathJoin(homedir(), ".cache", "opencode-cursor", "title-gen-model.json");
-
-function loadTitleGenModelCache(): { model: string; ts: number } | undefined {
-  try {
-    const raw = readFileSync(TITLE_GEN_CACHE_PATH, "utf8");
-    const data = JSON.parse(raw) as { model?: unknown; ts?: unknown };
-    if (typeof data.model === "string" && data.model && typeof data.ts === "number") {
-      return { model: data.model, ts: data.ts };
-    }
-  } catch {
-    // missing/corrupt cache — treat as empty
-  }
-  return undefined;
-}
-
-function saveTitleGenModelCache(model: string): void {
-  try {
-    mkdirSync(dirname(TITLE_GEN_CACHE_PATH), { recursive: true });
-    writeFileSync(
-      TITLE_GEN_CACHE_PATH,
-      JSON.stringify({ model, ts: Date.now() }),
-      "utf8",
-    );
-  } catch {
-    // cache is best-effort
-  }
-}
-
-/** Probe a single Zen model with a tiny completion request (no auth).
- *  Returns the model ID if it responds with HTTP 200 and non-empty content,
- *  or undefined if it fails (401, timeout, error, etc.). */
-async function probeZenModel(modelId: string): Promise<string | undefined> {
-  try {
-    const start = Date.now();
-    const resp = await fetch(`${ZEN_BASE_URL}/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: modelId,
-        stream: false,
-        messages: [
-          { role: "system", content: "Reply with exactly: ok" },
-          { role: "user", content: "test" },
-        ],
-      }),
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (!resp.ok) return undefined;
-    const json = await resp.json() as { choices?: Array<{ message?: { content?: string } }> };
-    const content = json.choices?.[0]?.message?.content?.trim();
-    const ms = Date.now() - start;
-    if (!content) return undefined;
-    log.info(`[proxy] title-gen probe: ✅ ${modelId} responded (${ms}ms)`);
-    return modelId;
-  } catch {
-    return undefined;
-  }
-}
-
-/** Probe model IDs concurrently; return the first success (true race). */
-async function firstSuccessfulProbe(
-  modelIds: string[],
-): Promise<string | undefined> {
-  if (modelIds.length === 0) return undefined;
-  return new Promise((resolve) => {
-    let pending = modelIds.length;
-    let settled = false;
-    for (const id of modelIds) {
-      void probeZenModel(id).then((result) => {
-        if (settled) return;
-        if (result) {
-          settled = true;
-          resolve(result);
-          return;
-        }
-        pending -= 1;
-        if (pending === 0) resolve(undefined);
-      });
-    }
-  });
-}
-
-/** Discover a working free model from Zen by probing all available models
- *  without authentication. The first model that responds with valid content
- *  is selected — no naming convention heuristics.
- *
- *  Strategy:
- *  1. Fast-track: probe known-good models first (quick, 1-3 requests).
- *  2. Full scan: fetch /v1/models, probe ALL models concurrently.
- *
- *  Returns undefined if nothing works. */
-async function discoverZenFreeModel(): Promise<string | undefined> {
-  const now = Date.now();
-  if (now - lastDiscoveryAttemptMs < DISCOVERY_COOLDOWN_MS) {
-    return resolvedTitleGenModel;
-  }
-  lastDiscoveryAttemptMs = now;
-
-  // Phase 1: Fast-track — probe known good models
-  log.info(`[proxy] title-gen discovery: fast-track probing ${ZEN_FAST_TRACK_MODELS.join(", ")}`);
-  const fastResult = await firstSuccessfulProbe(ZEN_FAST_TRACK_MODELS);
-  if (fastResult) {
-    resolvedTitleGenModel = fastResult;
-    lastDiscoveryMs = Date.now();
-    saveTitleGenModelCache(fastResult);
-    return fastResult;
-  }
-
-  // Phase 2: Full scan — fetch model list, probe everything
-  try {
-    log.info(`[proxy] title-gen discovery: fast-track failed, scanning all models`);
-    const resp = await fetch(`${ZEN_BASE_URL}/models`, {
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!resp.ok) {
-      log.warn(`[proxy] title-gen discovery: /models returned ${resp.status}`);
-      return resolvedTitleGenModel;
-    }
-    const json = await resp.json() as { data?: Array<{ id: string }> };
-    const allModels = (json.data ?? []).map((m) => m.id);
-
-    // Skip models already tried in fast-track
-    const remaining = allModels.filter((id) => !ZEN_FAST_TRACK_MODELS.includes(id));
-    log.info(`[proxy] title-gen discovery: probing ${remaining.length} remaining models (parallel)`);
-
-    const scanResult = await firstSuccessfulProbe(remaining);
-    if (scanResult) {
-      resolvedTitleGenModel = scanResult;
-      lastDiscoveryMs = Date.now();
-      saveTitleGenModelCache(scanResult);
-      return scanResult;
-    }
-
-    log.warn(`[proxy] title-gen discovery: all ${allModels.length} models failed probe`);
-    return resolvedTitleGenModel;
-  } catch (err) {
-    log.warn(`[proxy] title-gen discovery error: ${err}`);
-    return resolvedTitleGenModel;
-  }
-}
-
-/** Restore the title-gen model from the disk cache if it is still fresh.
- *  Returns the restored model id or undefined. Idempotent — does not re-read
- *  once `resolvedTitleGenModel` is set. */
-function hydrateTitleGenModelFromDisk(): string | undefined {
-  if (TITLE_GEN_MODEL_OVERRIDE) return TITLE_GEN_MODEL_OVERRIDE;
-  if (resolvedTitleGenModel) return resolvedTitleGenModel;
-  const disk = loadTitleGenModelCache();
-  if (disk && Date.now() - disk.ts < DISCOVERY_TTL_MS) {
-    resolvedTitleGenModel = disk.model;
-    lastDiscoveryMs = disk.ts;
-    log.info(`[proxy] title-gen model restored from disk cache: ${disk.model}`);
-    return resolvedTitleGenModel;
-  }
-  return undefined;
-}
-
-/** Get the title-gen model to use. Resolves from override, cached discovery
- *  (memory, then disk), or triggers a fresh discovery if the cache is stale. */
-async function resolveTitleGenModel(): Promise<string | undefined> {
-  if (TITLE_GEN_MODEL_OVERRIDE) return TITLE_GEN_MODEL_OVERRIDE;
-
-  const now = Date.now();
-  if (resolvedTitleGenModel && now - lastDiscoveryMs < DISCOVERY_TTL_MS) {
-    return resolvedTitleGenModel;
-  }
-
-  const fromDisk = hydrateTitleGenModelFromDisk();
-  if (fromDisk) return fromDisk;
-
-  const discovered = await discoverZenFreeModel();
-  if (discovered) {
-    saveTitleGenModelCache(discovered);
-    return discovered;
-  }
-
-  log.warn("[proxy] title-gen: no free model discovered");
-  return undefined;
-}
 
 /** Create an SSE streaming Response that reads from a live bridge.
  *  When retryCtx is provided, automatically retries on "Blob not found" errors
@@ -3425,7 +3046,6 @@ function handleStreamingResponse(
     abortSignal,
   );
 }
-
 /** Resume a paused bridge by sending MCP results and continuing to stream. */
 function handleToolResultResume(
   active: ActiveBridge,
@@ -3523,263 +3143,4 @@ function handleToolResultResume(
     false,
     abortSignal,
   );
-}
-
-async function handleNonStreamingResponse(
-  payload: CursorRequestPayload,
-  accessToken: string,
-  modelId: string,
-  convKey: string,
-  release: () => void,
-  workspaceRoot?: string,
-  toolsDisabled: boolean = false,
-): Promise<Response> {
-  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
-  const created = Math.floor(Date.now() / 1000);
-  try {
-    const { text, usage } = await collectFullResponse(
-      payload,
-      accessToken,
-      convKey,
-      workspaceRoot,
-      toolsDisabled,
-    );
-    return new Response(
-      JSON.stringify({
-        id: completionId,
-        object: "chat.completion",
-        created,
-        model: modelId,
-        choices: [
-          {
-            index: 0,
-            message: { role: "assistant", content: text },
-            finish_reason: "stop",
-          },
-        ],
-        usage,
-      }),
-      { headers: { "Content-Type": "application/json" } },
-    );
-  } finally {
-    release();
-  }
-}
-
-interface CollectedResponse {
-  text: string;
-  usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
-}
-
-const AGENT_PROBE_TIMEOUT_MS = 30_000;
-const AGENT_PROBE_SYSTEM_PROMPT = "You are a helpful assistant.";
-const AGENT_PROBE_USER_TEXT = "Say hi";
-
-/** Minimal agent Run probe — true when Cursor accepts the model for agent requests. */
-export async function probeCursorAgentSelection(
-  accessToken: string,
-  selection: CursorModelSelection,
-): Promise<boolean> {
-  const payload = buildCursorRequest(
-    selection,
-    AGENT_PROBE_SYSTEM_PROMPT,
-    AGENT_PROBE_USER_TEXT,
-    crypto.randomUUID(),
-    null,
-  );
-
-  return new Promise<boolean>((resolve) => {
-    let settled = false;
-    let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
-
-    const finish = (ok: boolean, reason: string) => {
-      if (settled) return;
-      settled = true;
-      if (process.env.OPENCODE_CURSOR_DEBUG_PROBE === "1") {
-        console.log(`[probe] finish ok=${ok} reason=${reason} model=${selection.publicId}`);
-      }
-      clearTimeout(timer);
-      if (heartbeatTimer) clearInterval(heartbeatTimer);
-      bridge.kill();
-      resolve(ok);
-    };
-
-    const timer = setTimeout(() => finish(false, "timeout"), AGENT_PROBE_TIMEOUT_MS);
-
-    const bridge: ReturnType<typeof spawnBridge> | BridgeHandle = bridgePool
-      ? bridgePool.acquire({
-          accessToken,
-          rpcPath: "/agent.v1.AgentService/Run",
-          url: CURSOR_API_URL,
-        })
-      : spawnBridge({
-          accessToken,
-          rpcPath: "/agent.v1.AgentService/Run",
-        });
-
-    const blobStore = payload.blobStore;
-    const state: StreamState = {
-      toolCallIndex: 0,
-      pendingExecs: [],
-      outputTokens: 0,
-      promptTokens: 0,
-      fallbackPromptTokens: 0,
-    };
-
-    bridge.onData(
-      createConnectFrameParser(
-        (messageBytes) => {
-          try {
-            const serverMessage = fromBinary(
-              AgentServerMessageSchema,
-              messageBytes,
-            );
-            processServerMessage(
-              serverMessage,
-              blobStore,
-              payload.mcpTools,
-              (data) => bridge.write(data),
-              state,
-              (text) => {
-                if (text.trim()) {
-                  finish(true, "text");
-                }
-              },
-              () => {},
-              () => {},
-              undefined,
-            );
-          } catch {
-            // Ignore unparseable frames during probe.
-          }
-        },
-        (endStreamBytes) => {
-          const err = parseConnectEndStream(endStreamBytes);
-          if (err) {
-            finish(false, "connect-error");
-            return;
-          }
-          if (state.outputTokens > 0) {
-            finish(true, "tokens");
-          }
-        },
-      ),
-    );
-
-    bridge.onClose((code) => {
-      if (!settled) {
-        if (state.outputTokens > 0) {
-          finish(true, "tokens-on-close");
-        } else {
-          finish(false, `close:${code}`);
-        }
-      }
-    });
-
-    bridge.write(frameConnectMessage(payload.requestBytes));
-    heartbeatTimer = setInterval(
-      () => bridge.write(makeHeartbeatBytes()),
-      5_000,
-    );
-  });
-}
-
-async function collectFullResponse(
-  payload: CursorRequestPayload,
-  accessToken: string,
-  convKey: string,
-  workspaceRoot?: string,
-  toolsDisabled: boolean = false,
-): Promise<CollectedResponse> {
-  const { promise, resolve } = Promise.withResolvers<CollectedResponse>();
-  let fullText = "";
-
-  const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
-
-  const state: StreamState = {
-    toolCallIndex: 0,
-    pendingExecs: [],
-    outputTokens: 0,
-    promptTokens: 0,
-    fallbackPromptTokens: conversationStates.get(convKey)?.lastPromptTokens ?? 0,
-  };
-  const tagFilter = createThinkingTagFilter();
-
-  bridge.onData(createConnectFrameParser(
-    (messageBytes) => {
-      try {
-        const serverMessage = fromBinary(
-          AgentServerMessageSchema,
-          messageBytes,
-        );
-        processServerMessage(
-          serverMessage,
-          payload.blobStore,
-          payload.mcpTools,
-          (data) => bridge.write(data),
-          state,
-          (text, isThinking) => {
-            if (isThinking) return;
-            const { content } = tagFilter.process(text);
-            fullText += content;
-          },
-          (exec) => {
-            // Non-streaming cannot park a tool bridge — fail closed instead of hanging.
-            clearInterval(heartbeatTimer);
-            bridge.kill();
-            resolve({
-              text:
-                fullText +
-                `\n[Error: tool call "${exec.toolName}" requires streaming mode]`,
-              usage: computeUsage(state),
-            });
-          },
-          (checkpointBytes) => {
-            const stored = conversationStates.get(convKey);
-            if (stored) {
-              stored.checkpoint = checkpointBytes;
-              for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-              enforceConversationBlobBudget(stored);
-              stored.lastAccessMs = Date.now();
-              // processServerMessage already updated state.promptTokens.
-              rememberConversationTokens(convKey, state.promptTokens);
-            }
-          },
-          workspaceRoot,
-          toolsDisabled,
-        );
-      } catch {
-        // Skip
-      }
-    },
-    (endStreamBytes) => {
-      const endError = parseConnectEndStream(endStreamBytes);
-      if (endError) {
-        fullText += `\n[Error: ${endError.message}]`;
-      }
-    },
-  ));
-
-  bridge.onClose(() => {
-    clearInterval(heartbeatTimer);
-    const stored = conversationStates.get(convKey);
-    if (stored) {
-      for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-      enforceConversationBlobBudget(stored);
-      stored.lastAccessMs = Date.now();
-    }
-    const flushed = tagFilter.flush();
-    fullText += flushed.content;
-
-    const usage = computeUsage(state);
-    if (usage.prompt_tokens > 0) {
-      rememberConversationTokens(convKey, usage.prompt_tokens);
-    }
-    resolve({
-      text: fullText,
-      usage,
-    });
-  });
-
-  return promise;
 }

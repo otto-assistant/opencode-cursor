@@ -21,8 +21,10 @@ export async function runExtractedHelperUnitTests(): Promise<void> {
     buildPostToolBridgeLossContinuation,
   } = await import("../../src/proxy");
   const { estimateModelCost } = await import("../../src/provider/pricing");
-  const { withTimeout } = await import("../../src/shared/timeout");
-  const { isCursorOAuthCredential } = await import("../../src/auth/types");
+  const { withTimeout } = await import("../../src/provider/config-models");
+  const { isCursorOAuthCredential } = await import(
+    "../../src/auth/credential-manager"
+  );
 
   // Regeneration path must reattach images from the pending user content
   // (regression: content was cleared before extractImagesFromContent ran).

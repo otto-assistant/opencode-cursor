@@ -1,4 +1,5 @@
 import type {
+  CursorModel,
   CursorModelParameter,
   CursorModelSelection,
 } from "../model-selection.js";
@@ -6,8 +7,6 @@ import {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MAX_TOKENS,
 } from "../shared/constants.js";
-import type { CursorModel } from "./types.js";
-
 interface VariantDescriptor {
   key: string;
   idSuffixes: readonly string[];

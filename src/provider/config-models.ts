@@ -11,7 +11,23 @@ import {
   type CursorModel,
 } from "../models.js";
 import { log } from "../shared/log.js";
-import { withTimeout } from "../shared/timeout.js";
+
+/** Reject a promise if it does not settle within `ms` milliseconds. */
+export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("timeout")), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
 
 /**
  * Resolve the model list used to seed the static provider config. Prefers the

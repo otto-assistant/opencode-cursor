@@ -16,7 +16,7 @@ import { log } from "../shared/log.js";
 import {
   isCursorOAuthCredential,
   type CursorOAuthCredential,
-} from "./types.js";
+} from "./credential-manager.js";
 
 function getOpencodeAuthPath(): string {
   const base =

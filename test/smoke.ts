@@ -1251,13 +1251,14 @@ async function testArrayContentParsing(modules: TestModules) {
     }),
   });
 
-  if (res.status === 400) {
-    const body = await res.json();
-    if (body.error?.message?.includes("No user message")) {
-      throw new Error(
-        "Array content not normalized — plan mode messages lost",
-      );
-    }
+  const responseBody = await res.json();
+  if (
+    res.status !== 400 ||
+    responseBody.error?.message !== "streaming required"
+  ) {
+    throw new Error(
+      `Expected 400 streaming required, got ${res.status}: ${JSON.stringify(responseBody)}`,
+    );
   }
 
   modules.stopProxy();

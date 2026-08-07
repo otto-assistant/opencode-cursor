@@ -1,11 +1,11 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { callCursorUnaryRpc, probeCursorAgentSelection } from "../proxy.js";
+import { callCursorUnaryRpc } from "../cursor-rpc.js";
 import {
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
 } from "../proto/agent_pb.js";
 import { normalizeAvailableModels } from "./available-normalizer.js";
-import type { CursorModel } from "./types.js";
+import type { CursorModel } from "../model-selection.js";
 import { normalizeCursorModels } from "./usable-normalizer.js";
 
 const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
@@ -20,8 +20,6 @@ const ADDITIONAL_MODEL_NAMES = [
   "grok-4-fast-reasoning",
   "grok-4-0709",
 ] as const;
-
-const AGENT_PROBE_MODEL_IDS = new Set<string>(ADDITIONAL_MODEL_NAMES);
 
 async function fetchCursorAvailableModels(
   apiKey: string,
@@ -50,10 +48,7 @@ async function fetchCursorAvailableModels(
     const decoded = JSON.parse(new TextDecoder().decode(response.body)) as unknown;
     const record = asRecord(decoded);
     const models = Array.isArray(record?.models)
-      ? await filterAgentRunnableModels(
-          apiKey,
-          normalizeAvailableModels(record.models),
-        )
+      ? normalizeAvailableModels(record.models)
       : [];
     return models.length > 0 ? models : null;
   } catch {
@@ -104,28 +99,6 @@ export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
     return cachedModels;
   }
   return [];
-}
-
-async function filterAgentRunnableModels(
-  accessToken: string,
-  models: CursorModel[],
-): Promise<CursorModel[]> {
-  const probeTargets = models.filter((model) => AGENT_PROBE_MODEL_IDS.has(model.id));
-  if (probeTargets.length === 0) return models;
-
-  const probeResults = await Promise.all(
-    probeTargets.map(async (model) => ({
-      id: model.id,
-      runnable: await probeCursorAgentSelection(accessToken, model.defaultSelection),
-    })),
-  );
-  const runnableIds = new Set(
-    probeResults.filter((result) => result.runnable).map((result) => result.id),
-  );
-
-  return models.filter(
-    (model) => !AGENT_PROBE_MODEL_IDS.has(model.id) || runnableIds.has(model.id),
-  );
 }
 
 /** Invalidate the in-memory catalog (after login or account change). */

@@ -1,10 +1,11 @@
-import { literalCursorModelSelection } from "../model-selection.js";
+import {
+  literalCursorModelSelection,
+  type CursorModel,
+} from "../model-selection.js";
 import {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MAX_TOKENS,
 } from "../shared/constants.js";
-import type { CursorModel } from "./types.js";
-
 /**
  * Minimal catalog seeded while logged out. OpenCode removes providers that
  * have zero models from `provider.list()`, which hides Cursor in OpenChamber.
