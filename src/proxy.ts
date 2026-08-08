@@ -614,94 +614,22 @@ let proxyServer: ReturnType<typeof Bun.serve> | undefined;
 let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
 let proxyModels: Array<{ id: string; name: string }> = [];
-let sharedProxyMonitorTimer: ReturnType<typeof setInterval> | undefined;
-let sharedProxyMonitorRecovering = false;
 const DEFAULT_MODEL_ID = "default";
 
-const DEFAULT_PROXY_PORT = 8788;
-const SHARED_PROXY_HEALTH_TIMEOUT_MS = 750;
-const SHARED_PROXY_MONITOR_INTERVAL_MS = 5_000;
-
 /**
- * Fixed port the proxy binds to. OpenCode 1.15.x resolves the provider base
- * URL from static config, so the proxy must listen on a deterministic port
- * that matches that URL (a random port would leave the SDK unable to connect).
- * Override with OPENCODE_CURSOR_PROXY_PORT if 8788 is taken.
+ * Optional pinned listen port from OPENCODE_CURSOR_PROXY_PORT.
+ * When unset (the default), Bun binds an ephemeral OS port (0).
  */
-const CURSOR_PROXY_PORT: number = (() => {
+function preferredProxyPort(): number {
   const raw = process.env.OPENCODE_CURSOR_PROXY_PORT;
   const parsed = raw ? Number(raw) : NaN;
-  return Number.isInteger(parsed) && parsed > 0 && parsed < 65536
-    ? parsed
-    : DEFAULT_PROXY_PORT;
-})();
-
-export function getCursorProxyBaseUrl(): string {
-  return `http://localhost:${CURSOR_PROXY_PORT}/v1`;
+  return Number.isInteger(parsed) && parsed > 0 && parsed < 65536 ? parsed : 0;
 }
 
-function isAddrInUseError(err: unknown): boolean {
-  if (!err || typeof err !== "object") return false;
-  const code = (err as { code?: unknown }).code;
-  const message = (err as { message?: unknown }).message;
-  return (
-    code === "EADDRINUSE" ||
-    (typeof message === "string" && /eaddrinuse|address already in use|in use/i.test(message))
-  );
-}
-async function isSharedProxyHealthy(): Promise<boolean> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), SHARED_PROXY_HEALTH_TIMEOUT_MS);
-  try {
-    const res = await fetch(`${getCursorProxyBaseUrl()}/models`, {
-      signal: controller.signal,
-    });
-    if (!res.ok) return false;
-    const body = await res.json().catch(() => undefined);
-    return (
-      !!body &&
-      typeof body === "object" &&
-      (body as { object?: unknown }).object === "list" &&
-      Array.isArray((body as { data?: unknown }).data)
-    );
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function clearSharedProxyMonitor(): void {
-  if (!sharedProxyMonitorTimer) return;
-  clearInterval(sharedProxyMonitorTimer);
-  sharedProxyMonitorTimer = undefined;
-}
-
-function startSharedProxyMonitor(): void {
-  if (sharedProxyMonitorTimer) return;
-  sharedProxyMonitorTimer = setInterval(async () => {
-    if (sharedProxyMonitorRecovering || proxyServer) return;
-    if (await isSharedProxyHealthy()) return;
-
-    if (!proxyAccessTokenProvider) {
-      log.warn("[proxy] shared proxy disappeared, but no access token provider is configured");
-      return;
-    }
-
-    sharedProxyMonitorRecovering = true;
-    try {
-      log.warn(`[proxy] shared proxy on port ${CURSOR_PROXY_PORT} is unavailable; attempting to bind locally`);
-      await startProxy(proxyAccessTokenProvider, proxyModels);
-      if (proxyServer) {
-        clearSharedProxyMonitor();
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      log.warn(`[proxy] shared proxy recovery failed: ${message}`);
-    } finally {
-      sharedProxyMonitorRecovering = false;
-    }
-  }, SHARED_PROXY_MONITOR_INTERVAL_MS);
+/** OpenAI-compatible base URL for the currently listening proxy. */
+export function getCursorProxyBaseUrl(): string | undefined {
+  if (!proxyPort) return undefined;
+  return `http://localhost:${proxyPort}/v1`;
 }
 
 function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }>): Array<{
@@ -743,9 +671,9 @@ export async function startProxy(
     log.info(`[proxy] bridge pool started min=${BRIDGE_POOL_MIN_SIZE} max=${BRIDGE_POOL_MAX_SIZE}`);
   }
 
-  try {
-    proxyServer = Bun.serve({
-    port: CURSOR_PROXY_PORT,
+  const listenPort = preferredProxyPort();
+  proxyServer = Bun.serve({
+    port: listenPort,
     idleTimeout: 255, // max — Cursor responses can take 30s+
     async fetch(req) {
       const url = new URL(req.url);
@@ -889,39 +817,13 @@ export async function startProxy(
         runMaintenanceSweep();
       }
     },
-    });
-  } catch (err) {
-    if (isAddrInUseError(err)) {
-      if (!(await isSharedProxyHealthy())) {
-        proxyServer = undefined;
-        proxyPort = undefined;
-        throw new Error(
-          `Port ${CURSOR_PROXY_PORT} is already in use, but no healthy Cursor proxy responded on ${getCursorProxyBaseUrl()}/models`,
-          { cause: err },
-        );
-      }
-
-      // A sibling plugin instance (another OpenCode session for the same
-      // user) already serves the proxy on the shared fixed port. Reuse it
-      // only after verifying it responds like this proxy. Keep monitoring so
-      // this process can claim the fixed port if the sibling exits later.
-      proxyServer = undefined;
-      proxyPort = CURSOR_PROXY_PORT;
-      startSharedProxyMonitor();
-      log.warn(
-        `[proxy] port ${CURSOR_PROXY_PORT} already in use; reusing existing proxy`,
-      );
-      return proxyPort;
-    }
-    proxyServer = undefined;
-    throw err;
-  }
+  });
 
   maintenanceTimer = setInterval(runMaintenanceSweep, MAINTENANCE_INTERVAL_MS);
 
   proxyPort = proxyServer.port;
-  clearSharedProxyMonitor();
   if (!proxyPort) throw new Error("Failed to bind proxy to a port");
+  log.info(`[proxy] listening on http://localhost:${proxyPort}/v1`);
   return proxyPort;
 }
 
@@ -938,7 +840,6 @@ export function resolveProxyModelId(
 }
 
 export function stopProxy(): void {
-  clearSharedProxyMonitor();
   if (maintenanceTimer) {
     clearInterval(maintenanceTimer);
     maintenanceTimer = undefined;

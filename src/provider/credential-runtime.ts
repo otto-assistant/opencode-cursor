@@ -70,7 +70,7 @@ export async function loadCursorRuntime(
   onModels?.(models);
 
   // startProxy() is idempotent: if the proxy is already running it returns
-  // immediately. Fixed-port binding (see proxy.ts).
+  // immediately with the bound (ephemeral) port.
   const port = await startProxy(
     createAccessTokenProvider(getAuth, persist),
     models,

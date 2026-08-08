@@ -19,6 +19,7 @@ import { clearModelCache, resolveCursorModelSelection, type CursorModel } from "
 import { resolveConfigModels } from "./provider/config-models.js";
 import { loadCursorRuntime } from "./provider/credential-runtime.js";
 import { ensureCursorProviderConfig } from "./provider/provider-config.js";
+import { getCursorProxyBaseUrl, startProxy } from "./proxy.js";
 import {
   CURSOR_PROVIDER_ID,
   CURSOR_VARIANT_OPTION,
@@ -36,6 +37,22 @@ export const CursorAuthPlugin: Plugin = async (
     modelCatalog = models;
   };
 
+  /**
+   * Bind the local proxy early (ephemeral port) so the static provider
+   * `options.baseURL` OpenCode reads from config points at a live listener.
+   * Auth/token wiring is upgraded later by `loadCursorRuntime`.
+   */
+  async function ensureProxyForConfig(
+    models: CursorModel[],
+  ): Promise<string> {
+    const existing = getCursorProxyBaseUrl();
+    if (existing) return existing;
+    const port = await startProxy(async () => {
+      throw new Error("Cursor proxy is not authenticated yet");
+    }, models);
+    return `http://localhost:${port}/v1`;
+  }
+
   return {
     // Newer OpenCode releases build the model catalog from statically declared
     // `config.provider.<id>` entries. Seed a concrete `cursor` provider so it
@@ -43,7 +60,8 @@ export const CursorAuthPlugin: Plugin = async (
     async config(config) {
       const models = await resolveConfigModels();
       rememberModels(models);
-      ensureCursorProviderConfig(config, models);
+      const baseURL = await ensureProxyForConfig(models);
+      ensureCursorProviderConfig(config, models, baseURL);
     },
 
     "chat.headers": async (hookInput, output) => {

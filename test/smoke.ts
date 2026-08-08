@@ -28,6 +28,11 @@ import { runExtractedHelperUnitTests } from "./unit/extracted-helpers";
 
 async function testProxyStartStop(modules: TestModules) {
   console.log("[test] Starting proxy...");
+  assertEqual(
+    process.env.OPENCODE_CURSOR_PROXY_PORT,
+    undefined,
+    "Smoke suite must use an ephemeral proxy port by default",
+  );
   const port = await modules.startProxy(async () => "test-token");
   console.log(`[test] Proxy started on port ${port}`);
 
@@ -37,6 +42,11 @@ async function testProxyStartStop(modules: TestModules) {
   if (modules.getProxyPort() !== port) {
     throw new Error("getProxyPort() mismatch");
   }
+  assertEqual(
+    modules.getCursorProxyBaseUrl(),
+    `http://localhost:${port}/v1`,
+    "Expected getCursorProxyBaseUrl() to track the bound port",
+  );
 
   const modelsRes = await fetch(`http://localhost:${port}/v1/models`);
   if (!modelsRes.ok) {
@@ -1071,6 +1081,17 @@ async function testConfigHookSeedsProvider(
   );
   assertEqual(cursor.npm, "@ai-sdk/openai-compatible", "Expected seeded npm");
   assert(cursor.options?.baseURL, "Expected seeded options.baseURL");
+  const livePort = modules.getProxyPort();
+  assert(livePort, "Expected config hook to bind the proxy on an ephemeral port");
+  assertEqual(
+    cursor.options.baseURL,
+    `http://localhost:${livePort}/v1`,
+    "Expected seeded baseURL to match the live ephemeral proxy port",
+  );
+  assert(
+    !cursor.options.baseURL.includes(":8788/"),
+    "Expected config baseURL not to hardcode the old fixed port 8788",
+  );
   assertEqual(
     Object.keys(cursor.models ?? {}).length,
     1,
@@ -1219,6 +1240,7 @@ async function testConfigHookSeedsProvider(
   } finally {
     globalThis.fetch = originalFetch;
     modules.resetPendingCursorLogin();
+    modules.stopProxy();
   }
 }
 
@@ -3028,9 +3050,9 @@ async function main() {
   process.env.OPENCODE_CURSOR_PRE_OUTPUT_STALL_TIMEOUT_MS = "1200";
   // Stall wait notices must stay off by default (Discord interruption).
   delete process.env.OPENCODE_CURSOR_STALL_WAIT_NOTICE_MS;
-  // Use a dedicated proxy port so tests never collide with a live OpenCode
-  // session running the plugin on the default fixed port.
-  process.env.OPENCODE_CURSOR_PROXY_PORT = "8799";
+  // Ephemeral port by default — each process binds an OS-assigned listen port.
+  // OPENCODE_CURSOR_PROXY_PORT remains an optional pin for debugging only.
+  delete process.env.OPENCODE_CURSOR_PROXY_PORT;
 
   const modules = await loadTestModules();
 

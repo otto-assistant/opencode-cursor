@@ -2,6 +2,7 @@ export interface TestModules {
   startProxy: typeof import("../../src/proxy").startProxy;
   stopProxy: typeof import("../../src/proxy").stopProxy;
   getProxyPort: typeof import("../../src/proxy").getProxyPort;
+  getCursorProxyBaseUrl: typeof import("../../src/proxy").getCursorProxyBaseUrl;
   resolveProxyModelId: typeof import("../../src/proxy").resolveProxyModelId;
   computeUsage: typeof import("../../src/proxy").computeUsage;
   isServerKeepaliveMessage: typeof import("../../src/proxy").isServerKeepaliveMessage;
@@ -29,6 +30,7 @@ export async function loadTestModules(): Promise<TestModules> {
     startProxy: proxy.startProxy,
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
+    getCursorProxyBaseUrl: proxy.getCursorProxyBaseUrl,
     resolveProxyModelId: proxy.resolveProxyModelId,
     computeUsage: proxy.computeUsage,
     isServerKeepaliveMessage: proxy.isServerKeepaliveMessage,

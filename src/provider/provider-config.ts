@@ -2,26 +2,25 @@ import {
   isLoginPlaceholderModel,
   type CursorModel,
 } from "../models.js";
-import { getCursorProxyBaseUrl } from "../proxy.js";
 import {
   CURSOR_PROVIDER_ID,
   OPENAI_COMPATIBLE_NPM,
 } from "../shared/constants.js";
 import { buildConfigModelEntries } from "./model-descriptor.js";
 
-// Base URL OpenCode uses for the statically-declared provider. It points at
-// the proxy's fixed port so requests reach the local proxy (OpenCode resolves
-// the base URL from static config, not from the auth loader).
-const CURSOR_BASE_URL = getCursorProxyBaseUrl();
-
 /**
  * Ensure OpenCode has a concrete `cursor` provider declaration in its config so
  * the provider and its models appear in the model menu. Existing user-defined
  * fields and models are preserved; only missing pieces are filled in.
+ *
+ * `baseURL` is the live proxy URL (ephemeral port). OpenCode 1.15.x reads the
+ * provider base URL from this static config, so callers must start the proxy
+ * first and pass the real URL — never a placeholder fixed port.
  */
 export function ensureCursorProviderConfig(
   config: unknown,
   models: CursorModel[],
+  baseURL: string,
 ): void {
   if (!config || typeof config !== "object") return;
   const cfg = config as { provider?: Record<string, any> };
@@ -56,7 +55,7 @@ export function ensureCursorProviderConfig(
     name: providerName,
     npm: existing.npm ?? OPENAI_COMPATIBLE_NPM,
     options: {
-      baseURL: CURSOR_BASE_URL,
+      baseURL,
       // Ensure OpenAI-compatible streams surface usage chunks to OpenCode's
       // context meter (AI SDK includeUsage / stream_options.include_usage).
       includeUsage: true,
