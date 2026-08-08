@@ -5,3 +5,6 @@ dist/
 
 # Local agent notes / environment-specific
 AGENTS.md
+
+# Graphify knowledge graph output
+graphify-out/

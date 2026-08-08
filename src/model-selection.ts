@@ -15,6 +15,28 @@ export interface CursorModelSelection {
   maxMode: boolean;
 }
 
+export interface CursorModel {
+  id: string;
+  name: string;
+  reasoning: boolean;
+  contextWindow: number;
+  maxTokens: number;
+  defaultSelection: CursorModelSelection;
+  variants: Record<string, CursorModelSelection>;
+}
+
+export function resolveCursorModelSelection(
+  models: readonly CursorModel[],
+  modelId: string,
+  variant: string | undefined,
+): CursorModelSelection | undefined {
+  const model = models.find((candidate) => candidate.id === modelId);
+  if (!model) return undefined;
+  const key = variant?.trim().toLowerCase();
+  if (!key || key === "default") return model.defaultSelection;
+  return model.variants[key] ?? model.defaultSelection;
+}
+
 export function encodeCursorModelSelection(
   selection: CursorModelSelection,
 ): string {

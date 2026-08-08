@@ -74,12 +74,46 @@ import {
   type McpToolDefinition,
 } from "./proto/agent_pb.js";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join as pathJoin, resolve as pathResolve } from "node:path";
 import { Mutex, isAbortError } from "./promise-queue.js";
+import {
+  BRIDGE_PATH,
+  CURSOR_API_URL,
+  callCursorUnaryRpc,
+} from "./cursor-rpc.js";
+import {
+  type ChatCompletionRequest,
+  type ExtractedImage,
+  type OpenAIToolDef,
+  type ToolResultInfo,
+  shouldBlockTool,
+} from "./openai/types.js";
+import { extractImagesFromContent } from "./openai/images.js";
+import {
+  extractWorkspaceRoot,
+  parseMessages,
+} from "./openai/message-parser.js";
+import {
+  buildInterruptSteerUserText,
+  extractAnchoredSummary,
+  hasUserSteerAfterTools,
+  isCompactionContinueUserText,
+  isPostCompactHistory,
+  isSummaryGenerationRequest,
+  isTitleGenerationRequest,
+} from "./openai/request-classifier.js";
+import {
+  buildPostToolBridgeLossContinuation,
+  sanitizeCheckpointAfterInterrupt,
+  truncateToolResultForCursor,
+} from "./openai/tool-results.js";
+import {
+  deriveBridgeKey,
+  deriveConversationKey,
+  deterministicConversationId,
+  selectionIdentity,
+} from "./conversation/identity.js";
 import { BridgePool, type BridgeHandle } from "./bridge-pool.js";
-import { log } from "./log.js";
+import { log } from "./shared/log.js";
 import {
   CURSOR_SELECTION_HEADER,
   decodeCursorModelSelection,
@@ -87,77 +121,29 @@ import {
   type CursorModelSelection,
 } from "./model-selection.js";
 
-const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
+// Re-export pure helpers so existing tests can import from ./proxy
+export {
+  callCursorUnaryRpc,
+  extractImagesFromContent,
+  parseMessages,
+  isTitleGenerationRequest,
+  isSummaryGenerationRequest,
+  hasUserSteerAfterTools,
+  buildInterruptSteerUserText,
+  isCompactionContinueUserText,
+  extractAnchoredSummary,
+  isPostCompactHistory,
+  truncateToolResultForCursor,
+  sanitizeCheckpointAfterInterrupt,
+  buildPostToolBridgeLossContinuation,
+};
+
 const CONNECT_END_STREAM_FLAG = 0b00000010;
-const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
   Connection: "keep-alive",
 } as const;
-
-interface OpenAIToolCall {
-  id: string;
-  type: "function";
-  function: { name: string; arguments: string };
-}
-
-/** A single element in an OpenAI multi-part content array. */
-interface ContentPart {
-  type: string;
-  text?: string;
-  /** OpenAI vision part: string URL or `{ url }`. */
-  image_url?: string | { url?: string; detail?: string };
-  /** Some OpenCode paths use explicit mime + data/url fields. */
-  mime?: string;
-  mime_type?: string;
-  data?: string;
-  url?: string;
-  filename?: string;
-  name?: string;
-}
-
-interface ExtractedImage {
-  bytes: Uint8Array;
-  mimeType: string;
-  filename: string;
-}
-
-interface OpenAIMessage {
-  role: "system" | "user" | "assistant" | "tool";
-  content: string | null | ContentPart[];
-  tool_call_id?: string;
-  tool_calls?: OpenAIToolCall[];
-}
-
-interface OpenAIToolDef {
-  type: "function";
-  function: {
-    name: string;
-    description?: string;
-    parameters?: Record<string, unknown>;
-  };
-}
-
-function shouldBlockTool(tool: OpenAIToolDef): boolean {
-  return tool.function.name.trim().toLowerCase() === "task";
-}
-
-interface ChatCompletionRequest {
-  model: string;
-  messages: OpenAIMessage[];
-  stream?: boolean;
-  temperature?: number;
-  max_tokens?: number;
-  tools?: OpenAIToolDef[];
-  tool_choice?: unknown;
-  user?: string;
-  metadata?: Record<string, unknown>;
-  thread_id?: string;
-  conversation_id?: string;
-  session_id?: string;
-}
-
 
 interface CursorRequestPayload {
   requestBytes: Uint8Array;
@@ -273,7 +259,6 @@ const convMutexLastUsedMs = new Map<string, number>();
 const systemBlobCache = new Map<string, { blobId: string; bytes: Uint8Array }>();
 
 let activeRequestCount = 0;
-let idleShutdownTimer: ReturnType<typeof setTimeout> | undefined;
 let maintenanceTimer: ReturnType<typeof setInterval> | undefined;
 
 export const proxyTelemetry = {
@@ -303,7 +288,6 @@ function getOrCreateMutex(convKey: string): Mutex {
 
 function deleteActiveBridge(bridgeKey: string): void {
   if (activeBridges.delete(bridgeKey)) {
-    scheduleIdleShutdown();
   }
 }
 
@@ -335,14 +319,12 @@ function isProxyUnderPressure(): boolean {
     activeBridges.size >= PRESSURE_ACTIVE_BRIDGES_THRESHOLD
   );
 }
-
 function shouldRejectByAdmissionControl(): boolean {
   return (
     activeRequestCount > ADMISSION_MAX_ACTIVE_REQUESTS ||
     activeBridges.size >= ADMISSION_MAX_ACTIVE_BRIDGES
   );
 }
-
 function setActiveBridge(bridgeKey: string, active: ActiveBridge): boolean {
   if (activeBridges.size >= MAX_ACTIVE_BRIDGES && !activeBridges.has(bridgeKey)) {
     proxyTelemetry.capRejects += 1;
@@ -514,20 +496,6 @@ function runMaintenanceSweep(): void {
   }
 }
 
-function clearIdleShutdownTimer(): void {
-  if (!idleShutdownTimer) return;
-  clearTimeout(idleShutdownTimer);
-  idleShutdownTimer = undefined;
-}
-
-function scheduleIdleShutdown(): void {
-  // Idle shutdown disabled — the proxy must stay alive as long as the opencode
-  // process is running.  Previously, after 10 min idle the proxy would stop()
-  // and the port would become invalid, but opencode's provider config still
-  // referenced the dead port → ConnectionRefused on every subsequent request.
-  // The maintenance sweep + admission control are sufficient for resource mgmt.
-}
-
 /** Length-prefix a message: [4-byte BE length][payload] */
 function lpEncode(data: Uint8Array): Buffer {
   const buf = Buffer.alloc(4 + data.length);
@@ -553,10 +521,6 @@ interface SpawnBridgeOptions {
   accessToken: string;
   rpcPath: string;
   url?: string;
-  /** When true, use application/proto for unary RPCs instead of Connect streaming. */
-  unary?: boolean;
-  contentType?: "application/proto" | "application/json";
-  connectProtocolVersion?: "1";
 }
 
 function spawnBridge(options: SpawnBridgeOptions): {
@@ -579,9 +543,6 @@ function spawnBridge(options: SpawnBridgeOptions): {
     accessToken: options.accessToken,
     url: options.url ?? CURSOR_API_URL,
     path: options.rpcPath,
-    unary: options.unary ?? false,
-    contentType: options.contentType,
-    connectProtocolVersion: options.connectProtocolVersion,
   });
   proc.stdin.write(lpEncode(new TextEncoder().encode(config)));
 
@@ -649,154 +610,26 @@ function spawnBridge(options: SpawnBridgeOptions): {
   };
 }
 
-interface CursorUnaryRpcOptions {
-  accessToken: string;
-  rpcPath: string;
-  requestBody: Uint8Array;
-  url?: string;
-  timeoutMs?: number;
-  contentType?: "application/proto" | "application/json";
-  connectProtocolVersion?: "1";
-}
-
-export async function callCursorUnaryRpc(
-  options: CursorUnaryRpcOptions,
- ): Promise<{ body: Uint8Array; exitCode: number; timedOut: boolean }> {
-  const bridge = spawnBridge({
-    accessToken: options.accessToken,
-    rpcPath: options.rpcPath,
-    url: options.url,
-    unary: true,
-    contentType: options.contentType,
-    connectProtocolVersion: options.connectProtocolVersion,
-  });
-  const chunks: Buffer[] = [];
-  const { promise, resolve } = Promise.withResolvers<{
-    body: Uint8Array;
-    exitCode: number;
-    timedOut: boolean;
-  }>();
-  let timedOut = false;
-  const timeoutMs = options.timeoutMs ?? 5_000;
-  const timeout = timeoutMs > 0
-    ? setTimeout(() => {
-        timedOut = true;
-        try { bridge.proc.kill(); } catch {}
-      }, timeoutMs)
-    : undefined;
-
-  bridge.onData((chunk) => {
-    chunks.push(Buffer.from(chunk));
-  });
-  bridge.onClose((exitCode) => {
-    if (timeout) clearTimeout(timeout);
-    resolve({
-      body: Buffer.concat(chunks),
-      exitCode,
-      timedOut,
-    });
-  });
-
-  // Unary: send raw protobuf body (no Connect framing)
-  bridge.write(options.requestBody);
-  bridge.end();
-
-  return promise;
-}
-
 let proxyServer: ReturnType<typeof Bun.serve> | undefined;
 let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
 let proxyModels: Array<{ id: string; name: string }> = [];
-let sharedProxyMonitorTimer: ReturnType<typeof setInterval> | undefined;
-let sharedProxyMonitorRecovering = false;
 const DEFAULT_MODEL_ID = "default";
 
-const DEFAULT_PROXY_PORT = 8788;
-const SHARED_PROXY_HEALTH_TIMEOUT_MS = 750;
-const SHARED_PROXY_MONITOR_INTERVAL_MS = 5_000;
-
 /**
- * Fixed port the proxy binds to. OpenCode 1.15.x resolves the provider base
- * URL from static config, so the proxy must listen on a deterministic port
- * that matches that URL (a random port would leave the SDK unable to connect).
- * Override with OPENCODE_CURSOR_PROXY_PORT if 8788 is taken.
+ * Optional pinned listen port from OPENCODE_CURSOR_PROXY_PORT.
+ * When unset (the default), Bun binds an ephemeral OS port (0).
  */
-const CURSOR_PROXY_PORT: number = (() => {
+function preferredProxyPort(): number {
   const raw = process.env.OPENCODE_CURSOR_PROXY_PORT;
   const parsed = raw ? Number(raw) : NaN;
-  return Number.isInteger(parsed) && parsed > 0 && parsed < 65536
-    ? parsed
-    : DEFAULT_PROXY_PORT;
-})();
-
-export function getCursorProxyBaseUrl(): string {
-  return `http://localhost:${CURSOR_PROXY_PORT}/v1`;
+  return Number.isInteger(parsed) && parsed > 0 && parsed < 65536 ? parsed : 0;
 }
 
-function isAddrInUseError(err: unknown): boolean {
-  if (!err || typeof err !== "object") return false;
-  const code = (err as { code?: unknown }).code;
-  const message = (err as { message?: unknown }).message;
-  return (
-    code === "EADDRINUSE" ||
-    (typeof message === "string" && /eaddrinuse|address already in use|in use/i.test(message))
-  );
-}
-
-async function isSharedProxyHealthy(): Promise<boolean> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), SHARED_PROXY_HEALTH_TIMEOUT_MS);
-  try {
-    const res = await fetch(`${getCursorProxyBaseUrl()}/models`, {
-      signal: controller.signal,
-    });
-    if (!res.ok) return false;
-    const body = await res.json().catch(() => undefined);
-    return (
-      !!body &&
-      typeof body === "object" &&
-      (body as { object?: unknown }).object === "list" &&
-      Array.isArray((body as { data?: unknown }).data)
-    );
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function clearSharedProxyMonitor(): void {
-  if (!sharedProxyMonitorTimer) return;
-  clearInterval(sharedProxyMonitorTimer);
-  sharedProxyMonitorTimer = undefined;
-}
-
-function startSharedProxyMonitor(): void {
-  if (sharedProxyMonitorTimer) return;
-  sharedProxyMonitorTimer = setInterval(async () => {
-    if (sharedProxyMonitorRecovering || proxyServer) return;
-    if (await isSharedProxyHealthy()) return;
-
-    if (!proxyAccessTokenProvider) {
-      log.warn("[proxy] shared proxy disappeared, but no access token provider is configured");
-      return;
-    }
-
-    sharedProxyMonitorRecovering = true;
-    try {
-      log.warn(`[proxy] shared proxy on port ${CURSOR_PROXY_PORT} is unavailable; attempting to bind locally`);
-      await startProxy(proxyAccessTokenProvider, proxyModels);
-      if (proxyServer) {
-        clearSharedProxyMonitor();
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      log.warn(`[proxy] shared proxy recovery failed: ${message}`);
-    } finally {
-      sharedProxyMonitorRecovering = false;
-    }
-  }, SHARED_PROXY_MONITOR_INTERVAL_MS);
+/** OpenAI-compatible base URL for the currently listening proxy. */
+export function getCursorProxyBaseUrl(): string | undefined {
+  if (!proxyPort) return undefined;
+  return `http://localhost:${proxyPort}/v1`;
 }
 
 function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }>): Array<{
@@ -826,7 +659,6 @@ export async function startProxy(
     id: model.id,
     name: model.name,
   }));
-  clearIdleShutdownTimer();
   if (proxyServer && proxyPort) return proxyPort;
 
   // Initialize bridge pool for connection reuse
@@ -839,12 +671,11 @@ export async function startProxy(
     log.info(`[proxy] bridge pool started min=${BRIDGE_POOL_MIN_SIZE} max=${BRIDGE_POOL_MAX_SIZE}`);
   }
 
-  try {
-    proxyServer = Bun.serve({
-    port: CURSOR_PROXY_PORT,
+  const listenPort = preferredProxyPort();
+  proxyServer = Bun.serve({
+    port: listenPort,
     idleTimeout: 255, // max — Cursor responses can take 30s+
     async fetch(req) {
-      clearIdleShutdownTimer();
       const url = new URL(req.url);
 
       // Fast-path: admission control BEFORE incrementing activeRequestCount.
@@ -888,9 +719,8 @@ export async function startProxy(
               data: buildOpenAIModelList(proxyModels),
             }),
             { headers: { "Content-Type": "application/json" } },
-          );
-        }
-
+  );
+}
         if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
           let release: (() => void) | undefined;
           try {
@@ -944,15 +774,13 @@ export async function startProxy(
             const selectedModel = decodeCursorModelSelection(
               req.headers.get(CURSOR_SELECTION_HEADER) ?? undefined,
             );
-            const rawResponse = handleChatCompletion(
+            const resolvedResponse = await handleChatCompletion(
               body,
               accessToken,
               release,
               selectedModel,
               req.signal,
             );
-            const resolvedResponse =
-              rawResponse instanceof Promise ? await rawResponse : rawResponse;
             // OpenCode/Bun may abort while we were awaiting setup (bridge spawn,
             // etc.) before the stream's abort listener was attached — or after
             // the Response is built but before the body is consumed. Cancel the
@@ -987,58 +815,15 @@ export async function startProxy(
       } finally {
         activeRequestCount = Math.max(0, activeRequestCount - 1);
         runMaintenanceSweep();
-        scheduleIdleShutdown();
       }
     },
-    });
-  } catch (err) {
-    if (isAddrInUseError(err)) {
-      if (!(await isSharedProxyHealthy())) {
-        proxyServer = undefined;
-        proxyPort = undefined;
-        throw new Error(
-          `Port ${CURSOR_PROXY_PORT} is already in use, but no healthy Cursor proxy responded on ${getCursorProxyBaseUrl()}/models`,
-          { cause: err },
-        );
-      }
-
-      // A sibling plugin instance (another OpenCode session for the same
-      // user) already serves the proxy on the shared fixed port. Reuse it
-      // only after verifying it responds like this proxy. Keep monitoring so
-      // this process can claim the fixed port if the sibling exits later.
-      proxyServer = undefined;
-      proxyPort = CURSOR_PROXY_PORT;
-      startSharedProxyMonitor();
-      log.warn(
-        `[proxy] port ${CURSOR_PROXY_PORT} already in use; reusing existing proxy`,
-      );
-      return proxyPort;
-    }
-    proxyServer = undefined;
-    throw err;
-  }
+  });
 
   maintenanceTimer = setInterval(runMaintenanceSweep, MAINTENANCE_INTERVAL_MS);
 
-  // Hydrate the title-gen model from the disk cache. When the cache is fresh
-  // we skip the background probe entirely — the first title-gen request then
-  // resolves instantly instead of racing a slow Zen probe. Only fall back to
-  // background discovery when there is no usable cached model.
-  if (!hydrateTitleGenModelFromDisk()) {
-    // Kick off background discovery of Zen free model for title-gen.
-    // First title-gen request will await the result if not yet ready.
-    discoverZenFreeModel().then((model) => {
-      if (model) {
-        log.info(`[proxy] title-gen ready: using ${model}`);
-      } else {
-        log.warn(`[proxy] title-gen: no free model discovered at startup`);
-      }
-    }).catch(() => {});
-  }
-
   proxyPort = proxyServer.port;
-  clearSharedProxyMonitor();
   if (!proxyPort) throw new Error("Failed to bind proxy to a port");
+  log.info(`[proxy] listening on http://localhost:${proxyPort}/v1`);
   return proxyPort;
 }
 
@@ -1055,10 +840,6 @@ export function resolveProxyModelId(
 }
 
 export function stopProxy(): void {
-  clearIdleShutdownTimer();
-  clearSharedProxyMonitor();
-  resolvedTitleGenModel = undefined;
-  lastDiscoveryMs = 0;
   if (maintenanceTimer) {
     clearInterval(maintenanceTimer);
     maintenanceTimer = undefined;
@@ -1070,10 +851,10 @@ export function stopProxy(): void {
   if (proxyServer) {
     proxyServer.stop();
     proxyServer = undefined;
-    proxyPort = undefined;
-    proxyAccessTokenProvider = undefined;
-    proxyModels = [];
   }
+  proxyPort = undefined;
+  proxyAccessTokenProvider = undefined;
+  proxyModels = [];
   // Clean up any lingering bridges
   for (const active of activeBridges.values()) {
     killActiveBridge(active);
@@ -1088,118 +869,25 @@ export function stopProxy(): void {
   proxyTelemetry.lastSnapshotMs = 0;
 }
 
-/** Handle title-gen by calling OpenCode Zen's free API directly.
- *  Bypasses the Cursor bridge entirely. Uses auto-discovered free model
- *  (or explicit override via OPENCODE_CURSOR_TITLE_GEN_MODEL). */
+/** Handle title-gen through the explicitly configured OpenCode Zen model. */
 async function handleTitleGenViaZen(
   modelId: string,
   body: ChatCompletionRequest,
 ): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
-
   try {
-    // Build a minimal OpenAI-compatible request for Zen
-    const zenBody = {
-      model: modelId,
-      stream: true,
-      messages: body.messages.map((m) => ({
-        role: m.role,
-        content: typeof m.content === "string"
-          ? m.content
-          : m.content
-            ?.filter((p) => p.type === "text" && p.text)
-            .map((p) => p.text)
-            .join("\n") ?? "",
-      })),
-    };
-
     const zenResponse = await fetch(`${ZEN_BASE_URL}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(zenBody),
+      body: JSON.stringify({ ...body, model: modelId, stream: true }),
       signal: AbortSignal.timeout(30_000),
     });
-
     if (!zenResponse.ok) {
       log.warn(`[proxy] title-gen Zen returned ${zenResponse.status}, falling back to empty`);
       return buildEmptyTitleResponse(completionId, created, modelId);
     }
-
-    // Proxy the SSE stream from Zen, translating chunk format
-    const stream = new ReadableStream({
-      start(controller) {
-        const encoder = new TextEncoder();
-        const reader = zenResponse.body?.getReader();
-        if (!reader) {
-          controller.close();
-          return;
-        }
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        (async () => {
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-
-              buffer += decoder.decode(value, { stream: true });
-              const lines = buffer.split("\n");
-              buffer = lines.pop() ?? "";
-
-              for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed || !trimmed.startsWith("data: ")) continue;
-                const data = trimmed.slice(6);
-                if (data === "[DONE]") {
-                  controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                  continue;
-                }
-                try {
-                  const chunk = JSON.parse(data);
-                  // Normalize chunk format for OpenCode.
-                  // Strip reasoning/reasoning_details from delta to prevent
-                  // reasoning tokens from leaking into Discord thread titles.
-                  const normalized = {
-                    id: completionId,
-                    object: "chat.completion.chunk",
-                    created,
-                    model: modelId,
-                    choices: (chunk.choices ?? []).map(
-                      (c: { index?: number; delta?: Record<string, unknown>; finish_reason?: string }) => {
-                        const { reasoning, reasoning_details, ...cleanDelta } = c.delta ?? {};
-                        return {
-                          index: c.index ?? 0,
-                          delta: cleanDelta,
-                          finish_reason: c.finish_reason ?? null,
-                        };
-                      },
-                    ),
-                  };
-                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(normalized)}\n\n`));
-                } catch {
-                  // Skip unparseable chunks
-                }
-              }
-            }
-          } catch (err) {
-            log.warn(`[proxy] title-gen Zen stream error: ${err}`);
-          } finally {
-            reader.cancel().catch(() => {});
-            try { controller.close(); } catch {}
-          }
-        })();
-      },
-    });
-
-    return new Response(stream, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      },
-    });
+    return new Response(zenResponse.body, { headers: SSE_HEADERS });
   } catch (err) {
     log.warn(`[proxy] title-gen Zen failed: ${err}, returning empty`);
     return buildEmptyTitleResponse(completionId, created, modelId);
@@ -1231,23 +919,26 @@ function buildEmptyTitleResponse(completionId: string, created: number, modelId:
   });
 }
 
-function handleChatCompletion(
-  body: ChatCompletionRequest,
-  accessToken: string,
-  release: () => void,
-  selectedModel?: CursorModelSelection,
-  abortSignal?: AbortSignal,
-): Response | Promise<Response> {
-  return doHandleChatCompletion(body, accessToken, release, selectedModel, abortSignal);
-}
-
-async function doHandleChatCompletion(
+async function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
   release: () => void,
   selectedModel?: CursorModelSelection,
   abortSignal?: AbortSignal,
 ): Promise<Response> {
+  if (body.stream === false) {
+    release();
+    return new Response(
+      JSON.stringify({
+        error: {
+          message: "streaming required",
+          type: "invalid_request_error",
+        },
+      }),
+      { status: 400, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
   const parsed = parseMessages(body.messages);
   const systemPrompt = parsed.systemPrompt;
   // Treat whitespace-only user payloads as empty — Cursor models otherwise
@@ -1282,15 +973,18 @@ async function doHandleChatCompletion(
     );
   }
 
-  // Title-generation requests are stateless one-shot calls — they don't need
-  // conversation state, checkpoints, MCP tools, or mutexes.
-  // Route to OpenCode Zen auto-discovered free model instead of Cursor to
-  // avoid resource_exhausted errors on premium models.
-  const isTitleGen = isTitleGenerationRequest(body.messages);
-  if (isTitleGen) {
-    const titleModelId = await resolveTitleGenModel();
-    log.info(`[proxy] title-gen request model=${modelId} → zen ${titleModelId}`);
+  if (isTitleGenerationRequest(body.messages)) {
+    const titleModelId =
+      process.env.OPENCODE_CURSOR_TITLE_GEN_MODEL?.trim();
     release();
+    if (!titleModelId) {
+      return buildEmptyTitleResponse(
+        `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`,
+        Math.floor(Date.now() / 1000),
+        modelId,
+      );
+    }
+    log.info(`[proxy] title-gen request model=${modelId} → zen ${titleModelId}`);
     return handleTitleGenViaZen(titleModelId, body);
   }
 
@@ -1336,7 +1030,6 @@ async function doHandleChatCompletion(
         release,
         workspaceRoot,
         abortSignal,
-        body.messages,
       );
     }
 
@@ -1504,9 +1197,6 @@ async function doHandleChatCompletion(
   );
   payload.mcpTools = mcpTools;
 
-  if (body.stream === false) {
-    return handleNonStreamingResponse(payload, accessToken, modelId, convKey, release, workspaceRoot, isSummary);
-  }
   const retryCtx: RetryContext = {
     stored,
     accessToken,
@@ -1529,319 +1219,6 @@ async function doHandleChatCompletion(
     abortSignal,
   );
 }
-
-interface ToolResultInfo {
-  toolCallId: string;
-  content: string;
-}
-
-interface ParsedMessages {
-  systemPrompt: string;
-  userText: string;
-  /** Images attached to the current user turn (OpenAI vision / file parts). */
-  images: ExtractedImage[];
-  turns: Array<{ userText: string; assistantText: string }>;
-  toolResults: ToolResultInfo[];
-}
-
-/** Normalize OpenAI message content to a plain string. */
-function textContent(content: OpenAIMessage["content"]): string {
-  if (content == null) return "";
-  if (typeof content === "string") return content;
-  return content
-    .filter((p) => p.type === "text" && p.text)
-    .map((p) => p.text!)
-    .join("\n");
-}
-
-function imageUrlFromPart(part: ContentPart): string | undefined {
-  if (typeof part.image_url === "string" && part.image_url.trim()) {
-    return part.image_url.trim();
-  }
-  if (
-    part.image_url &&
-    typeof part.image_url === "object" &&
-    typeof part.image_url.url === "string" &&
-    part.image_url.url.trim()
-  ) {
-    return part.image_url.url.trim();
-  }
-  if (typeof part.url === "string" && part.url.trim()) {
-    return part.url.trim();
-  }
-  return undefined;
-}
-
-function guessMimeFromName(name: string): string {
-  const lower = name.toLowerCase();
-  if (lower.endsWith(".png")) return "image/png";
-  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
-  if (lower.endsWith(".gif")) return "image/gif";
-  if (lower.endsWith(".webp")) return "image/webp";
-  if (lower.endsWith(".bmp")) return "image/bmp";
-  if (lower.endsWith(".svg")) return "image/svg+xml";
-  return "application/octet-stream";
-}
-
-function decodeDataUrl(dataUrl: string): ExtractedImage | undefined {
-  const match = /^data:([^;,]+)?(?:;charset=[^;,]+)?;base64,([A-Za-z0-9+/=\s]+)$/i.exec(
-    dataUrl.trim(),
-  );
-  if (!match) return undefined;
-  const mimeType = (match[1] || "application/octet-stream").trim() || "application/octet-stream";
-  try {
-    const bytes = Buffer.from(match[2].replace(/\s+/g, ""), "base64");
-    if (bytes.byteLength === 0) return undefined;
-    const ext = mimeType.includes("png")
-      ? "png"
-      : mimeType.includes("jpeg") || mimeType.includes("jpg")
-        ? "jpg"
-        : mimeType.includes("gif")
-          ? "gif"
-          : mimeType.includes("webp")
-            ? "webp"
-            : "bin";
-    return {
-      bytes: new Uint8Array(bytes),
-      mimeType,
-      filename: `attachment.${ext}`,
-    };
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Extract image attachments from an OpenAI / OpenCode content payload.
- * Supports `image_url` parts (data URLs) and file-like parts with base64 `data`.
- */
-export function extractImagesFromContent(
-  content: OpenAIMessage["content"],
-): ExtractedImage[] {
-  if (content == null || typeof content === "string") return [];
-  const images: ExtractedImage[] = [];
-  for (const part of content) {
-    const type = (part.type || "").toLowerCase();
-    const filename =
-      (typeof part.filename === "string" && part.filename) ||
-      (typeof part.name === "string" && part.name) ||
-      "attachment";
-
-    if (type === "image_url" || type === "image" || type === "input_image") {
-      const url = imageUrlFromPart(part);
-      if (url?.startsWith("data:")) {
-        const decoded = decodeDataUrl(url);
-        if (decoded) {
-          images.push({
-            ...decoded,
-            filename: filename.includes(".") ? filename : decoded.filename,
-          });
-        }
-      } else if (typeof part.data === "string" && part.data.trim()) {
-        try {
-          const bytes = new Uint8Array(
-            Buffer.from(part.data.replace(/^data:[^,]*,/, "").replace(/\s+/g, ""), "base64"),
-          );
-          if (bytes.byteLength > 0) {
-            const mimeType =
-              part.mime_type || part.mime || guessMimeFromName(filename) || "image/png";
-            images.push({ bytes, mimeType, filename });
-          }
-        } catch {
-          // skip undecodable
-        }
-      }
-      continue;
-    }
-
-    // OpenCode sometimes emits generic file parts for image attachments.
-    if (type === "file" || type === "input_file") {
-      const mime = (part.mime_type || part.mime || "").toLowerCase();
-      const looksImage =
-        mime.startsWith("image/") ||
-        /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(filename);
-      if (!looksImage) continue;
-      if (typeof part.data === "string" && part.data.trim()) {
-        try {
-          const bytes = new Uint8Array(
-            Buffer.from(part.data.replace(/^data:[^,]*,/, "").replace(/\s+/g, ""), "base64"),
-          );
-          if (bytes.byteLength > 0) {
-            images.push({
-              bytes,
-              mimeType: mime || guessMimeFromName(filename) || "image/png",
-              filename,
-            });
-          }
-        } catch {
-          // skip
-        }
-        continue;
-      }
-      const url = imageUrlFromPart(part);
-      if (url?.startsWith("data:")) {
-        const decoded = decodeDataUrl(url);
-        if (decoded) {
-          images.push({
-            ...decoded,
-            filename: filename.includes(".") ? filename : decoded.filename,
-            mimeType: mime || decoded.mimeType,
-          });
-        }
-      }
-    }
-  }
-  return images;
-}
-
-/** Extract the real workspace root from OpenCode's system prompt.
- *  OpenCode includes "Working directory: /path/to/dir" in its env block. */
-function extractWorkspaceRoot(systemPrompt: string): string | undefined {
-  // Try "Working directory: /path" pattern (OpenCode env block)
-  const wdMatch = systemPrompt.match(/Working directory:\s*(\S+)/i);
-  if (wdMatch?.[1]) return wdMatch[1];
-  // Try "Workspace root folder: /path" pattern
-  const wsMatch = systemPrompt.match(/Workspace root folder:\s*(\S+)/i);
-  if (wsMatch?.[1]) return wsMatch[1];
-  return undefined;
-}
-
-/**
- * Parse OpenAI chat messages into Cursor request inputs.
- *
- * Critical invariant for tool loops: when the latest assistant message still
- * has open `tool_calls` (results are trailing `tool` messages), keep that user
- * text as `userText` and return ONLY those trailing tool results. Flushing the
- * turn early made `userText` empty mid-loop; if the parked bridge was also
- * missing, Cursor then received an empty/continuation UserMessage and models
- * hallucinated "the user sent an empty message".
- *
- * OpenCode history replay sometimes omits `assistant.tool_calls` while still
- * sending the matching `role:tool` results (anomalyco/opencode#24090). Those
- * orphaned tool messages must still open a tool batch — otherwise we return
- * `toolResults=[]` + the original `userText`, kill the parked bridge, and
- * re-prompt Cursor with the same task (infinite re-plan loop).
- */
-export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
-  let systemPrompt = "You are a helpful assistant.";
-  const pairs: Array<{ userText: string; assistantText: string }> = [];
-  const trailingToolResults: ToolResultInfo[] = [];
-
-  // Collect system messages
-  const systemParts = messages
-    .filter((m) => m.role === "system")
-    .map((m) => textContent(m.content));
-  if (systemParts.length > 0) {
-    systemPrompt = systemParts.join("\n");
-  }
-
-  // OpenAI tool-call pattern interleaves assistant(tool_calls) → tool → assistant(text):
-  //   user → assistant(tool_calls) → tool → assistant(text+tool_calls) → tool → assistant(text) → user
-  // Accumulate assistant text after each user message, but do NOT close the turn
-  // while tool_calls are still unresolved.
-  const nonSystem = messages.filter((m) => m.role !== "system");
-  let pendingUser = "";
-  let pendingUserContent: OpenAIMessage["content"] = null;
-  let pendingAssistantTexts: string[] = [];
-  let openToolCallBatch = false;
-  let currentImages: ExtractedImage[] = [];
-
-  function flushPair() {
-    if (pendingUser) {
-      pairs.push({
-        userText: pendingUser,
-        assistantText: pendingAssistantTexts.join("\n"),
-      });
-    }
-    pendingUser = "";
-    pendingUserContent = null;
-    pendingAssistantTexts = [];
-    openToolCallBatch = false;
-  }
-
-  for (const msg of nonSystem) {
-    if (msg.role === "tool") {
-      // Infer an open batch when OpenCode dropped assistant.tool_calls on replay.
-      if (!openToolCallBatch) {
-        openToolCallBatch = true;
-        trailingToolResults.length = 0;
-      }
-      trailingToolResults.push({
-        toolCallId: msg.tool_call_id ?? "",
-        content: textContent(msg.content),
-      });
-      continue;
-    }
-
-    if (msg.role === "user") {
-      flushPair();
-      trailingToolResults.length = 0;
-      pendingUser = textContent(msg.content);
-      pendingUserContent = msg.content;
-      currentImages = extractImagesFromContent(msg.content);
-      continue;
-    }
-
-    if (msg.role === "assistant") {
-      const text = textContent(msg.content);
-      const hasToolCalls =
-        Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-      if (text) {
-        pendingAssistantTexts.push(text);
-      }
-      if (hasToolCalls) {
-        // New open batch — older tool results are already historical.
-        trailingToolResults.length = 0;
-        openToolCallBatch = true;
-      } else if (openToolCallBatch) {
-        // Assistant completed the tool loop without further tool_calls.
-        // Subsequent orphaned tool messages (missing tool_calls on the next
-        // assistant) will reopen a fresh trailing batch.
-        openToolCallBatch = false;
-        trailingToolResults.length = 0;
-      }
-    }
-  }
-
-  // Determine the current user message to send to Cursor
-  let lastUserText = "";
-  let lastUserImages: ExtractedImage[] = [];
-  if (openToolCallBatch) {
-    // Mid tool-loop: preserve the user text and only the unresolved tool results.
-    lastUserText = pendingUser;
-    lastUserImages = currentImages;
-  } else if (pendingUser && pendingAssistantTexts.length > 0) {
-    pairs.push({
-      userText: pendingUser,
-      assistantText: pendingAssistantTexts.join("\n"),
-    });
-    pendingUser = "";
-    pendingUserContent = null;
-    // Regeneration path: last completed turn without a newer user/tool payload.
-    if (pairs.length > 0 && trailingToolResults.length === 0) {
-      const last = pairs.pop()!;
-      lastUserText = last.userText;
-      // Images from a completed turn are already in Cursor checkpoint history;
-      // only re-attach when we still hold the original content for this request.
-      lastUserImages = extractImagesFromContent(pendingUserContent);
-    }
-  } else if (pendingUser || currentImages.length > 0) {
-    lastUserText = pendingUser;
-    lastUserImages = currentImages;
-  } else if (pairs.length > 0 && trailingToolResults.length === 0) {
-    const last = pairs.pop()!;
-    lastUserText = last.userText;
-  }
-
-  return {
-    systemPrompt,
-    userText: lastUserText,
-    images: lastUserImages,
-    turns: pairs,
-    toolResults: trailingToolResults,
-  };
-}
-
 /** Convert OpenAI tool definitions to Cursor's MCP tool protobuf format. */
 function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
   return tools.map((t) => {
@@ -2601,361 +1978,6 @@ function sendExecResult(
   sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 }
 
-function buildConversationIdentity(body: ChatCompletionRequest): string {
-  const rawIds = [
-    body.conversation_id,
-    body.thread_id,
-    body.session_id,
-    body.user,
-  ];
-  for (const id of rawIds) {
-    if (typeof id === "string" && id.trim().length > 0) {
-      return `id:${id.trim()}`;
-    }
-  }
-
-  const metadata = body.metadata && typeof body.metadata === "object"
-    ? body.metadata
-    : undefined;
-  if (metadata) {
-    const candidateKeys = ["conversation_id", "thread_id", "session_id", "chat_id", "id"];
-    for (const key of candidateKeys) {
-      const value = metadata[key];
-      if (typeof value === "string" && value.trim().length > 0) {
-        return `meta:${key}:${value.trim()}`;
-      }
-    }
-  }
-
-  return "";
-}
-
-/** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
-function selectionIdentity(selection: CursorModelSelection): string {
-  return JSON.stringify({
-    modelId: selection.modelId,
-    maxMode: selection.maxMode,
-    parameters: selection.parameters,
-  });
-}
-
-function deriveBridgeKey(modelId: string, body: ChatCompletionRequest): string {
-  const identity = buildConversationIdentity(body);
-  const firstUserMsg = body.messages.find((m) => m.role === "user");
-  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  const ns = requestKeyNamespace(body.messages);
-  let base = identity ? `${ns}${identity}` : `fallback:${ns}${firstUserText}`;
-  if (!identity && isPostCompactHistory(body.messages)) {
-    const summary = extractAnchoredSummary(body.messages);
-    const fingerprint = createHash("sha256")
-      .update(summary || `user:${firstUserText}`)
-      .digest("hex")
-      .slice(0, 16);
-    base = `${ns}postcompact:${fingerprint}:fallback:${firstUserText}`;
-  }
-  return createHash("sha256")
-    .update(`bridge:${modelId}:${base}`)
-    .digest("hex")
-    .slice(0, 24);
-}
-
-/** Detect if this is a title generation request by checking for title-gen system prompt. */
-export function isTitleGenerationRequest(messages: OpenAIMessage[]): boolean {
-  const systemText = messages
-    .filter((m) => m.role === "system")
-    .map((m) => textContent(m.content))
-    .join(" ");
-  return systemText.toLowerCase().includes("title generator") ||
-         systemText.toLowerCase().includes("generate a short title");
-}
-
-/**
- * Detect OpenCode /compact (compaction) and summary-agent requests.
- * These must not share the live agent conversation checkpoint and must not
- * advertise or emit tools — otherwise Cursor continues the coding agent and
- * OpenCode throws "Tool call not allowed while generating summary".
- */
-export function isSummaryGenerationRequest(messages: OpenAIMessage[]): boolean {
-  const systemText = messages
-    .filter((m) => m.role === "system")
-    .map((m) => textContent(m.content))
-    .join(" ")
-    .toLowerCase();
-  if (
-    systemText.includes("anchored context summarization") ||
-    systemText.includes("summarizing, compacting, or merging context") ||
-    systemText.includes("tasked with summarizing conversations") ||
-    systemText.includes("write like a pull request description") ||
-    systemText.includes("summarize what was done in this conversation")
-  ) {
-    return true;
-  }
-
-  // Compaction user prompts (when agent.prompt is absent from system for any reason).
-  const userText = messages
-    .filter((m) => m.role === "user")
-    .map((m) => textContent(m.content))
-    .join(" ")
-    .toLowerCase();
-  return (
-    userText.includes("this summary will be the only context available when the conversation continues") ||
-    userText.includes("create a detailed summary for continuing this coding session") ||
-    // OpenCode 1.18+ compaction can send the anchored-summary instruction as a
-    // bare user message with no system prompt (and tools: []), e.g.:
-    //   "Create a new anchored summary from the conversation history."
-    //   "Update the anchored summary below using the conversation history above.\n<previous-summary>…"
-    // Missing these leaves tools enabled and Cursor's agentic engine emits tool
-    // calls that OpenCode rejects with "Tool call not allowed while generating
-    // summary".
-    userText.includes("anchored summary from the conversation history") ||
-    userText.includes("anchored summary below using the conversation history") ||
-    userText.includes("<previous-summary>")
-  );
-}
-
-/** Namespace prefix so title/summary requests never collide with live agent state. */
-function requestKeyNamespace(messages: OpenAIMessage[]): string {
-  if (isTitleGenerationRequest(messages)) return "title:";
-  if (isSummaryGenerationRequest(messages)) return "summary:";
-  return "";
-}
-
-/**
- * True when OpenAI history has a user message after one or more tool results.
- * That pattern means the user interrupted/steered during a tool loop — the new
- * text must win over resuming the parked MCP bridge.
- */
-/**
- * True only when the user genuinely INTERRUPTED an unresolved tool batch.
- *
- * OpenCode always appends the current user prompt at the END of the replayed
- * message array, so after every completed tool round the tail looks like
- * `[…, assistant(tool_calls), tool(result), user("current prompt")]`. The old
- * implementation returned true for ANY user message after ANY tool message in
- * the whole history, which misclassified every normal continuation as an
- * interrupt — the proxy abandoned the parked bridge together with the tool
- * results and re-prompted Cursor with interrupt framing, so the model never
- * saw its tool output and restated the same plan forever (regression from
- * "honor user interrupts instead of bare cancel/resume", Jul 25).
- *
- * A steer exists only when the tool batch opened by the LAST assistant message
- * is still unresolved (no `role: tool` results after it) AND a trailing user
- * message is present. A user message after a completed round (results present,
- * or the last assistant made no tool calls) is a normal next turn.
- */
-export function hasUserSteerAfterTools(messages: OpenAIMessage[]): boolean {
-  let tailUserText = "";
-  let sawToolResult = false;
-  let sawAssistant = false;
-  let lastAssistantHasToolCalls = false;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg.role === "system") continue;
-    if (msg.role === "user") {
-      if (!tailUserText) {
-        tailUserText = textContent(msg.content).trim();
-      }
-      continue;
-    }
-    if (msg.role === "tool") {
-      sawToolResult = true;
-      continue;
-    }
-    if (msg.role === "assistant") {
-      lastAssistantHasToolCalls =
-        Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-      sawAssistant = true;
-      break;
-    }
-  }
-  if (!sawAssistant || !tailUserText) return false;
-  return lastAssistantHasToolCalls && !sawToolResult;
-}
-
-const INTERRUPT_STEER_PREFIX =
-  "Please follow this new instruction:";
-
-/** Frame a follow-up so Cursor treats it as a steer, not a bare cancel/resume.
- *  Kept natural — the previous "[User interrupted the previous turn...]" prefix
- *  made the model hallucinate "previous run was interrupted" responses. */
-export function buildInterruptSteerUserText(userText: string): string {
-  return `${INTERRUPT_STEER_PREFIX}\n\n${userText}`;
-}
-
-/**
- * True when the user message is OpenCode's synthetic post-compaction
- * "Continue if you have next steps…" prompt. Kept as a helper for
- * `isPostCompactHistory` / convKey stability (post-compact sessions must not
- * collide on one Cursor conversation), not for re-framing user prompts.
- */
-export function isCompactionContinueUserText(userText: string): boolean {
-  const text = userText.trim().toLowerCase();
-  if (!text) return false;
-  return (
-    text.startsWith("continue if you have next steps") ||
-    text.includes(
-      "continue if you have next steps, or stop and ask for clarification",
-    )
-  );
-}
-
-/**
- * Pull OpenCode's anchored compaction summary from history (assistant
- * "## Objective" …), if present.
- */
-export function extractAnchoredSummary(messages: OpenAIMessage[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg.role !== "assistant") continue;
-    const text = textContent(msg.content).trim();
-    if (
-      /^##\s*objective\b/im.test(text) &&
-      (/##\s*work state\b/im.test(text) ||
-        /\bimportant details\b/i.test(text) ||
-        /\bcompleted\b/i.test(text))
-    ) {
-      return text;
-    }
-  }
-  return "";
-}
-
-/**
- * True when OpenCode history is in the post-compaction shape:
- * either the synthetic continue prompt appears, or the session was rewritten
- * to "What did we do so far?" + anchored summary (OpenCode 1.18+).
- */
-export function isPostCompactHistory(messages: OpenAIMessage[]): boolean {
-  let sawContinue = false;
-  let sawWhatDidWeDo = false;
-  let sawObjectiveSummary = false;
-
-  for (const msg of messages) {
-    const text = textContent(msg.content).trim();
-    if (!text) continue;
-    if (msg.role === "user") {
-      if (isCompactionContinueUserText(text)) sawContinue = true;
-      if (/^what did we do so far\??$/i.test(text)) sawWhatDidWeDo = true;
-    }
-    if (msg.role === "assistant") {
-      // Anchored summaries from the compaction agent.
-      if (
-        /^##\s*objective\b/im.test(text) &&
-        (/##\s*work state\b/im.test(text) ||
-          /\bcompleted\b/i.test(text) ||
-          /\bremaining\b/i.test(text) ||
-          /\bimportant details\b/i.test(text))
-      ) {
-        sawObjectiveSummary = true;
-      }
-    }
-  }
-
-  return sawContinue || (sawWhatDidWeDo && sawObjectiveSummary);
-}
-
-
-/**
- * Max chars of a single mcpResult payload sent back to Cursor.
- * Huge shell/build logs (vite/webpack) can stall or kill the H2 bridge mid-resume;
- * OpenCode then marks the session idle with unsettled tool parts.
- * Override with OPENCODE_CURSOR_MCP_RESULT_MAX_CHARS.
- */
-const MCP_RESULT_MAX_CHARS = Number(
-  process.env.OPENCODE_CURSOR_MCP_RESULT_MAX_CHARS ?? 24_000,
-);
-const MCP_RESULT_HEAD_CHARS = Number(
-  process.env.OPENCODE_CURSOR_MCP_RESULT_HEAD_CHARS ?? 16_000,
-);
-const MCP_RESULT_TAIL_CHARS = Number(
-  process.env.OPENCODE_CURSOR_MCP_RESULT_TAIL_CHARS ?? 6_000,
-);
-
-/**
- * Truncate oversized tool output for Cursor mcpResult / continuation prompts.
- * Keeps head + tail so build success lines near the end stay visible.
- */
-export function truncateToolResultForCursor(content: string): string {
-  const text = content ?? "";
-  if (text.length <= MCP_RESULT_MAX_CHARS) return text;
-  const headN = Math.min(MCP_RESULT_HEAD_CHARS, MCP_RESULT_MAX_CHARS);
-  const tailN = Math.min(
-    MCP_RESULT_TAIL_CHARS,
-    Math.max(0, MCP_RESULT_MAX_CHARS - headN),
-  );
-  const head = text.slice(0, headN);
-  const tail = tailN > 0 ? text.slice(-tailN) : "";
-  const omitted = Math.max(0, text.length - head.length - tail.length);
-  return `${head}\n\n…[truncated ${omitted} chars of tool output for Cursor bridge stability]…\n\n${tail}`;
-}
-
-/** Drop unresolved pending tool calls from a checkpoint after user interrupt. */
-export function sanitizeCheckpointAfterInterrupt(
-  checkpoint: Uint8Array | null,
-): Uint8Array | null {
-  if (!checkpoint) return null;
-  try {
-    const state = fromBinary(ConversationStateStructureSchema, checkpoint);
-    if (!state.pendingToolCalls.length) return checkpoint;
-    state.pendingToolCalls = [];
-    return toBinary(ConversationStateStructureSchema, state);
-  } catch {
-    return checkpoint;
-  }
-}
-
-/** Derive a key for conversation state. Model-independent so context survives model switches.
- *
- * Priority:
- * 1) Explicit conversation identity passed by caller (conversation/thread/session/user)
- * 2) Fallback hash from stable message anchors (system + first user text)
- */
-function deriveConversationKey(body: ChatCompletionRequest): string {
-  const identity = buildConversationIdentity(body);
-  const firstUserMsg = body.messages.find((m) => m.role === "user");
-  const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
-  const ns = requestKeyNamespace(body.messages);
-  // NOTE: Do NOT include full system prompt in fallback key — OpenCode's system
-  // prompt changes every request (dynamic context, per-turn metadata), which would
-  // cause convKey to rotate and lose the stored conversation checkpoint.
-  // Only firstUserText is used — it's the stable initial user message.
-  // Always apply ns so /compact and title-gen never reuse the live agent checkpoint.
-  let fallbackSeed = `${ns}user:${firstUserText}`;
-  // After compact, OpenCode rewrites history so every session starts with the
-  // same synthetic user ("What did we do so far?"). Without a fingerprint,
-  // concurrent sessions collide on one Cursor conversationId and cross-talk.
-  if (!identity && isPostCompactHistory(body.messages)) {
-    const summary = extractAnchoredSummary(body.messages);
-    const fingerprint = createHash("sha256")
-      .update(summary || `user:${firstUserText}`)
-      .digest("hex")
-      .slice(0, 16);
-    fallbackSeed = `${ns}postcompact:${fingerprint}:user:${firstUserText}`;
-  }
-  const seed = identity ? `${ns}${identity}` : `fallback:${fallbackSeed}`;
-  return createHash("sha256")
-    .update(`conv:${seed}`)
-    .digest("hex")
-    .slice(0, 24);
-}
-
-/** Deterministic UUID derived from convKey so Cursor's server-side conversation
- *  persists across proxy restarts. Formats 16 bytes of SHA-256 as a v4-shaped UUID. */
-function deterministicConversationId(convKey: string): string {
-  const hex = createHash("sha256")
-    .update(`cursor-conv-id:${convKey}`)
-    .digest("hex")
-    .slice(0, 32);
-  // Format as UUID: xxxxxxxx-xxxx-4xxx-Nxxx-xxxxxxxxxxxx
-  return [
-    hex.slice(0, 8),
-    hex.slice(8, 12),
-    `4${hex.slice(13, 16)}`,
-    `${(0x8 | (parseInt(hex[16], 16) & 0x3)).toString(16)}${hex.slice(17, 20)}`,
-    hex.slice(20, 32),
-  ].join("-");
-}
-
 /** Context for retrying a streaming request after "Blob not found" errors. */
 interface RetryContext {
   stored: StoredConversation;
@@ -3052,209 +2074,7 @@ function postToolPreOutputStallTimeoutMs(): number {
     process.env.OPENCODE_CURSOR_POST_TOOL_PRE_OUTPUT_STALL_TIMEOUT_MS ?? 90_000,
   );
 }
-/** Override model for title-gen requests. When set, skips auto-discovery
- *  and uses this model directly. When unset (default), the proxy discovers
- *  a working free model from OpenCode Zen at startup. */
-const TITLE_GEN_MODEL_OVERRIDE = process.env.OPENCODE_CURSOR_TITLE_GEN_MODEL ?? "";
-
 const ZEN_BASE_URL = process.env.OPENCODE_ZEN_BASE_URL ?? "https://opencode.ai/zen/v1";
-
-/** Cached result of free-model discovery. Undefined = not yet discovered. */
-let resolvedTitleGenModel: string | undefined;
-/** Timestamp (ms) of the last successful discovery. */
-let lastDiscoveryMs = 0;
-/** Re-discover after this many milliseconds (8 hours). */
-const DISCOVERY_TTL_MS = 8 * 60 * 60 * 1000;
-/** Minimum pause between discovery attempts to avoid hammering on repeated failures. */
-const DISCOVERY_COOLDOWN_MS = 60_000;
-let lastDiscoveryAttemptMs = 0;
-
-/** Models known to be fast and good at title-gen. Probed first to speed up
- *  discovery. This list is purely advisory — if none respond, the full scan
- *  tests every model on Zen. */
-const ZEN_FAST_TRACK_MODELS = [
-  "minimax-m2.5-free",
-  "nemotron-3-super-free",
-  "big-pickle",
-];
-
-/** Disk cache for the discovered title-gen model. In-memory discovery is lost
- *  on every process restart (deploys/reboots), forcing a fresh ~2-3s probe on
- *  the first chat afterwards. Persisting the model id + timestamp skips that
- *  probe while keeping the same 8h freshness window. */
-const TITLE_GEN_CACHE_PATH = process.env.OPENCODE_CURSOR_TITLE_GEN_CACHE_PATH ??
-  pathJoin(homedir(), ".cache", "opencode-cursor", "title-gen-model.json");
-
-function loadTitleGenModelCache(): { model: string; ts: number } | undefined {
-  try {
-    const raw = readFileSync(TITLE_GEN_CACHE_PATH, "utf8");
-    const data = JSON.parse(raw) as { model?: unknown; ts?: unknown };
-    if (typeof data.model === "string" && data.model && typeof data.ts === "number") {
-      return { model: data.model, ts: data.ts };
-    }
-  } catch {
-    // missing/corrupt cache — treat as empty
-  }
-  return undefined;
-}
-
-function saveTitleGenModelCache(model: string): void {
-  try {
-    mkdirSync(dirname(TITLE_GEN_CACHE_PATH), { recursive: true });
-    writeFileSync(
-      TITLE_GEN_CACHE_PATH,
-      JSON.stringify({ model, ts: Date.now() }),
-      "utf8",
-    );
-  } catch {
-    // cache is best-effort
-  }
-}
-
-/** Probe a single Zen model with a tiny completion request (no auth).
- *  Returns the model ID if it responds with HTTP 200 and non-empty content,
- *  or undefined if it fails (401, timeout, error, etc.). */
-async function probeZenModel(modelId: string): Promise<string | undefined> {
-  try {
-    const start = Date.now();
-    const resp = await fetch(`${ZEN_BASE_URL}/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: modelId,
-        stream: false,
-        messages: [
-          { role: "system", content: "Reply with exactly: ok" },
-          { role: "user", content: "test" },
-        ],
-      }),
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (!resp.ok) return undefined;
-    const json = await resp.json() as { choices?: Array<{ message?: { content?: string } }> };
-    const content = json.choices?.[0]?.message?.content?.trim();
-    const ms = Date.now() - start;
-    if (!content) return undefined;
-    log.info(`[proxy] title-gen probe: ✅ ${modelId} responded (${ms}ms)`);
-    return modelId;
-  } catch {
-    return undefined;
-  }
-}
-
-/** Probe a list of model IDs concurrently. Returns the first model ID that
- *  responds successfully, or undefined if all fail. */
-async function raceProbeModels(modelIds: string[]): Promise<string | undefined> {
-  if (modelIds.length === 0) return undefined;
-  const results = await Promise.all(
-    modelIds.map((id) => probeZenModel(id)),
-  );
-  return results.find((r) => r !== undefined);
-}
-
-/** Discover a working free model from Zen by probing all available models
- *  without authentication. The first model that responds with valid content
- *  is selected — no naming convention heuristics.
- *
- *  Strategy:
- *  1. Fast-track: probe known-good models first (quick, 1-3 requests).
- *  2. Full scan: fetch /v1/models, probe ALL models concurrently.
- *
- *  Returns undefined if nothing works. */
-async function discoverZenFreeModel(): Promise<string | undefined> {
-  const now = Date.now();
-  if (now - lastDiscoveryAttemptMs < DISCOVERY_COOLDOWN_MS && resolvedTitleGenModel) {
-    return resolvedTitleGenModel;
-  }
-  lastDiscoveryAttemptMs = now;
-
-  // Phase 1: Fast-track — probe known good models
-  log.info(`[proxy] title-gen discovery: fast-track probing ${ZEN_FAST_TRACK_MODELS.join(", ")}`);
-  const fastResult = await raceProbeModels(ZEN_FAST_TRACK_MODELS);
-  if (fastResult) {
-    resolvedTitleGenModel = fastResult;
-    lastDiscoveryMs = Date.now();
-    saveTitleGenModelCache(fastResult);
-    return fastResult;
-  }
-
-  // Phase 2: Full scan — fetch model list, probe everything
-  try {
-    log.info(`[proxy] title-gen discovery: fast-track failed, scanning all models`);
-    const resp = await fetch(`${ZEN_BASE_URL}/models`, {
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!resp.ok) {
-      log.warn(`[proxy] title-gen discovery: /models returned ${resp.status}`);
-      return resolvedTitleGenModel;
-    }
-    const json = await resp.json() as { data?: Array<{ id: string }> };
-    const allModels = (json.data ?? []).map((m) => m.id);
-
-    // Skip models already tried in fast-track
-    const remaining = allModels.filter((id) => !ZEN_FAST_TRACK_MODELS.includes(id));
-    log.info(`[proxy] title-gen discovery: probing ${remaining.length} remaining models (parallel)`);
-
-    const scanResult = await raceProbeModels(remaining);
-    if (scanResult) {
-      resolvedTitleGenModel = scanResult;
-      lastDiscoveryMs = Date.now();
-      saveTitleGenModelCache(scanResult);
-      return scanResult;
-    }
-
-    log.warn(`[proxy] title-gen discovery: all ${allModels.length} models failed probe`);
-    return resolvedTitleGenModel;
-  } catch (err) {
-    log.warn(`[proxy] title-gen discovery error: ${err}`);
-    return resolvedTitleGenModel;
-  }
-}
-
-/** Restore the title-gen model from the disk cache if it is still fresh.
- *  Returns the restored model id or undefined. Idempotent — does not re-read
- *  once `resolvedTitleGenModel` is set. */
-function hydrateTitleGenModelFromDisk(): string | undefined {
-  if (TITLE_GEN_MODEL_OVERRIDE) return TITLE_GEN_MODEL_OVERRIDE;
-  if (resolvedTitleGenModel) return resolvedTitleGenModel;
-  const disk = loadTitleGenModelCache();
-  if (disk && Date.now() - disk.ts < DISCOVERY_TTL_MS) {
-    resolvedTitleGenModel = disk.model;
-    lastDiscoveryMs = disk.ts;
-    log.info(`[proxy] title-gen model restored from disk cache: ${disk.model}`);
-    return resolvedTitleGenModel;
-  }
-  return undefined;
-}
-
-/** Get the title-gen model to use. Resolves from override, cached discovery
- *  (memory, then disk), or triggers a fresh discovery if the cache is stale. */
-async function resolveTitleGenModel(): Promise<string> {
-  // Explicit override always wins
-  if (TITLE_GEN_MODEL_OVERRIDE) return TITLE_GEN_MODEL_OVERRIDE;
-
-  const now = Date.now();
-  // Use in-memory cached model if still fresh
-  if (resolvedTitleGenModel && now - lastDiscoveryMs < DISCOVERY_TTL_MS) {
-    return resolvedTitleGenModel;
-  }
-
-  // Hydrate from the disk cache so a fresh process skips the ~2-3s probe
-  // (discovery result survives restarts within the same 8h window).
-  const fromDisk = hydrateTitleGenModelFromDisk();
-  if (fromDisk) return fromDisk;
-
-  // Discover (or re-discover)
-  const discovered = await discoverZenFreeModel();
-  if (discovered) {
-    saveTitleGenModelCache(discovered);
-    return discovered;
-  }
-
-  // Last resort: fall back to gpt-5-nano (will likely 401 but better than crashing)
-  log.warn(`[proxy] title-gen: no free model discovered, falling back to gpt-5-nano`);
-  return "gpt-5-nano";
-}
 
 /** Create an SSE streaming Response that reads from a live bridge.
  *  When retryCtx is provided, automatically retries on "Blob not found" errors
@@ -3507,10 +2327,6 @@ function createBridgeStreamResponse(
           fallbackPromptTokens: conversationStates.get(convKey)?.lastPromptTokens ?? 0,
         };
         const tagFilter = createThinkingTagFilter();
-        // Title-gen requests use convKey starting with "title:".
-        // Suppress error-as-content for these to prevent error messages
-        // from becoming Discord thread titles.
-        const isTitleGenStream = convKey.startsWith("title:");
         let mcpExecReceived = false;
         let anyContentSent = false;
         /** Visible assistant text (not thinking/reasoning). Thinking-only
@@ -3521,7 +2337,6 @@ function createBridgeStreamResponse(
         let connectError = false;
         let emptyCloseRetry = false;
         let watchdogHandled = false;
-        let attemptSuperseded = false;
         let lastProgressAt = Date.now();
         const markProgress = () => {
           lastProgressAt = Date.now();
@@ -3662,9 +2477,7 @@ function createBridgeStreamResponse(
                       toolCallDebounceTimer = undefined;
                       if (closed) return;
                       if (!parkBridgeForToolCalls("debounce")) {
-                        if (!isTitleGenStream) {
-                          sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
-                        }
+                        sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
                         finishStream("stop");
                         return;
                       }
@@ -3729,16 +2542,11 @@ function createBridgeStreamResponse(
               }
 
               anyContentSent = true;
-              // For title-gen requests, suppress error-as-content to prevent
-              // error messages (e.g. "Connect error resource_exhausted") from
-              // becoming the Discord thread title. An empty response is better.
-              if (!isTitleGenStream) {
-                // Map known gRPC codes to user-friendly messages.
-                const displayMsg = isRateLimit
-                  ? `Cursor responded with "resource exhausted" after ${attempt + 1} attempt(s). This may be a temporary server overload or a rate limit. If the model usually works for you, please retry; if the error persists, try switching to a different model.`
-                  : formatConnectErrorForUser(endError.message, modelId);
-                sendSSE(makeChunk({ content: `\n[Error: ${displayMsg}]` }));
-              }
+              // Map known gRPC codes to user-friendly messages.
+              const displayMsg = isRateLimit
+                ? `Cursor responded with "resource exhausted" after ${attempt + 1} attempt(s). This may be a temporary server overload or a rate limit. If the model usually works for you, please retry; if the error persists, try switching to a different model.`
+                : formatConnectErrorForUser(endError.message, modelId);
+              sendSSE(makeChunk({ content: `\n[Error: ${displayMsg}]` }));
             }
           },
         );
@@ -3774,7 +2582,6 @@ function createBridgeStreamResponse(
           if (
             STALL_WAIT_NOTICE_MS > 0 &&
             !stallWaitUserNoticeEmittedThisResponse &&
-            !isTitleGenStream &&
             noProgressMs >= STALL_WAIT_NOTICE_MS &&
             noProgressMs < effectiveStallTimeoutMs
           ) {
@@ -3848,7 +2655,7 @@ function createBridgeStreamResponse(
               // Run from the latest checkpoint and re-attach tool results as a
               // continuation user message. Restarting the original requestBytes
               // would drop mcpResults already written to the dead bridge.
-              const continuation = buildPostToolStallContinuation(postedToolResults);
+              const continuation = buildPostToolBridgeLossContinuation(postedToolResults);
               const freshPayload = buildCursorRequest(
                 retryCtx.selection,
                 retryCtx.systemPrompt,
@@ -3882,11 +2689,9 @@ function createBridgeStreamResponse(
           // Honest terminal error — do NOT claim "retrying" when we are not.
           // OpenCode will not auto-retry a finished stop stream; a fake
           // "retrying..." message left agents hung until the user nudged them.
-          if (!isTitleGenStream) {
-            sendSSE(makeChunk({
-              content: "\n[Error: stream stalled; automatic recovery exhausted. Please resend your message.]",
-            }));
-          }
+          sendSSE(makeChunk({
+            content: "\n[Error: stream stalled; automatic recovery exhausted. Please resend your message.]",
+          }));
           finishStream("stop");
           deleteActiveBridge(bridgeKey);
           clearInterval(attemptHeartbeat);
@@ -3896,9 +2701,6 @@ function createBridgeStreamResponse(
         attemptBridge.onClose((code) => {
           clearInterval(stallTimer);
           clearInterval(attemptHeartbeat);
-          if (attemptSuperseded) {
-            return;
-          }
           if (watchdogHandled) {
             return;
           }
@@ -3941,9 +2743,6 @@ function createBridgeStreamResponse(
           // The setTimeout is scoped inside the ReadableStream — if the client
           // aborts (otto abort), the stream closes and safeRelease fires,
           // so no further retries will execute.
-          // Note: !retryCtx?.fallbackAttempted removed intentionally — the
-          // fallback model may also hit resource_exhausted, and we still want
-          // connect-error retries (with backoff) before surfacing the error.
           if (connectError && !anyContentSent && attempt < maxConnectRetries && liveAccessToken && liveRequestBytes) {
             deleteActiveBridge(bridgeKey);
             attemptBridge.kill();
@@ -4043,8 +2842,7 @@ function createBridgeStreamResponse(
           if (!mcpExecReceived) {
             // If no visible content was ever sent, surface an explicit error instead of
             // a silent empty completion that looks like "instant empty reply" in Discord.
-            // Suppress for title-gen to avoid polluting Discord thread names.
-            if (!anyVisibleTextSent && !isTitleGenStream) {
+            if (!anyVisibleTextSent) {
               log.warn(`[proxy] All retries exhausted; sending empty-stream error (bridgeKey=${bridgeKey})`);
               sendSSE(makeChunk({ content: "\n[Error: Cursor returned empty response. Try sending your message again.]" }));
             }
@@ -4069,9 +2867,7 @@ function createBridgeStreamResponse(
                 pendingExecs: state.pendingExecs,
               };
               if (!parkBridgeForToolCalls("bridge-close")) {
-                if (!isTitleGenStream) {
-                  sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
-                }
+                sendSSE(makeChunk({ content: "\n[Error: bridge capacity reached, try again]" }));
                 finishStream("stop");
                 clearInterval(attemptHeartbeat);
                 attemptBridge.kill();
@@ -4083,9 +2879,7 @@ function createBridgeStreamResponse(
               if (currentAttemptIsActive) {
                 deleteActiveBridge(bridgeKey);
               }
-              if (!isTitleGenStream) {
-                sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
-              }
+              sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
               finishStream("stop");
               clearInterval(attemptHeartbeat);
               attemptBridge.kill();
@@ -4100,48 +2894,6 @@ function createBridgeStreamResponse(
   });
 
   return new Response(stream, { headers: SSE_HEADERS });
-}
-
-/** Append tool-result payloads to an internal recovery continuation prompt. */
-function appendToolResultsToContinuation(
-  parts: string[],
-  toolResults?: ToolResultInfo[],
-): void {
-  if (!toolResults || toolResults.length === 0) return;
-  for (const result of toolResults) {
-    const content = result.content.trim() || "(no output)";
-    // Head+tail truncation keeps build success lines near the end.
-    parts.push(truncateToolResultForCursor(content));
-  }
-}
-
-/** User-facing continuation prompt used when a post-tool stream stalls and we
- *  rebuild a fresh Run from the stored checkpoint (mcpResults cannot be replayed).
- *  Kept natural — technical "[Internal stream recovery]" prefixes confused the
- *  model into hallucinating "empty message" responses. */
-function buildPostToolStallContinuation(toolResults?: ToolResultInfo[]): string {
-  const parts: string[] = [
-    "Continue from the current conversation checkpoint.",
-  ];
-  appendToolResultsToContinuation(parts, toolResults);
-  return parts.join("\n");
-}
-
-/**
- * Continuation when the parked tool bridge died/expired before OpenCode returned
- * results (typical after long shells/builds that outlive the old 5m TTL).
- * Always lead with an explicit continue cue — raw tool payloads alone (e.g.
- * TodoWrite status lines) were being misread as a brand-new user task, which
- * restarted planning every hop.
- */
-export function buildPostToolBridgeLossContinuation(
-  toolResults?: ToolResultInfo[],
-): string {
-  const parts: string[] = [
-    "Continue from the current conversation checkpoint.",
-  ];
-  appendToolResultsToContinuation(parts, toolResults);
-  return parts.join("\n");
 }
 
 /** Spawn a bridge, send the initial request frame, and start heartbeat. */
@@ -4195,7 +2947,6 @@ function handleStreamingResponse(
     abortSignal,
   );
 }
-
 /** Resume a paused bridge by sending MCP results and continuing to stream. */
 function handleToolResultResume(
   active: ActiveBridge,
@@ -4206,7 +2957,6 @@ function handleToolResultResume(
   release: () => void,
   workspaceRoot?: string,
   abortSignal?: AbortSignal,
-  messages: OpenAIMessage[] = [],
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
   active.lastAccessMs = Date.now();
@@ -4294,253 +3044,4 @@ function handleToolResultResume(
     false,
     abortSignal,
   );
-}
-
-async function handleNonStreamingResponse(
-  payload: CursorRequestPayload,
-  accessToken: string,
-  modelId: string,
-  convKey: string,
-  release: () => void,
-  workspaceRoot?: string,
-  toolsDisabled: boolean = false,
-): Promise<Response> {
-  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
-  const created = Math.floor(Date.now() / 1000);
-  try {
-    const { text, usage } = await collectFullResponse(
-      payload,
-      accessToken,
-      convKey,
-      workspaceRoot,
-      toolsDisabled,
-    );
-    return new Response(
-      JSON.stringify({
-        id: completionId,
-        object: "chat.completion",
-        created,
-        model: modelId,
-        choices: [
-          {
-            index: 0,
-            message: { role: "assistant", content: text },
-            finish_reason: "stop",
-          },
-        ],
-        usage,
-      }),
-      { headers: { "Content-Type": "application/json" } },
-    );
-  } finally {
-    release();
-  }
-}
-
-interface CollectedResponse {
-  text: string;
-  usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
-}
-
-const AGENT_PROBE_TIMEOUT_MS = 30_000;
-const AGENT_PROBE_SYSTEM_PROMPT = "You are a helpful assistant.";
-const AGENT_PROBE_USER_TEXT = "Say hi";
-
-/** Minimal agent Run probe — true when Cursor accepts the model for agent requests. */
-export async function probeCursorAgentSelection(
-  accessToken: string,
-  selection: CursorModelSelection,
-): Promise<boolean> {
-  const payload = buildCursorRequest(
-    selection,
-    AGENT_PROBE_SYSTEM_PROMPT,
-    AGENT_PROBE_USER_TEXT,
-    crypto.randomUUID(),
-    null,
-  );
-
-  return new Promise<boolean>((resolve) => {
-    let settled = false;
-    let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
-
-    const finish = (ok: boolean, reason: string) => {
-      if (settled) return;
-      settled = true;
-      if (process.env.OPENCODE_CURSOR_DEBUG_PROBE === "1") {
-        console.log(`[probe] finish ok=${ok} reason=${reason} model=${selection.publicId}`);
-      }
-      clearTimeout(timer);
-      if (heartbeatTimer) clearInterval(heartbeatTimer);
-      bridge.kill();
-      resolve(ok);
-    };
-
-    const timer = setTimeout(() => finish(false, "timeout"), AGENT_PROBE_TIMEOUT_MS);
-
-    const bridge: ReturnType<typeof spawnBridge> | BridgeHandle = bridgePool
-      ? bridgePool.acquire({
-          accessToken,
-          rpcPath: "/agent.v1.AgentService/Run",
-          url: CURSOR_API_URL,
-        })
-      : spawnBridge({
-          accessToken,
-          rpcPath: "/agent.v1.AgentService/Run",
-        });
-
-    const blobStore = payload.blobStore;
-    const state: StreamState = {
-      toolCallIndex: 0,
-      pendingExecs: [],
-      outputTokens: 0,
-      promptTokens: 0,
-      fallbackPromptTokens: 0,
-    };
-
-    bridge.onData(
-      createConnectFrameParser(
-        (messageBytes) => {
-          try {
-            const serverMessage = fromBinary(
-              AgentServerMessageSchema,
-              messageBytes,
-            );
-            processServerMessage(
-              serverMessage,
-              blobStore,
-              payload.mcpTools,
-              (data) => bridge.write(data),
-              state,
-              (text) => {
-                if (text.trim()) {
-                  finish(true, "text");
-                }
-              },
-              () => {},
-              () => {},
-              undefined,
-            );
-          } catch {
-            // Ignore unparseable frames during probe.
-          }
-        },
-        (endStreamBytes) => {
-          const err = parseConnectEndStream(endStreamBytes);
-          if (err) {
-            finish(false, "connect-error");
-            return;
-          }
-          if (state.outputTokens > 0) {
-            finish(true, "tokens");
-          }
-        },
-      ),
-    );
-
-    bridge.onClose((code) => {
-      if (!settled) {
-        if (state.outputTokens > 0) {
-          finish(true, "tokens-on-close");
-        } else {
-          finish(false, `close:${code}`);
-        }
-      }
-    });
-
-    bridge.write(frameConnectMessage(payload.requestBytes));
-    heartbeatTimer = setInterval(
-      () => bridge.write(makeHeartbeatBytes()),
-      5_000,
-    );
-  });
-}
-
-async function collectFullResponse(
-  payload: CursorRequestPayload,
-  accessToken: string,
-  convKey: string,
-  workspaceRoot?: string,
-  toolsDisabled: boolean = false,
-): Promise<CollectedResponse> {
-  const { promise, resolve } = Promise.withResolvers<CollectedResponse>();
-  let fullText = "";
-
-  const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
-
-  const state: StreamState = {
-    toolCallIndex: 0,
-    pendingExecs: [],
-    outputTokens: 0,
-    promptTokens: 0,
-    fallbackPromptTokens: conversationStates.get(convKey)?.lastPromptTokens ?? 0,
-  };
-  const tagFilter = createThinkingTagFilter();
-
-  bridge.onData(createConnectFrameParser(
-    (messageBytes) => {
-      try {
-        const serverMessage = fromBinary(
-          AgentServerMessageSchema,
-          messageBytes,
-        );
-        processServerMessage(
-          serverMessage,
-          payload.blobStore,
-          payload.mcpTools,
-          (data) => bridge.write(data),
-          state,
-          (text, isThinking) => {
-            if (isThinking) return;
-            const { content } = tagFilter.process(text);
-            fullText += content;
-          },
-          () => {},
-          (checkpointBytes) => {
-            const stored = conversationStates.get(convKey);
-            if (stored) {
-              stored.checkpoint = checkpointBytes;
-              for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-              enforceConversationBlobBudget(stored);
-              stored.lastAccessMs = Date.now();
-              // processServerMessage already updated state.promptTokens.
-              rememberConversationTokens(convKey, state.promptTokens);
-            }
-          },
-          workspaceRoot,
-          toolsDisabled,
-        );
-      } catch {
-        // Skip
-      }
-    },
-    (endStreamBytes) => {
-      const endError = parseConnectEndStream(endStreamBytes);
-      if (endError) {
-        fullText += `\n[Error: ${endError.message}]`;
-      }
-    },
-  ));
-
-  bridge.onClose(() => {
-    clearInterval(heartbeatTimer);
-    const stored = conversationStates.get(convKey);
-    if (stored) {
-      for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-      enforceConversationBlobBudget(stored);
-      stored.lastAccessMs = Date.now();
-    }
-    const flushed = tagFilter.flush();
-    fullText += flushed.content;
-
-    const usage = computeUsage(state);
-    if (usage.prompt_tokens > 0) {
-      rememberConversationTokens(convKey, usage.prompt_tokens);
-    }
-    resolve({
-      text: fullText,
-      usage,
-    });
-  });
-
-  return promise;
 }
