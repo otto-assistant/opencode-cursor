@@ -1,8 +1,11 @@
-import { resolve as pathResolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { resolveNodeExecutable } from "./node-runtime.js";
 
 export const CURSOR_API_URL =
   process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
-export const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
+export const BRIDGE_PATH = fileURLToPath(
+  new URL("./h2-bridge.mjs", import.meta.url),
+);
 
 function lpEncode(data: Uint8Array): Buffer {
   const buffer = Buffer.alloc(4 + data.length);
@@ -22,7 +25,7 @@ interface CursorUnaryRpcOptions {
 }
 
 function spawnBridge(options: CursorUnaryRpcOptions) {
-  const proc = Bun.spawn(["node", BRIDGE_PATH], {
+  const proc = Bun.spawn([resolveNodeExecutable(), BRIDGE_PATH], {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "ignore",

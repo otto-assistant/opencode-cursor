@@ -11,7 +11,7 @@ export interface TestModules {
   decodeCursorModelSelection: typeof import("../../src/model-selection").decodeCursorModelSelection;
   generateCursorAuthParams: typeof import("../../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../../src/auth").getTokenExpiry;
-  CursorAuthPlugin: typeof import("../../src/index").CursorAuthPlugin;
+  CursorAuthPlugin: typeof import("../../src/v1").CursorAuthPluginV1;
   clearModelCache: typeof import("../../src/models").clearModelCache;
   normalizeCursorModels: typeof import("../../src/models").normalizeCursorModels;
   normalizeAvailableModels: typeof import("../../src/models").normalizeAvailableModels;
@@ -22,7 +22,7 @@ export interface TestModules {
 export async function loadTestModules(): Promise<TestModules> {
   const proxy = await import("../../src/proxy");
   const auth = await import("../../src/auth");
-  const index = await import("../../src/index");
+  const v1 = await import("../../src/v1");
   const models = await import("../../src/models");
   const modelSelection = await import("../../src/model-selection");
   const authLogin = await import("../../src/auth-login");
@@ -39,7 +39,7 @@ export async function loadTestModules(): Promise<TestModules> {
     decodeCursorModelSelection: modelSelection.decodeCursorModelSelection,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
-    CursorAuthPlugin: index.CursorAuthPlugin,
+    CursorAuthPlugin: v1.CursorAuthPluginV1,
     clearModelCache: models.clearModelCache,
     normalizeCursorModels: models.normalizeCursorModels,
     normalizeAvailableModels: models.normalizeAvailableModels,
