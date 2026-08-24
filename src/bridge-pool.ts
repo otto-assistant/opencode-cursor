@@ -9,9 +9,12 @@
  * across requests: after a stream completes, the worker returns to
  * the idle pool. Dead workers are replaced automatically.
  */
-import { resolve as pathResolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { resolveNodeExecutable } from "./node-runtime.js";
 
-const PERSISTENT_BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge-persistent.mjs");
+const PERSISTENT_BRIDGE_PATH = fileURLToPath(
+  new URL("./h2-bridge-persistent.mjs", import.meta.url),
+);
 
 // --- Typed message protocol constants ---
 const IN_NEW_REQUEST = 0x00;
@@ -49,7 +52,7 @@ interface PersistentWorker {
 }
 
 function spawnWorker(): PersistentWorker {
-  const proc = Bun.spawn(["node", PERSISTENT_BRIDGE_PATH], {
+  const proc = Bun.spawn([resolveNodeExecutable(), PERSISTENT_BRIDGE_PATH], {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "ignore",
@@ -212,6 +215,7 @@ export class BridgePool {
     if (!worker) {
       if (this.allWorkers.size < this.maxSize) {
         worker = this.addWorker();
+        this.idle.pop();
       } else {
         // Pool full — spawn an ephemeral worker not tracked by pool
         worker = spawnWorker();
