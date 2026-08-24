@@ -132,7 +132,13 @@ export async function startTestCursorBackend(): Promise<TestCursorBackend> {
   const refreshPort = (refreshServer.address() as AddressInfo).port;
 
   const apiServer = http2.createServer();
+  // Native transport cancellation resets test streams by design. Bun surfaces
+  // those peer resets as EventEmitter errors unless the fixture consumes them.
+  apiServer.on("session", (session) => {
+    session.on("error", () => {});
+  });
   apiServer.on("stream", (stream, headers) => {
+    stream.on("error", () => {});
     const path = String(headers[":path"] ?? "");
     const authHeader = String(headers.authorization ?? "");
     if (path === "/agent.v1.AgentService/Run") {
