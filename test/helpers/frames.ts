@@ -4,7 +4,6 @@ import {
   HeartbeatUpdateSchema,
   InteractionUpdateSchema,
   TextDeltaUpdateSchema,
-  ThinkingDeltaUpdateSchema,
   TurnEndedUpdateSchema,
 } from "../../src/proto/agent_pb";
 
@@ -68,29 +67,5 @@ export function frameTextThenEndServerMessages(text: string): Buffer[] {
   return [
     frameConnectUnaryMessage(textPayload),
     frameConnectUnaryMessage(endPayload),
-  ];
-}
-
-export function frameReasoningTextThenEndServerMessages(
-  reasoning: string,
-  text: string,
-): Buffer[] {
-  const reasoningPayload = toBinary(
-    AgentServerMessageSchema,
-    create(AgentServerMessageSchema, {
-      message: {
-        case: "interactionUpdate",
-        value: create(InteractionUpdateSchema, {
-          message: {
-            case: "thinkingDelta",
-            value: create(ThinkingDeltaUpdateSchema, { text: reasoning }),
-          },
-        }),
-      },
-    }),
-  );
-  return [
-    frameConnectUnaryMessage(reasoningPayload),
-    ...frameTextThenEndServerMessages(text),
   ];
 }

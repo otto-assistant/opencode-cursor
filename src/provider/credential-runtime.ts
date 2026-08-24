@@ -1,4 +1,4 @@
-import type { PluginInput } from "@opencode-ai/plugin-v1";
+import type { PluginInput } from "@opencode-ai/plugin";
 import { RefreshTokenInvalidError } from "../auth.js";
 import {
   createAccessTokenProvider,

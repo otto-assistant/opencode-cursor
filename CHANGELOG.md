@@ -5,26 +5,6 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.0.0-beta.2] - 2026-08-24
-
-### Added
-
-- OpenCode V2 `Plugin.define` entrypoint with native integration, catalog, and
-  `LanguageModelV3` registrations
-- Native Cursor AgentService transport for images, cancellation, parallel tool
-  calls, bounded H2 pooling, and live tool-result continuation
-- V2 loader, package, lifecycle, catalog, integration, and language-adapter tests
-- Preserved OpenCode V1 adapter at the `./v1` package export; npm `latest`
-  remains on the `2.x` release line while V2 publishes under npm `beta`
-
-### Changed
-
-- OpenCode V2 now owns transcript reconstruction, credential persistence,
-  permissions, tool execution, and compaction; the V2 path no longer uses the
-  localhost OpenAI-compatible proxy
-- Adapted from CasualDeveloper's V2 implementation in commit
-  `3af03f605243b58b33c2a9e1f9fa638280bca693`
-
 ## [2.2.0] - 2026-08-05
 
 ### Changed
@@ -74,7 +54,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 See [GitHub Releases](https://github.com/otto-assistant/opencode-cursor/releases) for earlier notes.
 
 [2.2.0]: https://github.com/otto-assistant/opencode-cursor/compare/v2.1.0...v2.2.0
-[3.0.0-beta.2]: https://github.com/otto-assistant/opencode-cursor/compare/v2.2.0...v3.0.0-beta.2
 [2.1.0]: https://github.com/otto-assistant/opencode-cursor/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/otto-assistant/opencode-cursor/compare/v1.4.0...v2.0.0
 [1.4.0]: https://github.com/otto-assistant/opencode-cursor/releases/tag/v1.4.0

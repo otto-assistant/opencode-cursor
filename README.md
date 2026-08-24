@@ -1,168 +1,173 @@
 <p align="center">
-  <img src="docs/header.svg" width="828" alt="opencode-cursor — Cursor models in OpenCode">
+  <img src="docs/header.svg" width="828" alt="opencode-cursor — Cursor models in OpenCode, direct API, native OAuth">
 </p>
 
-# Cursor provider for OpenCode 2
+<p align="center">
+  <a href="https://www.npmjs.com/package/@otto-assistant/opencode-cursor-oauth"><img src="https://img.shields.io/npm/v/%40otto-assistant%2Fopencode-cursor-oauth?style=flat-square&color=3dd6c6&labelColor=0b1220&label=npm" alt="npm version"></a>
+  <a href="https://www.npmjs.com/package/@otto-assistant/opencode-cursor-oauth"><img src="https://img.shields.io/npm/dm/%40otto-assistant%2Fopencode-cursor-oauth?style=flat-square&color=3dd6c6&labelColor=0b1220" alt="npm downloads"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3dd6c6?style=flat-square&labelColor=0b1220" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/linux%20·%20macos%20·%20windows-3dd6c6?style=flat-square&labelColor=0b1220" alt="linux, macos, windows">
+  <a href="https://github.com/otto-assistant/opencode-cursor/releases"><img src="https://img.shields.io/github/v/release/otto-assistant/opencode-cursor?style=flat-square&color=3dd6c6&labelColor=0b1220&label=release" alt="latest release"></a>
+</p>
 
-Use the models available to your Cursor account from OpenCode 2, including
-Cursor private models, live model variants, image input, streaming, and tool
-continuation.
+<p align="center">
+  <strong>Cursor models inside OpenCode</strong> — browser OAuth, live catalog discovery,<br>
+  and a local OpenAI-compatible proxy tuned for agent loops.
+</p>
 
-This is the V2 beta line. OpenCode 1 users remain supported by the `2.x`
-release on npm's `latest` tag; the beta package also exposes the preserved
-legacy adapter as `@otto-assistant/opencode-cursor-oauth/v1` for migration
-testing.
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#authenticate">Authenticate</a> ·
+  <a href="#why-this-plugin">Why this plugin</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#troubleshooting">Troubleshooting</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
 
-## Status
+---
 
-- Plugin version: `3.0.0-beta.2`
-- OpenCode channel: V2 beta
-- Plugin API: pinned to the matching OpenCode beta build
-- Package dist-tag after publication: `beta`
+Use every model on your Cursor subscription from OpenCode: Claude, GPT, Gemini, Grok, Composer, and Cursor Auto — with thinking, effort variants, streaming, and tool calls that actually finish.
 
-OpenCode 2 and its plugin API are still beta. Exact beta versions are pinned
-because entrypoints, hooks, and catalog shapes may change between previews.
+No `cursor-agent` binary. No SDK child-process gymnastics. Direct Cursor API over HTTP/2.
 
-## Install
+## Quick start
 
-Once the beta package is published:
-
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugins": ["@otto-assistant/opencode-cursor-oauth@beta"]
-}
-```
-
-Restart OpenCode after changing an npm plugin version. The current pinned beta
-CLI can list active plugins with `opencode2 plugin list`; package add/remove
-commands are not available in this preview.
-
-For development from this repository:
+**1. Install the plugin**
 
 ```bash
-bun install --frozen-lockfile
-bun run build
+npm install -g @otto-assistant/opencode-cursor-oauth
 ```
 
-Add the built entrypoint to a V2 config:
+**2. Register it in OpenCode**
+
+Add (or merge) this into `~/.config/opencode/opencode.json`:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": ["../dist/index.js"]
+  "plugin": ["@otto-assistant/opencode-cursor-oauth"],
+  "provider": {
+    "cursor": { "name": "Cursor" }
+  }
 }
 ```
 
-Relative plugin paths are resolved from the config file containing them.
+**3. Sign in with Cursor (browser OAuth — not an API key)**
 
-## Connect Cursor
+```bash
+opencode auth login --provider cursor
+```
 
-Start OpenCode 2, run `/connect`, and choose **Cursor** followed by
-**Sign in with Cursor**. Open the displayed URL and approve access.
+A browser window opens. Approve access. Tokens land in `~/.local/share/opencode/auth.json` and refresh automatically.
 
-OpenCode owns credential storage and refresh. The plugin does not read or
-write OpenCode credential files directly.
+**4. Use a Cursor model**
 
-You need:
+```bash
+opencode run "Summarise this repository in five bullets." --model cursor/default
+```
 
-- An active Cursor account with model entitlement
-- OpenCode 2 beta matching the plugin API version
-- Bun for the plugin runtime
-- Node.js 18 or newer for the bundled HTTP/2 workers
+In the TUI: pick provider **cursor**, then a model (including Thinking / Fast / effort variants when Cursor exposes them).
 
-The Cursor desktop application and `cursor-agent` CLI are not required.
+### From source (optional)
+
+```bash
+git clone https://github.com/otto-assistant/opencode-cursor.git
+cd opencode-cursor
+bun install && bun run build
+npm install -g .
+```
+
+## Authenticate
+
+| Step | What happens |
+|------|----------------|
+| `opencode auth login --provider cursor` | Starts PKCE browser OAuth |
+| You approve in the browser | Cursor returns access + refresh tokens |
+| Plugin stores credentials | `~/.local/share/opencode/auth.json` |
+| Access expires | Plugin refreshes silently; permanent 4xx → re-login |
+
+If you use OpenChamber and never see an OAuth button, the plugin still prints a login URL and embeds it in the placeholder model name — open that URL, then reload.
+
+**You do not need a Cursor API key.** Browser OAuth is the only supported path.
+
+## Why this plugin
+
+| | |
+|---|---|
+| **Direct API** | Talks to Cursor over HTTP/2. No `cursor-agent` install, no brittle CLI wrapper. |
+| **Native OAuth** | `opencode auth login` — PKCE browser flow with automatic token refresh. |
+| **Live models** | Discovers your account's catalog, including Thinking, Fast, 1M context, and effort levels. |
+| **Agent-grade streaming** | Tool calls continue correctly; parked bridges resume with results instead of restating forever. |
+| **Phase-aware stalls** | Reasoning gets time to think; silent post-tool hangs recover in ~90s, not minutes. |
+| **Measured speed** | v2.2: first message **−39% to −44%** TTFB vs prior release (cold start + H2 pre-connect). |
 
 ## Architecture
 
 ```text
-OpenCode 2
-  └─ V2 integration and catalog APIs
-       └─ native LanguageModelV3 adapter
-            └─ Node HTTP/2 bridge pool
-                 └─ Cursor AgentService
+OpenCode
+  └─ /v1/chat/completions
+       └─ Local OpenAI-compatible proxy
+            └─ Node HTTP/2 bridge
+                 └─ Cursor API (api2.cursor.sh)
 ```
 
-OpenCode owns provider selection, credentials, permissions, persistence, and
-tool execution. Each user turn starts a Cursor AgentService Run from OpenCode's
-active transcript. If Cursor requests a tool, that Run remains alive only until
-OpenCode returns the matching result; terminal responses discard it. Cursor
-checkpoints are not retained, while private Composer models and native Cursor
-rate limits remain available.
+| Layer | Responsibility |
+|-------|----------------|
+| **Plugin hooks** | OAuth, provider config, model catalog, selection headers |
+| **Proxy** | OpenAI ↔ Cursor protocol, tool loops, stalls, checkpoints |
+| **Transport** | Persistent / one-shot HTTP/2 bridges to Cursor |
 
-### Model routing
+Model listings map Cursor's variant catalog into OpenCode-native choices (`Opus 4.8`, `Opus 4.8 Thinking`, effort `low`→`max`, Fast, …). Selection is encoded for the proxy so Cursor receives the exact `RequestedModel` parameters your account supports.
 
-The catalog is discovered from the signed-in Cursor account. Every model and
-variant carries an encoded internal selection header containing the exact
-Cursor model ID, parameters, and routing mode. The native adapter validates
-that header and maps it into Cursor's `RequestedModel`.
+## Performance notes
 
-No hardcoded offline model catalog is advertised. After a connection changes,
-the plugin refreshes discovery and asks OpenCode to reload the catalog.
+From the [v2.2.0](https://github.com/otto-assistant/opencode-cursor/releases/tag/v2.2.0) release:
 
-### Lifecycle
+| Scenario | Before | After |
+|---|---|---|
+| First message, `gpt-5.4-nano` | 8.5s | **4.8s** |
+| First message, `cursor/default` | 6.1s | **3.7s** |
+| Post-tool silent stall budget | 180s | **90s** |
 
-The plugin starts a bounded HTTP/2 worker pool during V2 `setup()`. Disabling,
-reloading, or shutting down the plugin stops:
+Knobs (optional): `OPENCODE_CURSOR_PRE_OUTPUT_STALL_TIMEOUT_MS`, `OPENCODE_CURSOR_POST_TOOL_PRE_OUTPUT_STALL_TIMEOUT_MS`, `OPENCODE_CURSOR_TOOL_DEBOUNCE_MS`.
 
-- active AgentService Runs
-- HTTP/2 bridge workers
-- pending OAuth polling
-- catalog event subscriptions
+Debug logs: `OPENCODE_CURSOR_DEBUG=1`.
+
+## Requirements
+
+- [OpenCode](https://opencode.ai)
+- Active Cursor subscription
+- Bun (plugin runtime) · Node.js ≥ 18 (HTTP/2 bridge)
 
 ## Development
 
 ```bash
-npm test
-npm run test:v2
-npm run typecheck
-npm run build
-npm run test:package
-npm run test:v2-loader
+bun install
+bun run build
+bun run test
 ```
 
-Or run the complete deterministic gate:
+## Troubleshooting
 
-```bash
-npm run verify
-```
+| Symptom | Fix |
+|---------|-----|
+| Cursor missing from provider list | Confirm `plugin` includes `@otto-assistant/opencode-cursor-oauth` and restart OpenCode |
+| "sign in required" / login URL in model name | Open the printed URL, approve OAuth, reload |
+| Refresh rejected / re-login required | Run `opencode auth login --provider cursor` again |
+| Model not found | Wait for live discovery after login; avoid relying on stale offline catalogs |
+| Tool loop restates forever | Update to latest plugin — post-tool resume + phase-aware stalls are required |
 
-`test:package` packs the exact built artifact, installs only its production
-dependencies with lifecycle scripts disabled, imports it independently, and
-loads that extracted package through the pinned `opencode2` beta.
+## FAQ
 
-## Debugging
+**Do I need to clone the repo?**  
+No. Configure the npm package in `opencode.json` and OpenCode installs it.
 
-Enable plugin logs:
+**Is this the same as cursor-agent bridges?**  
+No. This plugin authenticates with Cursor OAuth and proxies the Cursor API directly. You do not need the `cursor-agent` CLI.
 
-```bash
-OPENCODE_CURSOR_DEBUG=1 opencode2
-```
-
-Optional AgentService controls:
-
-- `OPENCODE_CURSOR_NATIVE_TOOL_SETTLE_MS`
-- `OPENCODE_CURSOR_PRE_OUTPUT_STALL_TIMEOUT_MS`
-- `OPENCODE_CURSOR_POST_TOOL_PRE_OUTPUT_STALL_TIMEOUT_MS`
-- `OPENCODE_CURSOR_STALL_TIMEOUT_MS`
-- `OPENCODE_CURSOR_MAX_ACTIVE_RUNS`
-- `OPENCODE_CURSOR_NATIVE_PARK_TTL_MS`
-- `OPENCODE_CURSOR_DEFAULT_CONTEXT_WINDOW`
-- `OPENCODE_CURSOR_DEFAULT_MAX_TOKENS`
-- `OPENCODE_CURSOR_BRIDGE_POOL_MIN`
-- `OPENCODE_CURSOR_BRIDGE_POOL_MAX`
-- `OPENCODE_CURSOR_BRIDGE_POOL_DISABLED`
-
-## Known beta constraints
-
-- OpenCode V2 plugin contracts may change before stable 2.0.
-- One Cursor integration currently resolves one active OpenCode credential.
-- Real account acceptance consumes Cursor quota and is run separately from
-  deterministic CI.
-- Models without explicit Cursor context metadata use the configurable default
-  context and output limits listed above.
-- The plugin relies on Cursor's private API, which can change without notice.
+**Where are releases?**  
+[GitHub Releases](https://github.com/otto-assistant/opencode-cursor/releases) · [npm](https://www.npmjs.com/package/@otto-assistant/opencode-cursor-oauth) · [Changelog](CHANGELOG.md)
 
 ## License
 
-MIT
+[MIT](LICENSE)

@@ -1,3 +1,4 @@
+import { tool } from "@opencode-ai/plugin";
 import {
   literalCursorModelSelection,
   type CursorModel,
@@ -6,6 +7,24 @@ import {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MAX_TOKENS,
 } from "../shared/constants.js";
+const z = tool.schema;
+
+const CursorModelDetailsSchema = z.object({
+  modelId: z.string(),
+  displayName: z.string().optional().catch(undefined),
+  displayNameShort: z.string().optional().catch(undefined),
+  displayModelId: z.string().optional().catch(undefined),
+  aliases: z
+    .array(z.unknown())
+    .optional()
+    .catch([])
+    .transform((aliases) =>
+      (aliases ?? []).filter(
+        (alias: unknown): alias is string => typeof alias === "string",
+      ),
+    ),
+  thinkingDetails: z.unknown().optional(),
+});
 
 interface CursorModelDetails {
   modelId: string;
@@ -71,8 +90,10 @@ export function normalizeCursorModels(
 }
 
 function normalizeSingleModel(model: unknown): CursorModel | null {
-  const details = parseCursorModelDetails(model);
-  if (!details) return null;
+  const parsed = CursorModelDetailsSchema.safeParse(model);
+  if (!parsed.success) return null;
+
+  const details = parsed.data;
   const id = details.modelId.trim();
   if (!id) return null;
 
@@ -84,30 +105,6 @@ function normalizeSingleModel(model: unknown): CursorModel | null {
     maxTokens: DEFAULT_MAX_TOKENS,
     defaultSelection: literalCursorModelSelection(id),
     variants: {},
-  };
-}
-
-function parseCursorModelDetails(
-  value: unknown,
-): CursorModelDetails | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return undefined;
-  }
-  const record = value as Record<string, unknown>;
-  if (typeof record.modelId !== "string") return undefined;
-  const optionalString = (key: string): string | undefined =>
-    typeof record[key] === "string" ? record[key] : undefined;
-  return {
-    modelId: record.modelId,
-    displayName: optionalString("displayName"),
-    displayNameShort: optionalString("displayNameShort"),
-    displayModelId: optionalString("displayModelId"),
-    aliases: Array.isArray(record.aliases)
-      ? record.aliases.filter(
-          (alias): alias is string => typeof alias === "string",
-        )
-      : [],
-    thinkingDetails: record.thinkingDetails,
   };
 }
 
