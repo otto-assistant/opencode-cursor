@@ -13,6 +13,7 @@ import {
 import {
   frameConnectUnaryMessage,
   frameHeartbeatServerMessage,
+  frameReasoningTextThenEndServerMessages,
   frameTextThenEndServerMessages,
 } from "../helpers/frames";
 import { makeJwt } from "../helpers/jwt";
@@ -20,6 +21,12 @@ import { makeJwt } from "../helpers/jwt";
 export type DiscoveryMode = "success" | "empty" | "auth-error";
 export type RunMode =
   | "immediate-close"
+  | "stateless-tool-loop"
+  | "stateless-parallel-tool-loop"
+  | "reasoning-text"
+  | "native-tool-loop"
+  | "native-multi-tool-loop"
+  | "native-parallel-tool-loop"
   | "stall-once-then-close"
   | "heartbeat-only-stall"
   | "text-then-hang"
@@ -49,6 +56,7 @@ export interface TestCursorBackend {
   setRunMode: (mode: RunMode) => void;
   getRunRequestCount: () => number;
   getRunUserTexts: () => string[];
+  getRunImageCounts: () => number[];
   getRunModelIds: () => string[];
   getRunSelections: () => Array<{
     publicId?: string;
@@ -58,6 +66,7 @@ export interface TestCursorBackend {
     maxMode?: boolean;
     parameters: Record<string, string>;
   }>;
+  getRunToolResultErrors: () => boolean[];
   close: () => Promise<void>;
 }
 
@@ -67,6 +76,8 @@ export async function startTestCursorBackend(): Promise<TestCursorBackend> {
   let runRequestCount = 0;
   const runModelIds: string[] = [];
   const runUserTexts: string[] = [];
+  const runImageCounts: number[] = [];
+  const runToolResultErrors: boolean[] = [];
   let runStallConsumed = false;
   let discoveredModels: Array<{
     id: string;
@@ -126,6 +137,7 @@ export async function startTestCursorBackend(): Promise<TestCursorBackend> {
     const authHeader = String(headers.authorization ?? "");
     if (path === "/agent.v1.AgentService/Run") {
       runRequestCount++;
+      let nativeResultCount = 0;
       let pending = Buffer.alloc(0);
       stream.on("data", (chunk) => {
         pending = Buffer.concat([pending, Buffer.from(chunk)]);
@@ -142,8 +154,12 @@ export async function startTestCursorBackend(): Promise<TestCursorBackend> {
               if (modelId) runModelIds.push(modelId);
               const action = runRequest.action?.action;
               if (action?.case === "userMessageAction") {
-                const text = action.value.userMessage?.text;
+                const userMessage = action.value.userMessage;
+                const text = userMessage?.text;
                 if (typeof text === "string") runUserTexts.push(text);
+                runImageCounts.push(
+                  userMessage?.selectedContext?.selectedImages.length ?? 0,
+                );
               }
               runSelections.push({
                 publicId: modelId,
@@ -158,6 +174,64 @@ export async function startTestCursorBackend(): Promise<TestCursorBackend> {
                 ),
               });
             } else if (message.message.case === "execClientMessage") {
+              if (message.message.value.message.case === "mcpResult") {
+                const result = message.message.value.message.value.result;
+                runToolResultErrors.push(
+                  result.case === "success" ? result.value.isError : true,
+                );
+              }
+              if (runMode === "native-multi-tool-loop") {
+                nativeResultCount += 1;
+                if (nativeResultCount === 1) {
+                  const execMsg = create(ExecServerMessageSchema, {
+                    id: 2,
+                    execId: "exec-2",
+                    message: {
+                      case: "mcpArgs",
+                      value: create(McpArgsSchema, {
+                        name: "read",
+                        toolName: "read",
+                        toolCallId: "cursor-call-2",
+                        providerIdentifier: "opencode",
+                        args: {},
+                      }),
+                    },
+                  });
+                  stream.write(
+                    frameConnectUnaryMessage(
+                      toBinary(
+                        AgentServerMessageSchema,
+                        create(AgentServerMessageSchema, {
+                          message: { case: "execServerMessage", value: execMsg },
+                        }),
+                      ),
+                    ),
+                  );
+                } else {
+                  for (const frame of frameTextThenEndServerMessages("completed multi-tool Run")) {
+                    stream.write(frame);
+                  }
+                  stream.end();
+                }
+                continue;
+              }
+              if (runMode === "native-parallel-tool-loop") {
+                nativeResultCount += 1;
+                if (nativeResultCount === 2) {
+                  for (const frame of frameTextThenEndServerMessages("continued after parallel tools")) {
+                    stream.write(frame);
+                  }
+                  stream.end();
+                }
+                continue;
+              }
+              if (runMode === "native-tool-loop") {
+                for (const frame of frameTextThenEndServerMessages("continued on parked Run")) {
+                  stream.write(frame);
+                }
+                stream.end();
+                continue;
+              }
               // The proxy delivered an mcpResult (tool-result resume). In the
               // tool-call modes, respond with visible text and then hang —
               // simulating a model that starts answering and stalls.
@@ -321,6 +395,192 @@ export async function startTestCursorBackend(): Promise<TestCursorBackend> {
         }, 12_000);
         return;
       }
+      if (runMode === "stateless-tool-loop" && runRequestCount === 1) {
+        const execMsg = create(ExecServerMessageSchema, {
+          id: 1,
+          execId: "exec-1",
+          message: {
+            case: "mcpArgs",
+            value: create(McpArgsSchema, {
+              name: "read",
+              toolName: "read",
+              toolCallId: "cursor-call-1",
+              providerIdentifier: "opencode",
+              args: {},
+            }),
+          },
+        });
+        stream.end(
+          frameConnectUnaryMessage(
+            toBinary(
+              AgentServerMessageSchema,
+              create(AgentServerMessageSchema, {
+                message: { case: "execServerMessage", value: execMsg },
+              }),
+            ),
+          ),
+        );
+        return;
+      }
+      if (runMode === "native-tool-loop") {
+        if (runRequestCount > 1) {
+          for (const frame of frameTextThenEndServerMessages("continued on fresh Run")) {
+            stream.write(frame);
+          }
+          stream.end();
+          return;
+        }
+        const execMsg = create(ExecServerMessageSchema, {
+          id: 1,
+          execId: "exec-1",
+          message: {
+            case: "mcpArgs",
+            value: create(McpArgsSchema, {
+              name: "read",
+              toolName: "read",
+              toolCallId: "cursor-call-1",
+              providerIdentifier: "opencode",
+              args: {},
+            }),
+          },
+        });
+        stream.write(
+          frameConnectUnaryMessage(
+            toBinary(
+              AgentServerMessageSchema,
+              create(AgentServerMessageSchema, {
+                message: { case: "execServerMessage", value: execMsg },
+              }),
+            ),
+          ),
+        );
+        return;
+      }
+      if (runMode === "native-multi-tool-loop") {
+        const execMsg = create(ExecServerMessageSchema, {
+          id: 1,
+          execId: "exec-1",
+          message: {
+            case: "mcpArgs",
+            value: create(McpArgsSchema, {
+              name: "write",
+              toolName: "write",
+              toolCallId: "cursor-call-1",
+              providerIdentifier: "opencode",
+              args: {},
+            }),
+          },
+        });
+        stream.write(
+          frameConnectUnaryMessage(
+            toBinary(
+              AgentServerMessageSchema,
+              create(AgentServerMessageSchema, {
+                message: { case: "execServerMessage", value: execMsg },
+              }),
+            ),
+          ),
+        );
+        return;
+      }
+      if (runMode === "native-parallel-tool-loop") {
+        if (runRequestCount > 1) {
+          for (const frame of frameTextThenEndServerMessages("continued on fresh Run")) {
+            stream.write(frame);
+          }
+          stream.end();
+          return;
+        }
+        const toolFrame = (id: number, name: string) => {
+          const execMsg = create(ExecServerMessageSchema, {
+            id,
+            execId: `exec-${id}`,
+            message: {
+              case: "mcpArgs",
+              value: create(McpArgsSchema, {
+                name,
+                toolName: name,
+                toolCallId: `cursor-call-${id}`,
+                providerIdentifier: "opencode",
+                args: {},
+              }),
+            },
+          });
+          return frameConnectUnaryMessage(
+            toBinary(
+              AgentServerMessageSchema,
+              create(AgentServerMessageSchema, {
+                message: { case: "execServerMessage", value: execMsg },
+              }),
+            ),
+          );
+        };
+        stream.write(toolFrame(1, "read"));
+        setTimeout(() => {
+          try {
+            stream.write(toolFrame(2, "grep"));
+          } catch {
+            // The client may have abandoned the Run.
+          }
+        }, 100);
+        return;
+      }
+      if (runMode === "stateless-parallel-tool-loop" && runRequestCount === 1) {
+        const toolFrame = (id: number, name: string) => {
+          const execMsg = create(ExecServerMessageSchema, {
+            id,
+            execId: `exec-${id}`,
+            message: {
+              case: "mcpArgs",
+              value: create(McpArgsSchema, {
+                name,
+                toolName: name,
+                toolCallId: `cursor-call-${id}`,
+                providerIdentifier: "opencode",
+                args: {},
+              }),
+            },
+          });
+          return frameConnectUnaryMessage(
+            toBinary(
+              AgentServerMessageSchema,
+              create(AgentServerMessageSchema, {
+                message: { case: "execServerMessage", value: execMsg },
+              }),
+            ),
+          );
+        };
+        stream.write(toolFrame(1, "read"));
+        setTimeout(() => {
+          try {
+            stream.end(toolFrame(2, "grep"));
+          } catch {
+            // The client may have cancelled the Run.
+          }
+        }, 400);
+        return;
+      }
+      if (runMode === "stateless-tool-loop") {
+        for (const frame of frameTextThenEndServerMessages("continued after tool")) {
+          stream.write(frame);
+        }
+        stream.end();
+        return;
+      }
+      if (runMode === "stateless-parallel-tool-loop") {
+        for (const frame of frameTextThenEndServerMessages("continued after tools")) {
+          stream.write(frame);
+        }
+        stream.end();
+        return;
+      }
+      if (runMode === "reasoning-text") {
+        for (const frame of frameReasoningTextThenEndServerMessages("considering", "answer")) {
+          stream.write(frame);
+        }
+        stream.end();
+        return;
+      }
       for (const frame of frameTextThenEndServerMessages("ok")) {
         try {
           stream.write(frame);
@@ -439,6 +699,8 @@ export async function startTestCursorBackend(): Promise<TestCursorBackend> {
       runRequestCount = 0;
       runModelIds.length = 0;
       runUserTexts.length = 0;
+      runImageCounts.length = 0;
+      runToolResultErrors.length = 0;
       runSelections.length = 0;
     },
     getRunRequestCount() {
@@ -446,6 +708,9 @@ export async function startTestCursorBackend(): Promise<TestCursorBackend> {
     },
     getRunUserTexts() {
       return [...runUserTexts];
+    },
+    getRunImageCounts() {
+      return [...runImageCounts];
     },
     getRunModelIds() {
       return [...runModelIds];
@@ -455,6 +720,9 @@ export async function startTestCursorBackend(): Promise<TestCursorBackend> {
         ...selection,
         parameters: { ...selection.parameters },
       }));
+    },
+    getRunToolResultErrors() {
+      return [...runToolResultErrors];
     },
     async close() {
       await Promise.all([
