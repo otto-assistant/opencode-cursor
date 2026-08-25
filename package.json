@@ -25,7 +25,7 @@
   "scripts": {
     "build": "node scripts/clean.mjs && tsc -p tsconfig.json && node scripts/copy-runtime.mjs",
     "test": "bun test/smoke.ts",
-    "test:v2": "bun test test/v2-*.test.ts test/node-runtime.test.ts test/model-normalizer.test.ts",
+    "test:v2": "bun test test/v2-*.test.ts test/bridge-pool.test.ts test/node-runtime.test.ts test/model-normalizer.test.ts test/shared-constants.test.ts",
     "test:package": "node scripts/check-package.mjs",
     "test:v2-loader": "node scripts/smoke-opencode-v2.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",

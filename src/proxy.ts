@@ -112,7 +112,11 @@ import {
   deterministicConversationId,
   selectionIdentity,
 } from "./conversation/identity.js";
-import { BridgePool, type BridgeHandle } from "./bridge-pool.js";
+import {
+  BridgePool,
+  BridgePoolCapacityError,
+  type BridgeHandle,
+} from "./bridge-pool.js";
 import { log } from "./shared/log.js";
 import {
   CURSOR_SELECTION_HEADER,
@@ -800,6 +804,24 @@ export async function startProxy(
             release?.();
             if (isAbortError(err) || req.signal.aborted) {
               return new Response(null, { status: 499, statusText: "Client Closed Request" });
+            }
+            if (err instanceof BridgePoolCapacityError) {
+              return new Response(
+                JSON.stringify({
+                  error: {
+                    message: "Server is saturated, please retry shortly",
+                    type: "server_error",
+                    code: "service_unavailable",
+                  },
+                }),
+                {
+                  status: 503,
+                  headers: {
+                    "Content-Type": "application/json",
+                    "Retry-After": "2",
+                  },
+                },
+              );
             }
             const message = err instanceof Error ? err.message : String(err);
             return new Response(
