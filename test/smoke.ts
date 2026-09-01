@@ -1793,13 +1793,9 @@ async function testPoolSequentialRequests() {
   console.log("[test] Pool sequential requests OK");
 }
 
-/**
- * Test that concurrent requests beyond maxSize succeed via ephemeral overflow
- * workers, and that those untracked workers do not inflate the tracked pool
- * (regression guard for the ephemeral-worker leak fix in BridgePool).
- */
-async function testPoolOverflowEphemeralWorkers() {
-  console.log("[test] Testing pool overflow ephemeral workers...");
+/** Test that maxSize bounds worker processes and released capacity is reusable. */
+async function testPoolCapacityBound() {
+  console.log("[test] Testing pool capacity bound...");
 
   const { BridgePool } = await import("../src/bridge-pool");
   const server = await createPoolTestServer();
@@ -1808,33 +1804,92 @@ async function testPoolOverflowEphemeralWorkers() {
   pool.warmup();
   await new Promise((r) => setTimeout(r, 200));
 
-  // Fire more concurrent requests than maxSize so the pool must spawn
-  // ephemeral overflow workers (not tracked in allWorkers).
-  const CONCURRENCY = 4;
-  const results = await Promise.all(
-    Array.from({ length: CONCURRENCY }, () => poolRequest(pool, server.url)),
-  );
-  for (let i = 0; i < results.length; i++) {
-    assertEqual(results[i]!.code, 0, `Overflow request ${i} should succeed (code=0)`);
-  }
+  const active = pool.acquire({
+    accessToken: "test-token",
+    rpcPath: "/agent.v1.AgentService/Run",
+    url: server.url,
+  });
+  active.onData(() => {});
+  const activeClosed = new Promise<number>((resolve) => active.onClose(resolve));
+  active.end();
 
-  // Give streamDone-driven shutdown of ephemeral workers time to run.
-  await new Promise((r) => setTimeout(r, 200));
+  let capacityError: unknown;
+  try {
+    pool.acquire({
+      accessToken: "test-token",
+      rpcPath: "/agent.v1.AgentService/Run",
+      url: server.url,
+    });
+  } catch (error) {
+    capacityError = error;
+  }
+  assert(
+    capacityError instanceof Error && capacityError.message.includes("capacity reached"),
+    "Concurrent request beyond maxSize should fail fast",
+  );
+
+  assertEqual(await activeClosed, 0, "Active request should complete successfully");
+  const afterRelease = await poolRequest(pool, server.url);
+  assertEqual(afterRelease.code, 0, "Released pool capacity should be reusable");
 
   const stats = pool.stats();
-  console.log(`[test]   pool stats after overflow: ${JSON.stringify(stats)}`);
-  assert(
-    stats.total <= 1,
-    `Tracked pool must stay within maxSize after overflow, got total=${stats.total}`,
-  );
-  assert(
-    server.streamCount() >= CONCURRENCY,
-    `Expected >= ${CONCURRENCY} streams, got ${server.streamCount()}`,
-  );
+  assertEqual(stats.total, 1, "Pool should stay within maxSize");
+  assert(server.streamCount() >= 2, `Expected >= 2 streams, got ${server.streamCount()}`);
 
   pool.shutdown();
   await server.close();
-  console.log("[test] Pool overflow ephemeral workers OK");
+  console.log("[test] Pool capacity bound OK");
+}
+
+async function testProxyMapsPoolCapacityToServiceUnavailable(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing proxy pool-capacity response...");
+  modules.stopProxy();
+  backend.setRunMode("text-then-hang");
+  const port = await modules.startProxy(async () => "test-token");
+  const readers: ReadableStreamDefaultReader<Uint8Array>[] = [];
+
+  try {
+    for (let i = 0; i < 4; i++) {
+      const response = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "default",
+          stream: true,
+          conversation_id: `pool-capacity-${i}`,
+          messages: [{ role: "user", content: `hold request ${i}` }],
+        }),
+      });
+      assertEqual(response.status, 200, `Capacity holder ${i} should start`);
+      assert(response.body, `Capacity holder ${i} should stream`);
+      const reader = response.body!.getReader();
+      readers.push(reader);
+      await reader.read();
+    }
+
+    const rejected = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "default",
+        stream: true,
+        conversation_id: "pool-capacity-rejected",
+        messages: [{ role: "user", content: "reject while saturated" }],
+      }),
+    });
+    assertEqual(rejected.status, 503, "Pool saturation should return service unavailable");
+    assertEqual(rejected.headers.get("Retry-After"), "2", "Pool saturation should be retryable");
+    const payload = await rejected.json() as { error?: { code?: string } };
+    assertEqual(payload.error?.code, "service_unavailable", "Pool saturation should use the overload code");
+  } finally {
+    await Promise.all(readers.map((reader) => reader.cancel().catch(() => undefined)));
+    backend.setRunMode("immediate-close");
+    modules.stopProxy();
+  }
+  console.log("[test] Proxy pool-capacity response OK");
 }
 
 async function testStreamingWatchdogRecoversFromStalledRun(
@@ -3053,6 +3108,8 @@ async function main() {
   // Ephemeral port by default — each process binds an OS-assigned listen port.
   // OPENCODE_CURSOR_PROXY_PORT remains an optional pin for debugging only.
   delete process.env.OPENCODE_CURSOR_PROXY_PORT;
+  delete process.env.OPENCODE_CURSOR_BRIDGE_POOL_MIN;
+  delete process.env.OPENCODE_CURSOR_BRIDGE_POOL_MAX;
 
   const modules = await loadTestModules();
 
@@ -3076,7 +3133,8 @@ async function main() {
     await testPersistentBridgeSessionIsolation();
     await testPoolRecoveryAfterServerRestart();
     await testPoolSequentialRequests();
-    await testPoolOverflowEphemeralWorkers();
+    await testPoolCapacityBound();
+    await testProxyMapsPoolCapacityToServiceUnavailable(modules, backend);
     await testProxyConsumesCursorModelHeader(modules, backend);
     await testStreamingWatchdogRecoversFromStalledRun(modules, backend);
     await testStallExhaustionIsHonest(modules, backend);

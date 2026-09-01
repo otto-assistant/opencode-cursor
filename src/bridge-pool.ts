@@ -11,6 +11,7 @@
  */
 import { fileURLToPath } from "node:url";
 import { resolveNodeExecutable } from "./node-runtime.js";
+import { log } from "./shared/log.js";
 
 const PERSISTENT_BRIDGE_PATH = fileURLToPath(
   new URL("./h2-bridge-persistent.mjs", import.meta.url),
@@ -176,6 +177,13 @@ export interface BridgeAcquireOptions {
   unary?: boolean;
 }
 
+export class BridgePoolCapacityError extends Error {
+  constructor(maxSize: number) {
+    super(`BridgePool capacity reached (${maxSize} active workers)`);
+    this.name = "BridgePoolCapacityError";
+  }
+}
+
 export class BridgePool {
   private idle: PersistentWorker[] = [];
   private allWorkers = new Set<PersistentWorker>();
@@ -184,15 +192,21 @@ export class BridgePool {
   private shuttingDown = false;
 
   constructor(options: BridgePoolOptions = {}) {
-    this.minSize = options.minSize ?? 2;
-    this.maxSize = options.maxSize ?? 4;
+    const minSize = options.minSize ?? 2;
+    const maxSize = options.maxSize ?? 4;
+    if (!Number.isSafeInteger(minSize) || minSize < 0) {
+      throw new Error(`BridgePool minSize must be a non-negative integer, got ${minSize}`);
+    }
+    if (!Number.isSafeInteger(maxSize) || maxSize < 1) {
+      throw new Error(`BridgePool maxSize must be a positive integer, got ${maxSize}`);
+    }
+    this.minSize = Math.min(minSize, maxSize);
+    this.maxSize = maxSize;
   }
 
   /** Pre-warm the pool with minSize idle workers. */
   warmup(): void {
-    for (let i = 0; i < this.minSize; i++) {
-      this.addWorker();
-    }
+    this.replenish();
   }
 
   /** Acquire a bridge handle for a new request. */
@@ -217,9 +231,7 @@ export class BridgePool {
         worker = this.addWorker();
         this.idle.pop();
       } else {
-        // Pool full — spawn an ephemeral worker not tracked by pool
-        worker = spawnWorker();
-        // Don't add to allWorkers — it won't be returned to pool
+        throw new BridgePoolCapacityError(this.maxSize);
       }
     }
 
@@ -305,7 +317,6 @@ export class BridgePool {
     /** Exit code recorded when STREAM_DONE/process-death completes before callers attach onClose. */
     let recordedExitCode = 0;
     const pool = this;
-    const isPooled = this.allWorkers.has(worker);
     /** Buffer OUTPUT_DATA until the caller registers onData (stdout can beat ReadableStream wiring). */
     const pendingData: Buffer[] = [];
     let userDataCb: ((chunk: Buffer) => void) | null = null;
@@ -318,6 +329,16 @@ export class BridgePool {
 
     // When stream completes (bridge sends STREAM_DONE), fire onClose and return to pool
     let closeCb: ((code: number) => void) | null = null;
+    const notifyClose = (callback: ((code: number) => void) | null, code: number) => {
+      if (!callback) return;
+      queueMicrotask(() => {
+        try {
+          callback(code);
+        } catch (error) {
+          log.error("[bridge-pool] onClose callback failed", error);
+        }
+      });
+    };
 
     worker.cbs.streamDone = (code: number) => {
       if (done) return;
@@ -325,16 +346,8 @@ export class BridgePool {
       recordedExitCode = code;
       const cbNow = closeCb;
       closeCb = null;
-      cbNow?.(code);
-      if (isPooled) {
-        pool.release(worker);
-      } else {
-        // Ephemeral overflow worker (pool was saturated at acquire time): it is
-        // not tracked by the pool and will never be reused, so shut it down
-        // instead of leaking the child process.
-        workerSendShutdown(worker);
-        workerKill(worker);
-      }
+      pool.release(worker);
+      notifyClose(cbNow, code);
     };
 
     // Handle unexpected process death
@@ -344,12 +357,8 @@ export class BridgePool {
       recordedExitCode = 1;
       const cbNow = closeCb;
       closeCb = null;
-      cbNow?.(1);
-      if (isPooled) {
-        pool.remove(worker);
-      } else {
-        workerKill(worker);
-      }
+      pool.remove(worker);
+      notifyClose(cbNow, 1);
     };
 
     return {
@@ -366,11 +375,11 @@ export class BridgePool {
       kill() {
         if (done) return;
         done = true;
-        if (isPooled) {
-          pool.remove(worker);
-        } else {
-          workerKill(worker);
-        }
+        recordedExitCode = 1;
+        const cbNow = closeCb;
+        closeCb = null;
+        pool.remove(worker);
+        notifyClose(cbNow, 1);
       },
       onData(cb: (chunk: Buffer) => void) {
         const flushed = pendingData.splice(0, pendingData.length);
@@ -379,7 +388,7 @@ export class BridgePool {
       },
       onClose(cb: (code: number) => void) {
         if (done) {
-          queueMicrotask(() => cb(recordedExitCode));
+          notifyClose(cb, recordedExitCode);
         } else {
           closeCb = cb;
         }
