@@ -131,6 +131,17 @@ npm run verify
 dependencies with lifecycle scripts disabled, imports it independently, and
 loads that extracted package through the pinned `opencode2` beta.
 
+### Beta release
+
+Before dispatching the **Release V2 Beta** workflow, land a reviewed commit that
+updates `package.json` to the next unused `X.Y.Z-beta.N` version and updates any
+lockfiles changed by the package manager. Run the workflow from `beta` with
+`dry_run` enabled first, then rerun the same commit with `dry_run` disabled to
+publish.
+
+The workflow does not bump versions or create release commits. It validates,
+packs, and publishes the exact reviewed version to npm's `beta` dist-tag.
+
 ## Debugging
 
 Enable plugin logs:

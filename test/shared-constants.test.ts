@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 
+// The suite runs under Bun, so process.execPath intentionally launches a fresh
+// Bun process that can import the TypeScript module without a build step.
 const readFallbackLimits = (environment: NodeJS.ProcessEnv) => JSON.parse(
   execFileSync(
     process.execPath,

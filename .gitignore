@@ -5,6 +5,7 @@ dist/
 
 # Local agent notes / environment-specific
 AGENTS.md
+.opencode/
 
 # Graphify knowledge graph output
 graphify-out/

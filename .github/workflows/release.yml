@@ -39,6 +39,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Version bumps are reviewed separately; this workflow publishes package.json verbatim.
           version="$(node -p "require('./package.json').version")"
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]]; then
             echo "Expected package version X.Y.Z-beta.N, got: $version" >&2
