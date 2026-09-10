@@ -1,0 +1,12 @@
+syntax = "proto3";
+package agent.v1;
+
+// Wire projection verified statically against @cursor/sdk 1.0.31.
+// Kept separate from agent.proto so V1 decoding and accounting are unchanged.
+message TurnEndedUpdate {
+  optional int64 input_tokens = 1;
+  optional int64 output_tokens = 2;
+  optional int64 cache_read_tokens = 3;
+  optional int64 cache_write_tokens = 4;
+  optional int64 reasoning_tokens = 5;
+}

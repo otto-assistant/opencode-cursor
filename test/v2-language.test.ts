@@ -23,7 +23,11 @@ afterEach(async () => {
 
 async function collect(stream: ReadableStream<LanguageModelV3StreamPart>) {
   const parts: LanguageModelV3StreamPart[] = [];
-  for await (const part of stream) parts.push(part);
+  try {
+    for await (const part of stream) parts.push(part);
+  } catch (error) {
+    parts.push({ type: "error", error });
+  }
   return parts;
 }
 
@@ -43,9 +47,9 @@ describe("native Cursor LanguageModelV3 adapter", () => {
       },
       session: {
         hook: async (name: string, callback: (event: any) => void, options: unknown) => {
-          expect(name).toBe("context");
           expect(options).toEqual({ providerID: "cursor" });
-          contextHook = callback;
+          if (name === "context") contextHook = callback;
+          else hooks.set(name, callback);
           return { dispose: async () => { disposed.push(name); } };
         },
       },
@@ -84,15 +88,22 @@ describe("native Cursor LanguageModelV3 adapter", () => {
         }],
       }],
     };
-    contextHook?.(contextEvent);
+    for (const hook of [contextHook, ...["compaction", "generate", "title"].map((kind) => hooks.get(kind))]) {
+      const draft = structuredClone(contextEvent);
+      expect(hook).toBeDefined();
+      hook?.(draft);
+      expect(draft.messages[0]?.content[0]?.providerMetadata).toEqual({
+        cursor: { toolResultError: true },
+      });
+    }
+    const request = { sessionID: "session-a", headers: {} };
+    hooks.get("model.request")?.(request);
+    expect(request.headers).toEqual({ "x-opencode-cursor-host-session": "session-a" });
 
     expect(typeof event.sdk?.languageModel).toBe("function");
     expect(event.language?.modelId).toBe("composer-2");
-    expect(contextEvent.messages[0]?.content[0]?.providerMetadata).toEqual({
-      cursor: { toolResultError: true },
-    });
     await registration.dispose();
-    expect(disposed).toEqual(["language", "sdk", "context"]);
+    expect(disposed).toEqual(["language", "sdk", "model.request", "title", "generate", "compaction", "context"]);
   });
 
   test("rolls back the context hook when AI SDK registration fails", async () => {
@@ -101,8 +112,8 @@ describe("native Cursor LanguageModelV3 adapter", () => {
 
     await expect(registerCursorLanguage({
       session: {
-        hook: async () => ({
-          dispose: async () => { disposed.push("context"); },
+        hook: async (name: string) => ({
+          dispose: async () => { disposed.push(name); },
         }),
       },
       aisdk: {
@@ -112,7 +123,7 @@ describe("native Cursor LanguageModelV3 adapter", () => {
       },
     } as never, async () => "token")).rejects.toThrow("SDK hook failed");
 
-    expect(disposed).toEqual(["context"]);
+    expect(disposed).toEqual(["model.request", "title", "generate", "compaction", "context"]);
   });
 
   test("continues a tool loop on the parked AgentService Run", async () => {
@@ -199,13 +210,11 @@ describe("native Cursor LanguageModelV3 adapter", () => {
     });
     const firstFinish = firstParts.find((part) => part.type === "finish");
     const secondFinish = secondParts.find((part) => part.type === "finish");
-    const firstInput = firstFinish?.type === "finish"
-      ? firstFinish.usage.inputTokens.total ?? 0
-      : 0;
-    const secondInput = secondFinish?.type === "finish"
-      ? secondFinish.usage.inputTokens.total ?? 0
-      : 0;
-    expect(secondInput).toBeGreaterThan(firstInput);
+    for (const finish of [firstFinish, secondFinish]) {
+      expect(finish?.type === "finish" ? finish.usage.inputTokens : null).toEqual({
+        total: undefined, noCache: undefined, cacheRead: undefined, cacheWrite: undefined,
+      });
+    }
   });
 
   test("preserves OpenCode tool failures in Cursor MCP results", async () => {
@@ -323,16 +332,23 @@ describe("native Cursor LanguageModelV3 adapter", () => {
     await collect(second.stream);
 
     expect(backend.getRunRequestCount()).toBe(2);
-    expect(backend.getRunUserTexts()[1]).toContain("Stop and explain instead.");
+    expect(backend.getRunUserTexts()[1]).toBe(
+      "The tool results above answer your latest tool calls in this turn. Continue the task from them; do not repeat calls whose results are already shown.",
+    );
   });
 
-  test("uses generic instructions when no tools are available", async () => {
-    const { cursorToolInstructions } = await import("../src/cursor-agent");
-
-    const instructions = cursorToolInstructions(true);
-
-    expect(instructions).toContain("No tools are available");
-    expect(instructions).not.toContain("summary/compaction");
+  test("preserves the V2 output watchdog default and overrides", async () => {
+    const { nativeOutputStallTimeoutMs } = await import("../src/cursor-agent");
+    const previous = process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS;
+    try {
+      delete process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS;
+      expect(nativeOutputStallTimeoutMs()).toBe(180_000);
+      process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS = "1e3";
+      expect(nativeOutputStallTimeoutMs()).toBe(1_000);
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS;
+      else process.env.OPENCODE_CURSOR_STALL_TIMEOUT_MS = previous;
+    }
   });
 
   test("maps reasoning, text, and images through valid V3 blocks", async () => {
@@ -380,7 +396,7 @@ describe("native Cursor LanguageModelV3 adapter", () => {
     const finish = parts.find((part) => part.type === "finish");
     expect(
       finish?.type === "finish" ? finish.usage.inputTokens.total : undefined,
-    ).toBeGreaterThan(0);
+    ).toBeUndefined();
   });
 
   test("preserves stream warnings in doGenerate", async () => {
@@ -613,7 +629,7 @@ describe("native Cursor LanguageModelV3 adapter", () => {
     expect(backend.getRunRequestCount()).toBe(2);
   });
 
-  test("abandons a parked Run when a parallel call arrives after settling", async () => {
+  test("delivers a late call on the same Run and forwards both real outcomes", async () => {
     backend.setRunMode("native-parallel-tool-loop");
     process.env.OPENCODE_CURSOR_NATIVE_TOOL_SETTLE_MS = "50";
     try {
@@ -658,9 +674,21 @@ describe("native Cursor LanguageModelV3 adapter", () => {
         ],
         tools,
       });
-      await collect(second.stream);
-
-      expect(backend.getRunRequestCount()).toBe(2);
+      const secondParts = await collect(second.stream);
+      const late = secondParts.find((part) => part.type === "tool-call");
+      expect(late).toMatchObject({ type: "tool-call", toolName: "grep" });
+      const third = await model.doStream({ prompt: [
+        { role: "user", content: [{ type: "text", text: "Inspect both." }] },
+        { role: "assistant", content: call?.type === "tool-call" ? [call] : [] },
+        { role: "tool", content: call?.type === "tool-call" ? [{ type: "tool-result", toolCallId: call.toolCallId,
+          toolName: call.toolName, output: { type: "text", value: "partial result" } }] : [] },
+        { role: "assistant", content: late?.type === "tool-call" ? [late] : [] },
+        { role: "tool", content: late?.type === "tool-call" ? [{ type: "tool-result", toolCallId: late.toolCallId,
+          toolName: late.toolName, output: { type: "text", value: "late result" } }] : [] },
+      ], tools });
+      expect(await collect(third.stream)).toContainEqual(expect.objectContaining({ type: "text-delta", delta: "continued after parallel tools" }));
+      expect(backend.getRunRequestCount()).toBe(1);
+      expect(backend.getRunToolResultErrors()).toEqual([false, false]);
     } finally {
       delete process.env.OPENCODE_CURSOR_NATIVE_TOOL_SETTLE_MS;
     }
@@ -826,7 +854,7 @@ describe("native Cursor LanguageModelV3 adapter", () => {
     const parts = await collecting;
     expect(parts).toContainEqual(expect.objectContaining({
       type: "error",
-      error: expect.objectContaining({ message: expect.stringContaining("exited") }),
+      error: expect.objectContaining({ message: expect.stringContaining("disposed") }),
     }));
   });
 

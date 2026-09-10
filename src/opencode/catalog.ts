@@ -3,14 +3,23 @@ import {
   Model,
   Plugin,
   Provider,
-} from "@opencode-ai/plugin";
-import { Money } from "@opencode-ai/schema/money";
+} from "@opencode/plugin";
+import { Money } from "@opencode/schema/money";
 import {
   CURSOR_SELECTION_HEADER,
   encodeCursorModelSelection,
   type CursorModel,
 } from "../model-selection.js";
+import { rememberCursorModels } from "../models/catalog.js";
+import {
+  applyCatalogMetadata,
+  type CatalogMetadata,
+} from "../models/metadata.js";
 import { estimateModelCost } from "../provider/pricing.js";
+import {
+  DEFAULT_CONTEXT_WINDOW,
+  DEFAULT_MAX_TOKENS,
+} from "../shared/constants.js";
 import {
   CURSOR_INTEGRATION_ID,
   type DisposableRegistration,
@@ -28,7 +37,9 @@ export interface CursorCatalogState {
   models: readonly CursorModel[];
 }
 
-type CatalogContext = Pick<Plugin.Context, "catalog">;
+type CatalogContext = {
+  provider: Pick<Plugin.Context["provider"], "transform">;
+};
 
 export function createCursorCatalogState(
   models: readonly CursorModel[],
@@ -41,62 +52,41 @@ export function updateCursorCatalogState(
   models: readonly CursorModel[],
 ): void {
   state.models = models;
+  rememberCursorModels(models);
 }
 
 export async function registerCursorCatalog(
   context: CatalogContext,
   state: CursorCatalogState,
 ): Promise<DisposableRegistration> {
-  return context.catalog.transform((catalog) => {
-    catalog.provider.update(CURSOR_PROVIDER_ID, (provider) => {
-      provider.name = "Cursor";
-      provider.integrationID = CURSOR_INTEGRATION;
-      provider.activation =
-        state.models.length === 0 ? "enabled" : "auto";
-      provider.package = CURSOR_PACKAGE;
-    });
-
-    if (state.models.length === 0) {
-      const connectModelID = Model.ID.make("connect");
-      catalog.model.update(
-        CURSOR_PROVIDER_ID,
-        connectModelID,
-        (model) => {
-          model.name = "Connect Cursor to load models";
-          model.modelID = connectModelID;
-          model.capabilities = {
-            tools: false,
-            input: ["text"],
-            output: ["text"],
-          };
-          model.variants = [];
-          model.time = { released: 0 };
-          model.cost = [];
-          model.status = "active";
-          model.enabled = true;
-          model.limit = { context: 1, output: 1 };
-        },
-      );
-    }
-
-    for (const cursorModel of state.models) {
+  return context.provider.transform((editor) => {
+    rememberCursorModels(state.models);
+    const references = catalogReferences(editor.list());
+    const models: Model.Info[] = state.models.map((cursorModel) => {
       const modelID = Model.ID.make(cursorModel.id);
-      catalog.model.update(CURSOR_PROVIDER_ID, modelID, (model) => {
-        const cost = estimateModelCost(cursorModel.id);
-        model.name = cursorModel.name;
-        model.modelID = modelID;
-        model.capabilities = {
+      const metadata = applyCatalogMetadata(cursorModel, references, {
+        context: DEFAULT_CONTEXT_WINDOW,
+        output: DEFAULT_MAX_TOKENS,
+      });
+      const priced = metadata.cost ?? [estimateModelCost(cursorModel.id)];
+      return {
+        ...Model.Info.default(CURSOR_PROVIDER_ID, modelID),
+        name: cursorModel.name,
+        modelID,
+        ...(metadata.family
+          ? { family: Model.Family.make(metadata.family) }
+          : {}),
+        capabilities: {
           tools: true,
-          input: ["text", "image"],
+          input: metadata.input,
           output: ["text"],
-        };
-        model.headers = {
-          ...model.headers,
+        },
+        headers: {
           [CURSOR_SELECTION_HEADER]: encodeCursorModelSelection(
             cursorModel.defaultSelection,
           ),
-        };
-        model.variants = Object.entries(cursorModel.variants).map(
+        },
+        variants: Object.entries(cursorModel.variants).map(
           ([id, selection]) => ({
             id: Model.VariantID.make(id),
             headers: {
@@ -104,25 +94,84 @@ export async function registerCursorCatalog(
                 encodeCursorModelSelection(selection),
             },
           }),
-        );
-        model.time = { released: 0 };
-        model.cost = [
-          {
-            input: Money.USDPerMillionTokens.make(cost.input),
-            output: Money.USDPerMillionTokens.make(cost.output),
-            cache: {
-              read: Money.USDPerMillionTokens.make(cost.cache.read),
-              write: Money.USDPerMillionTokens.make(cost.cache.write),
-            },
+        ),
+        time: { released: metadata.released },
+        cost: priced.map((item) => ({
+          ...("tier" in item && item.tier ? { tier: item.tier } : {}),
+          input: Money.USDPerMillionTokens.make(item.input),
+          output: Money.USDPerMillionTokens.make(item.output),
+          cache: {
+            read: Money.USDPerMillionTokens.make(item.cache.read),
+            write: Money.USDPerMillionTokens.make(item.cache.write),
           },
-        ];
-        model.status = "active";
-        model.enabled = true;
-        model.limit = {
-          context: cursorModel.contextWindow,
-          output: cursorModel.maxTokens,
-        };
+        })),
+        status: "active",
+        enabled: true,
+        limit: {
+          context: metadata.context,
+          output: metadata.output,
+        },
+      };
+    });
+
+    if (models.length === 0) {
+      const connectModelID = Model.ID.make("connect");
+      models.push({
+        ...Model.Info.default(CURSOR_PROVIDER_ID, connectModelID),
+        name: "Connect Cursor to load models",
+        modelID: connectModelID,
+        capabilities: {
+          tools: false,
+          input: ["text"],
+          output: ["text"],
+        },
+        variants: [],
+        time: { released: 0 },
+        cost: [],
+        status: "active",
+        enabled: true,
+        limit: { context: 1, output: 1 },
       });
     }
+
+    editor.add({
+      info: {
+        ...Provider.Info.empty(CURSOR_PROVIDER_ID),
+        name: "Cursor",
+        integrationID: CURSOR_INTEGRATION,
+        activation: state.models.length === 0 ? "enabled" : "auto",
+        package: CURSOR_PACKAGE,
+      },
+      models,
+    });
   });
+}
+
+function catalogReferences(
+  records: readonly {
+    provider: { id: string };
+    models: ReadonlyMap<string, Model.Info>;
+  }[],
+): CatalogMetadata[] {
+  const references: CatalogMetadata[] = [];
+  for (const record of records) {
+    for (const model of record.models.values()) {
+      references.push({
+        providerID: record.provider.id,
+        id: model.id,
+        family: model.family,
+        context: model.limit.context,
+        output: model.limit.output,
+        input: model.capabilities.input,
+        released: model.time.released,
+        cost: model.cost.map((item) => ({
+          ...(item.tier ? { tier: item.tier } : {}),
+          input: item.input,
+          output: item.output,
+          cache: { read: item.cache.read, write: item.cache.write },
+        })),
+      });
+    }
+  }
+  return references;
 }

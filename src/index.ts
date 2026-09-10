@@ -1,4 +1,4 @@
-import { Plugin } from "@opencode-ai/plugin";
+import { Plugin } from "@opencode/plugin";
 import {
   setupCursorRuntime,
 } from "./opencode/runtime.js";

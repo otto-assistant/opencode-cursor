@@ -3,8 +3,8 @@ import { resolveNodeExecutable } from "./node-runtime.js";
 
 export const CURSOR_API_URL =
   process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
-export const BRIDGE_PATH = fileURLToPath(
-  new URL("./h2-bridge.mjs", import.meta.url),
+const UNARY_WORKER_PATH = fileURLToPath(
+  new URL("./h2-unary.mjs", import.meta.url),
 );
 
 function lpEncode(data: Uint8Array): Buffer {
@@ -24,8 +24,8 @@ interface CursorUnaryRpcOptions {
   connectProtocolVersion?: "1";
 }
 
-function spawnBridge(options: CursorUnaryRpcOptions) {
-  const proc = Bun.spawn([resolveNodeExecutable(), BRIDGE_PATH], {
+function spawnUnaryWorker(options: CursorUnaryRpcOptions) {
+  const proc = Bun.spawn([resolveNodeExecutable(), UNARY_WORKER_PATH], {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "ignore",
@@ -37,7 +37,6 @@ function spawnBridge(options: CursorUnaryRpcOptions) {
           accessToken: options.accessToken,
           url: options.url ?? CURSOR_API_URL,
           path: options.rpcPath,
-          unary: true,
           contentType: options.contentType,
           connectProtocolVersion: options.connectProtocolVersion,
         }),
@@ -50,7 +49,7 @@ function spawnBridge(options: CursorUnaryRpcOptions) {
 export async function callCursorUnaryRpc(
   options: CursorUnaryRpcOptions,
 ): Promise<{ body: Uint8Array; exitCode: number; timedOut: boolean }> {
-  const proc = spawnBridge(options);
+  const proc = spawnUnaryWorker(options);
   let timedOut = false;
   const timeoutMs = options.timeoutMs ?? 5_000;
   const timeout =
@@ -70,13 +69,23 @@ export async function callCursorUnaryRpc(
   const chunks: Buffer[] = [];
   const reader = proc.stdout.getReader();
   let pending = Buffer.alloc(0);
+  let bytes = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      bytes += value.length;
+      if (bytes > 8 * 1024 * 1024 + 4) {
+        proc.kill();
+        throw new Error("Cursor unary response exceeds capacity");
+      }
       pending = Buffer.concat([pending, Buffer.from(value)]);
       while (pending.length >= 4) {
         const length = pending.readUInt32BE(0);
+        if (length > 8 * 1024 * 1024) {
+          proc.kill();
+          throw new Error("Invalid Cursor unary response frame");
+        }
         if (pending.length < 4 + length) break;
         chunks.push(Buffer.from(pending.subarray(4, 4 + length)));
         pending = pending.subarray(4 + length);
@@ -88,7 +97,7 @@ export async function callCursorUnaryRpc(
 
   return {
     body: Buffer.concat(chunks),
-    exitCode: (await proc.exited) ?? 1,
+    exitCode: pending.length ? 1 : ((await proc.exited) ?? 1),
     timedOut,
   };
 }

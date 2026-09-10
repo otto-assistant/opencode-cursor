@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true
+  },
+  "include": [
+    "scripts/probe-opencode-v2-cursor.ts",
+    "scripts/cursor-capability/**/*.ts",
+    "test/cursor-capability.test.ts"
+  ]
+}

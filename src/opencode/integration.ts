@@ -1,4 +1,4 @@
-import { Credential, Integration, Plugin } from "@opencode-ai/plugin";
+import { Credential, Integration, Plugin } from "@opencode/plugin";
 import {
   getPendingCursorLogin,
   startCursorBrowserLogin,
