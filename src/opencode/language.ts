@@ -6,216 +6,78 @@ import type {
   LanguageModelV3StreamPart,
   LanguageModelV3Usage,
   SharedV3Warning,
+  SharedV3ProviderMetadata,
 } from "@ai-sdk/provider";
-import { Plugin, Provider } from "@opencode-ai/plugin";
-import type { ExtractedImage, OpenAIToolDef } from "../openai/types.js";
-import { truncateToolResultForCursor } from "../openai/tool-results.js";
+import { Plugin, Provider } from "@opencode/plugin";
+import type { CursorToolDefinition } from "../tools.js";
+import { currentCursorModels } from "../models/catalog.js";
 import {
   CURSOR_SELECTION_HEADER,
-  decodeCursorModelSelection,
-  literalCursorModelSelection,
+  selectionForCursorRequest,
   type CursorModelSelection,
 } from "../model-selection.js";
 import {
-  discardCursorAgent,
-  resumeCursorAgent,
   runCursorAgent,
+  stopCursorTransport,
   type CursorRunEvent,
-  type CursorToolResult,
 } from "../cursor-agent.js";
-import { CURSOR_INTEGRATION_ID, type DisposableRegistration } from "./integration.js";
+import { compileHistory, record } from "./history.js";
+import { HostToolObserver } from "./tool-observer.js";
+import type { CursorTokenUsage } from "../cursor-agent-usage.js";
+import {
+  CURSOR_INTEGRATION_ID,
+  type DisposableRegistration,
+} from "./integration.js";
 
 type AccessTokenProvider = () => Promise<string>;
-
-function extractWorkspaceRoot(systemPrompt: string): string | undefined {
-  return systemPrompt.match(/Working directory:\s*(\S+)/i)?.[1] ??
-    systemPrompt.match(/Workspace root folder:\s*(\S+)/i)?.[1];
-}
+const SESSION_HEADER = "x-opencode-cursor-host-session";
 
 export interface CursorLanguageModelOptions {
   modelId: string;
   selection: CursorModelSelection;
   getAccessToken: AccessTokenProvider;
   apiUrl?: string;
+  scope?: string;
+  toolObserver?: HostToolObserver;
 }
 
-const emptyUsage = (): LanguageModelV3Usage => ({
-  inputTokens: {
-    total: undefined,
-    noCache: undefined,
-    cacheRead: undefined,
-    cacheWrite: undefined,
-  },
-  outputTokens: {
-    total: undefined,
-    text: undefined,
-    reasoning: undefined,
-  },
-});
-
-function stringify(value: unknown): string {
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
-
-function toolResultText(output: Extract<
-  LanguageModelV3CallOptions["prompt"][number],
-  { role: "tool" }
->["content"][number]): string {
-  if (output.type !== "tool-result") return "";
-  let text: string;
-  switch (output.output.type) {
-    case "text":
-    case "error-text":
-      text = output.output.value;
-      break;
-    case "json":
-    case "error-json":
-      text = stringify(output.output.value);
-      break;
-    case "execution-denied":
-      text = output.output.reason ?? "Tool execution denied";
-      break;
-    case "content":
-      text = output.output.value
-        .filter((part) => part.type === "text")
-        .map((part) => part.text)
-        .join("\n");
-      break;
-  }
-  return truncateToolResultForCursor(text);
-}
-
-function record(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
-
-function toolResultIsError(output: Extract<
-  LanguageModelV3CallOptions["prompt"][number],
-  { role: "tool" }
->["content"][number]): boolean {
-  if (output.type !== "tool-result") return false;
-  if (
-    output.output.type === "error-text" ||
-    output.output.type === "error-json" ||
-    output.output.type === "execution-denied"
-  ) {
-    return true;
-  }
-  return record(output.providerOptions?.cursor)?.toolResultError === true;
-}
-
-function compilePrompt(prompt: LanguageModelV3CallOptions["prompt"]): {
-  systemPrompt: string;
-  userText: string;
-  images: ExtractedImage[];
-  toolResults: CursorToolResult[];
-  continuationToolResults: CursorToolResult[];
-} {
-  const system: string[] = [];
-  const transcript: string[] = [];
-  const images: ExtractedImage[] = [];
-  const toolResults: CursorToolResult[] = [];
-  const continuationToolResults: CursorToolResult[] = [];
-  let continuationStart = prompt.length;
-  for (let index = prompt.length - 1; index >= 0; index -= 1) {
-    if (prompt[index]?.role !== "tool") break;
-    continuationStart = index;
-  }
-
-  for (const [messageIndex, message] of prompt.entries()) {
-    if (message.role === "system") {
-      system.push(message.content);
-      continue;
-    }
-    if (message.role === "user") {
-      const text = message.content
-        .filter((part) => part.type === "text")
-        .map((part) => part.text)
-        .join("\n");
-      transcript.push(`[OpenCode user]\n${text || "(image attachment)"}`);
-      for (const part of message.content) {
-        if (part.type !== "file" || !part.mediaType.startsWith("image/")) continue;
-        let bytes: Uint8Array | undefined;
-        if (part.data instanceof Uint8Array) {
-          bytes = part.data;
-        } else if (typeof part.data === "string") {
-          bytes = Buffer.from(part.data, "base64");
-        } else if (part.data.protocol === "data:") {
-          const encoded = part.data.href.split(",", 2)[1];
-          if (encoded) bytes = Buffer.from(encoded, "base64");
-        }
-        if (bytes) {
-          images.push({
-            bytes,
-            mimeType: part.mediaType,
-            filename: part.filename ?? `image-${images.length + 1}`,
-          });
-        }
-      }
-      continue;
-    }
-    if (message.role === "assistant") {
-      for (const part of message.content) {
-        if (part.type === "text") {
-          transcript.push(`[OpenCode assistant]\n${part.text}`);
-        } else if (part.type === "reasoning") {
-          transcript.push(`[OpenCode assistant reasoning]\n${part.text}`);
-        } else if (part.type === "tool-call") {
-          transcript.push(
-            `[OpenCode tool call id=${part.toolCallId} name=${part.toolName}]\n${stringify(part.input)}`,
-          );
-        } else if (part.type === "tool-result") {
-          const content = toolResultText(part);
-          toolResults.push({
-            toolCallId: part.toolCallId,
-            content,
-            isError: toolResultIsError(part),
-          });
-          transcript.push(
-            `[OpenCode tool result id=${part.toolCallId} name=${part.toolName}]\n${content}`,
-          );
-        }
-      }
-      continue;
-    }
-    for (const part of message.content) {
-      if (part.type !== "tool-result") continue;
-      const content = toolResultText(part);
-      toolResults.push({
-        toolCallId: part.toolCallId,
-        content,
-        isError: toolResultIsError(part),
-      });
-      if (messageIndex >= continuationStart) {
-        continuationToolResults.push(toolResults.at(-1)!);
-      }
-      transcript.push(
-        `[OpenCode tool result id=${part.toolCallId} name=${part.toolName}]\n${content}`,
-      );
-    }
-  }
-
+// Cursor reports conversation occupancy, not per-call input or a cache split.
+// OpenCode stores only uncached input, so occupancy is reported as uncached to
+// keep its context meter and compaction accurate. Exact Run counters stay in
+// providerMetadata.cursor.turnUsage.
+function usage(
+  contextTokens?: number,
+  outputTokens?: number,
+): LanguageModelV3Usage {
   return {
-    systemPrompt: system.join("\n") || "You are a helpful assistant.",
-    userText: transcript.join("\n\n"),
-    images,
-    toolResults,
-    continuationToolResults,
+    inputTokens: {
+      total: contextTokens,
+      noCache: contextTokens,
+      cacheRead: undefined,
+      cacheWrite: undefined,
+    },
+    outputTokens: {
+      total: outputTokens,
+      text: undefined,
+      reasoning: undefined,
+    },
   };
+}
+
+function reportedCounts(counts: CursorTokenUsage): Record<string, number> {
+  const result: Record<string, number> = {};
+  for (const [key, value] of Object.entries(counts))
+    if (value !== undefined) result[key] = value;
+  return result;
 }
 
 function compileTools(
   tools: LanguageModelV3CallOptions["tools"],
-  toolChoice: LanguageModelV3CallOptions["toolChoice"],
-): OpenAIToolDef[] {
-  if (toolChoice?.type === "none") return [];
+  choice: LanguageModelV3CallOptions["toolChoice"],
+): CursorToolDefinition[] {
+  if (choice?.type === "none") return [];
+  if (tools?.some((tool) => tool.type !== "function"))
+    throw new Error("Cursor supports host-executed function tools only");
   return (tools ?? [])
     .filter((tool) => tool.type === "function")
     .map((tool) => ({
@@ -228,59 +90,40 @@ function compileTools(
     }));
 }
 
-function usage(promptTokens: number, outputTokens: number): LanguageModelV3Usage {
-  return {
-    inputTokens: {
-      total: promptTokens || undefined,
-      noCache: promptTokens || undefined,
-      cacheRead: undefined,
-      cacheWrite: undefined,
-    },
-    outputTokens: {
-      total: outputTokens || undefined,
-      text: undefined,
-      reasoning: undefined,
-    },
-  };
-}
-
-export function createCursorLanguageModel(options: CursorLanguageModelOptions): LanguageModelV3 {
+export function createCursorLanguageModel(
+  options: CursorLanguageModelOptions,
+): LanguageModelV3 {
+  const scope = options.scope ?? crypto.randomUUID();
   const doStream: LanguageModelV3["doStream"] = async (call) => {
-    const prompt = compilePrompt(call.prompt);
+    call.abortSignal?.throwIfAborted();
+    const prompt = compileHistory(call.prompt);
     const tools = compileTools(call.tools, call.toolChoice);
     const warnings: SharedV3Warning[] = [];
-    if (call.toolChoice?.type === "required" || call.toolChoice?.type === "tool") {
+    if (
+      call.toolChoice?.type === "required" ||
+      call.toolChoice?.type === "tool"
+    )
       warnings.push({
         type: "unsupported",
         feature: "toolChoice",
         details: "Cursor AgentService chooses tools internally.",
       });
-    }
-    let cursorStream = resumeCursorAgent(
-      prompt.continuationToolResults,
-      prompt.systemPrompt,
-      prompt.userText,
-      options.selection,
+    const sessionID = call.headers?.[SESSION_HEADER];
+    const cursorStream = runCursorAgent({
+      accessToken: await options.getAccessToken(),
+      selection: options.selection,
+      history: prompt.entries,
+      results: prompt.results,
       tools,
-      call.abortSignal,
-    );
-    if (!cursorStream) {
-      discardCursorAgent(prompt.toolResults);
-      cursorStream = runCursorAgent({
-        accessToken: await options.getAccessToken(),
-        selection: options.selection,
-        systemPrompt: prompt.systemPrompt,
-        userText: prompt.userText,
-        images: prompt.images,
-        tools,
-        workspaceRoot: extractWorkspaceRoot(prompt.systemPrompt),
-        abortSignal: call.abortSignal,
-        apiUrl: options.apiUrl,
-      });
-    }
-    let openBlock:
-      | { type: "text" | "reasoning"; id: string }
-      | undefined;
+      scope: `${scope}:${call.headers?.[SESSION_HEADER] ?? "direct"}`,
+      abortSignal: call.abortSignal,
+      apiUrl: options.apiUrl,
+      host:
+        sessionID && options.toolObserver
+          ? { sessionID, observer: options.toolObserver }
+          : undefined,
+    });
+    let openBlock: { type: "text" | "reasoning"; id: string } | undefined;
     const closeBlock = (
       controller: TransformStreamDefaultController<LanguageModelV3StreamPart>,
     ) => {
@@ -291,63 +134,111 @@ export function createCursorLanguageModel(options: CursorLanguageModelOptions): 
       });
       openBlock = undefined;
     };
-    const ensureBlock = (
-      type: "text" | "reasoning",
-      controller: TransformStreamDefaultController<LanguageModelV3StreamPart>,
-    ) => {
-      if (openBlock?.type === type) return openBlock.id;
-      closeBlock(controller);
-      const id = `${type}-${crypto.randomUUID()}`;
-      openBlock = { type, id };
-      controller.enqueue({
-        type: type === "text" ? "text-start" : "reasoning-start",
-        id,
-      });
-      return id;
-    };
-
     return {
-      stream: cursorStream.pipeThrough(new TransformStream<CursorRunEvent, LanguageModelV3StreamPart>({
-        start(controller) {
-          controller.enqueue({ type: "stream-start", warnings });
-        },
-        transform(event, controller) {
-          if (event.type === "text") {
-            const id = ensureBlock("text", controller);
-            controller.enqueue({ type: "text-delta", id, delta: event.text });
-            return;
-          }
-          if (event.type === "reasoning") {
-            const id = ensureBlock("reasoning", controller);
-            controller.enqueue({ type: "reasoning-delta", id, delta: event.text });
-            return;
-          }
-          if (event.type === "tool-call") {
+      stream: cursorStream.pipeThrough(
+        new TransformStream<CursorRunEvent, LanguageModelV3StreamPart>({
+          start(controller) {
+            controller.enqueue({ type: "stream-start", warnings });
+          },
+          transform(event, controller) {
+            if (event.type === "text" || event.type === "reasoning") {
+              if (
+                openBlock?.type !== event.type ||
+                (event.type === "reasoning" && openBlock.id !== event.id)
+              ) {
+                closeBlock(controller);
+                openBlock = {
+                  type: event.type,
+                  id:
+                    event.type === "reasoning" ? event.id : crypto.randomUUID(),
+                };
+                controller.enqueue({
+                  type:
+                    event.type === "text" ? "text-start" : "reasoning-start",
+                  id: openBlock.id,
+                  ...(event.type === "reasoning"
+                    ? {
+                        providerMetadata: { cursor: { reasoningID: event.id } },
+                      }
+                    : {}),
+                });
+              }
+              controller.enqueue({
+                type: event.type === "text" ? "text-delta" : "reasoning-delta",
+                id: openBlock.id,
+                delta: event.text,
+              });
+              return;
+            }
             closeBlock(controller);
+            if (
+              event.type === "reasoning-metadata" ||
+              event.type === "opaque-reasoning"
+            ) {
+              const id = crypto.randomUUID();
+              controller.enqueue({ type: "reasoning-start", id });
+              controller.enqueue({
+                type: "reasoning-end",
+                id,
+                providerMetadata: {
+                  cursor:
+                    event.type === "opaque-reasoning"
+                      ? {
+                          opaqueReasoning: event.annotations.map(
+                            (annotation) => ({
+                              digest: annotation.digest,
+                              modelName: annotation.modelName,
+                              blocks: annotation.blocks.map((block) => ({
+                                ...block,
+                              })),
+                            }),
+                          ),
+                        }
+                      : {
+                          reasoningSignatures: event.signatures.map(
+                            (signature) => ({
+                              ...signature,
+                            }),
+                          ),
+                        },
+                },
+              });
+              return;
+            }
+            if (event.type === "tool-call") {
+              controller.enqueue({
+                type: "tool-call",
+                toolCallId: event.toolCallId,
+                toolName: event.toolName,
+                input: event.input,
+              });
+              return;
+            }
             controller.enqueue({
-              type: "tool-call",
-              toolCallId: event.toolCallId,
-              toolName: event.toolName,
-              input: event.input,
+              type: "finish",
+              usage: usage(event.contextTokens, event.outputTokenDelta),
+              finishReason: { unified: event.reason, raw: event.reason },
+              providerMetadata: {
+                cursor: {
+                  ...(event.contextTokens === undefined
+                    ? {}
+                    : { contextTokens: event.contextTokens }),
+                  ...(event.outputTokenDelta === undefined
+                    ? {}
+                    : { outputTokenDelta: event.outputTokenDelta }),
+                  usageScope: "cursor-turn",
+                  ...(event.turnUsage === undefined
+                    ? {}
+                    : { turnUsage: reportedCounts(event.turnUsage) }),
+                  billedCost: "unavailable",
+                },
+              },
             });
-            return;
-          }
-          if (event.type === "error") {
-            closeBlock(controller);
-            controller.enqueue({ type: "error", error: event.error });
-            return;
-          }
-          closeBlock(controller);
-          controller.enqueue({
-            type: "finish",
-            usage: usage(event.promptTokens, event.outputTokens),
-            finishReason: { unified: event.reason, raw: event.reason },
-          });
-        },
-      })),
+          },
+        }),
+      ),
     };
   };
-
   return {
     specificationVersion: "v3",
     provider: CURSOR_INTEGRATION_ID,
@@ -357,29 +248,63 @@ export function createCursorLanguageModel(options: CursorLanguageModelOptions): 
     async doGenerate(call) {
       const result = await doStream(call);
       const content: LanguageModelV3Content[] = [];
-      let finalUsage = emptyUsage();
+      let finalUsage = usage();
       let finishReason: LanguageModelV3FinishReason = {
         unified: "other",
         raw: undefined,
       };
       let warnings: SharedV3Warning[] = [];
+      let providerMetadata: SharedV3ProviderMetadata | undefined;
+      const blocks = new Map<
+        string,
+        Extract<LanguageModelV3Content, { type: "text" | "reasoning" }>
+      >();
       for await (const part of result.stream) {
         if (part.type === "stream-start") warnings = part.warnings;
-        if (part.type === "text-delta") content.push({ type: "text", text: part.delta });
-        if (part.type === "reasoning-delta") content.push({ type: "reasoning", text: part.delta });
+        if (part.type === "text-start" || part.type === "reasoning-start") {
+          const block = {
+            type:
+              part.type === "text-start"
+                ? ("text" as const)
+                : ("reasoning" as const),
+            text: "",
+            providerMetadata: part.providerMetadata,
+          };
+          blocks.set(part.id, block);
+          content.push(block);
+        }
+        if (part.type === "text-delta" || part.type === "reasoning-delta") {
+          const block = blocks.get(part.id);
+          if (block) block.text += part.delta;
+        }
+        if (part.type === "text-end" || part.type === "reasoning-end") {
+          const block = blocks.get(part.id);
+          if (block && part.providerMetadata)
+            block.providerMetadata = {
+              ...block.providerMetadata,
+              ...part.providerMetadata,
+            };
+        }
         if (part.type === "tool-call") content.push(part);
         if (part.type === "error") throw part.error;
         if (part.type === "finish") {
           finalUsage = part.usage;
           finishReason = part.finishReason;
+          providerMetadata = part.providerMetadata;
         }
       }
-      return { content, usage: finalUsage, finishReason, warnings };
+      return {
+        content,
+        usage: finalUsage,
+        finishReason,
+        warnings,
+        providerMetadata,
+      };
     },
   };
 }
 
-type LanguageContext = Pick<Plugin.Context, "aisdk" | "session">;
+type LanguageContext = Pick<Plugin.Context, "aisdk" | "session" | "event">;
 
 async function disposeRegistrations(
   registrations: readonly DisposableRegistration[],
@@ -398,66 +323,93 @@ async function disposeRegistrations(
 export async function registerCursorLanguage(
   context: LanguageContext,
   getAccessToken: AccessTokenProvider,
+  scope = crypto.randomUUID(),
 ): Promise<DisposableRegistration> {
   const providerID = Provider.ID.make(CURSOR_INTEGRATION_ID);
-  const session = await context.session.hook(
-    "context",
-    (event) => {
-      event.messages = event.messages.map((message) => ({
-        ...message,
-        content: message.content.map((part) => {
-          if (part.type !== "tool-result" || part.result.type !== "error") return part;
-          const cursor = record(part.providerMetadata?.cursor);
-          return {
-            ...part,
-            providerMetadata: {
-              ...part.providerMetadata,
-              cursor: { ...cursor, toolResultError: true },
+  const registrations: DisposableRegistration[] = [];
+  const observer = new HostToolObserver(context.event);
+  registrations.push(observer);
+  try {
+    for (const kind of ["context", "compaction", "generate", "title"] as const) {
+      registrations.push(
+        await context.session.hook(
+          kind,
+          (event) => {
+            event.messages = event.messages.map((message) => ({
+              ...message,
+              content: message.content.map((part) => {
+                if (part.type !== "tool-result" || part.result.type !== "error")
+                  return part;
+                return {
+                  ...part,
+                  providerMetadata: {
+                    ...part.providerMetadata,
+                    cursor: {
+                      ...record(part.providerMetadata?.cursor),
+                      toolResultError: true,
+                    },
+                  },
+                };
+              }),
+            }));
+          },
+          { providerID },
+        ),
+      );
+    }
+    registrations.push(
+      await context.session.hook(
+        "model.request",
+        (event) => {
+          event.headers[SESSION_HEADER] = event.sessionID;
+        },
+        { providerID },
+      ),
+    );
+    registrations.push(
+      await context.aisdk.hook(
+        "sdk",
+        (event) => {
+          event.sdk = {
+            languageModel() {
+              throw new Error("Cursor language hook was not installed");
             },
           };
-        }),
-      }));
-    },
-    { providerID },
-  );
-  let sdk: DisposableRegistration | undefined;
-  let language: DisposableRegistration | undefined;
-  try {
-    sdk = await context.aisdk.hook(
-      "sdk",
-      (event) => {
-        event.sdk = {
-          languageModel() {
-            throw new Error("Cursor language hook was not installed");
-          },
-        };
-      },
-      { providerID },
+        },
+        { providerID },
+      ),
     );
-    language = await context.aisdk.hook(
-      "language",
-      (event) => {
-        const encoded = event.model.headers?.[CURSOR_SELECTION_HEADER];
-        const selection = decodeCursorModelSelection(encoded) ??
-          literalCursorModelSelection(event.model.modelID ?? event.model.id);
-        event.language = createCursorLanguageModel({
-          modelId: event.model.id,
-          selection,
-          getAccessToken,
-        });
-      },
-      { providerID },
+    registrations.push(
+      await context.aisdk.hook(
+        "language",
+        (event) => {
+          const selection = selectionForCursorRequest(
+            currentCursorModels(),
+            event.model.id,
+            event.model.headers?.[CURSOR_SELECTION_HEADER],
+          );
+          event.language = createCursorLanguageModel({
+            modelId: event.model.id,
+            selection,
+            getAccessToken,
+            scope,
+            toolObserver: observer,
+          });
+        },
+        { providerID },
+      ),
     );
   } catch (error) {
-    await disposeRegistrations([
-      ...(sdk ? [sdk] : []),
-      session,
-    ]).catch(() => undefined);
+    await disposeRegistrations(registrations.reverse()).catch(() => undefined);
     throw error;
   }
+  let disposed = false;
   return {
     async dispose() {
-      await disposeRegistrations([language, sdk, session]);
+      if (disposed) return;
+      disposed = true;
+      stopCursorTransport(scope);
+      await disposeRegistrations(registrations.reverse());
     },
   };
 }

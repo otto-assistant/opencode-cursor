@@ -7,6 +7,7 @@ import {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MAX_TOKENS,
 } from "../shared/constants.js";
+import { groupEffortFamilies } from "./effort-family.js";
 interface VariantDescriptor {
   key: string;
   idSuffixes: readonly string[];
@@ -14,7 +15,9 @@ interface VariantDescriptor {
 }
 
 const VARIANT_DESCRIPTORS: readonly VariantDescriptor[] = [
+  variantDescriptor("default", ["default"], ["Default"]),
   variantDescriptor("none", ["none"], ["None"]),
+  variantDescriptor("minimal", ["minimal"], ["Minimal"]),
   variantDescriptor("low", ["low"], ["Low"]),
   variantDescriptor("medium", ["medium"], ["Medium"]),
   variantDescriptor(
@@ -27,16 +30,20 @@ const VARIANT_DESCRIPTORS: readonly VariantDescriptor[] = [
 ];
 
 const DEFAULT_VARIANT_ORDER = [
-  "medium",
+  "default",
   "none",
-  "high",
+  "minimal",
   "low",
+  "medium",
+  "high",
   "xhigh",
   "max",
 ] as const;
 
 const VARIANT_DISPLAY_ORDER = [
+  "default",
   "none",
+  "minimal",
   "low",
   "medium",
   "high",
@@ -112,7 +119,11 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
       const parameters = parseParameterValues(variant.parameterValues);
       const values = new Map(parameters.map((parameter) => [parameter.id, parameter.value]));
       const context = values.get("context");
-      const rawEffort = values.get("reasoning") ?? values.get("effort");
+      const rawEffort =
+        values.get("reasoning") ??
+        values.get("effort") ??
+        values.get("reasoning-effort") ??
+        values.get("reasoning_effort");
       const effort = normalizeEffort(rawEffort);
       if (rawEffort && !effort) continue;
       const structuralParts = buildStructuralParts(values, structuralParameters);
@@ -178,14 +189,7 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
     }
 
     for (const group of groups.values()) {
-      const variantsByEffort = Object.fromEntries(
-        group.selections
-          .filter((entry): entry is AvailableSelection & { effort: string } =>
-            Boolean(entry.effort),
-          )
-          .sort((a, b) => compareVariantDisplayOrder(a.effort, b.effort))
-          .map((entry) => [entry.effort, entry.selection]),
-      );
+      const variantsByEffort = variantsForGroup(group.selections);
       const defaultEntry =
         group.selections.find((entry) => entry.isDefault) ??
         selectDefaultAvailableSelection(group.selections);
@@ -223,9 +227,9 @@ export function normalizeAvailableModels(models: readonly unknown[]): CursorMode
     }
   }
 
-  return [...output.values()]
-    .map((entry) => entry.model)
-    .sort((a, b) => a.id.localeCompare(b.id));
+  return groupEffortFamilies(
+    [...output.values()].map((entry) => entry.model),
+  );
 }
 
 function selectDefaultAvailableSelection(
@@ -293,8 +297,8 @@ function buildStructuralParameterMetadata(
   const metadata = new Map<string, ParameterMetadata>();
   for (const [index, definition] of definitions.entries()) {
     const id = stringProp(definition, "id");
-    if (!id || id === "reasoning" || id === "effort") continue;
     const values = parameterDefinitionValues(definition);
+    if (!id || !splitsModel(id, values.map((value) => value.value))) continue;
     metadata.set(id, {
       id,
       baseline: values[0]?.value,
@@ -311,7 +315,7 @@ function buildStructuralParameterMetadata(
 
   for (const variant of variants) {
     for (const parameter of parseParameterValues(variant.parameterValues)) {
-      if (parameter.id === "reasoning" || parameter.id === "effort") continue;
+      if (!splitsModel(parameter.id, [parameter.value])) continue;
       const existing = metadata.get(parameter.id);
       if (existing) {
         existing.baseline ??= parameter.value;
@@ -362,8 +366,8 @@ function buildStructuralParts(
       });
       continue;
     }
-    if (parameter.id === "thinking" || parameter.id === "fast") {
-      const title = parameter.id === "thinking" ? "Thinking" : "Fast";
+    if (parameter.id === "fast") {
+      const title = "Fast";
       parts.push({
         id: value === "true" ? parameter.id : `${parameter.id}-${normalizeIdPart(value)}`,
         name: value === "true" ? title : `${title} ${label ?? value}`,
@@ -390,6 +394,79 @@ function structuralParameterSignature(
           ? [parameter.id, "present", parameter.baseline]
           : [parameter.id, "missing"],
     ),
+  );
+}
+
+function splitsModel(id: string, values: readonly string[]): boolean {
+  return !isThinkingParameter(id) && !isEffortParameter(id, values);
+}
+
+function isThinkingParameter(id: string): boolean {
+  return canonicalParameterId(id) === "thinking";
+}
+
+function isEffortParameter(id: string, values: readonly string[] = []): boolean {
+  const canonical = canonicalParameterId(id);
+  if (canonical === "reasoning" || canonical === "effort" || canonical === "reasoningeffort") {
+    return true;
+  }
+  return values.length > 0 && values.every((value) => normalizeEffort(value) !== undefined);
+}
+
+function canonicalParameterId(id: string): string {
+  return id.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function variantsForGroup(
+  selections: readonly AvailableSelection[],
+): Record<string, CursorModelSelection> {
+  const byEffort = new Map<string, AvailableSelection[]>();
+  for (const entry of selections) {
+    if (!entry.effort) continue;
+    const group = byEffort.get(entry.effort) ?? [];
+    group.push(entry);
+    byEffort.set(entry.effort, group);
+  }
+  const variants: Record<string, CursorModelSelection> = {};
+  for (const effort of [...byEffort.keys()].sort(compareVariantDisplayOrder)) {
+    variants[effort] = preferThinkingSelection(byEffort.get(effort)!).selection;
+  }
+  const thinking = selections.some((entry) => isThinking(entry.selection));
+  const nonThinking = selections.filter((entry) => !isThinking(entry.selection));
+  if (thinking && nonThinking.length > 0 && !variants.none) {
+    const none =
+      nonThinking.find((entry) => entry.isDefault) ??
+      selectDefaultAvailableSelection(nonThinking);
+    if (none) variants.none = none.selection;
+  }
+  if (Object.keys(variants).length === 0) {
+    const enabled = selections.find((entry) => isThinking(entry.selection));
+    const disabled = selections.find((entry) => !isThinking(entry.selection));
+    if (enabled && disabled) {
+      variants.none = disabled.selection;
+      variants.high = enabled.selection;
+    }
+  }
+  return Object.fromEntries(
+    Object.entries(variants).sort(([left], [right]) =>
+      compareVariantDisplayOrder(left, right),
+    ),
+  );
+}
+
+function preferThinkingSelection(
+  entries: readonly AvailableSelection[],
+): AvailableSelection {
+  return (
+    entries.find((entry) => isThinking(entry.selection)) ??
+    entries.find((entry) => entry.isDefault) ??
+    entries[0]!
+  );
+}
+
+function isThinking(selection: CursorModelSelection): boolean {
+  return selection.parameters.some(
+    (parameter) => parameter.id === "thinking" && parameter.value === "true",
   );
 }
 

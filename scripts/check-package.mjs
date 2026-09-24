@@ -1,16 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const root = process.cwd();
-const temporaryRoot = await mkdtemp(
-  join(tmpdir(), "opencode-cursor-package-"),
-);
+const temporaryRoot = await mkdtemp(join(tmpdir(), "opencode-cursor-package-"));
 
 try {
-  const packed = JSON.parse(
+  const report = JSON.parse(
     execFileSync(
       "npm",
       [
@@ -22,15 +20,15 @@ try {
       ],
       { encoding: "utf8" },
     ),
-  )[0];
+  );
+  // npm 12 keys pack results by package name; earlier releases return an array.
+  const packed = Array.isArray(report) ? report[0] : Object.values(report)[0];
   const paths = new Set(packed.files.map((file) => file.path));
   for (const required of [
     "dist/index.js",
     "dist/index.d.ts",
-    "dist/v1.js",
-    "dist/v1.d.ts",
-    "dist/h2-bridge.mjs",
-    "dist/h2-bridge-persistent.mjs",
+    "dist/h2-v2.mjs",
+    "dist/h2-unary.mjs",
     "LICENSE",
     "README.md",
     "package.json",
@@ -39,7 +37,12 @@ try {
       throw new Error(`Packed artifact is missing ${required}`);
     }
   }
-  for (const forbidden of ["src/", "test/", ".opencode/", "package-lock.json"]) {
+  for (const forbidden of [
+    "src/",
+    "test/",
+    ".opencode/",
+    "package-lock.json",
+  ]) {
     if (
       [...paths].some(
         (path) => path === forbidden || path.startsWith(forbidden),
@@ -68,12 +71,16 @@ try {
   ) {
     throw new Error("Packed default export is not an OpenCode V2 plugin");
   }
-  const loadedV1 = await import(
-    pathToFileURL(join(packageRoot, "dist", "v1.js")).href
+  const manifest = JSON.parse(
+    await readFile(join(packageRoot, "package.json"), "utf8"),
   );
-  if (typeof loadedV1.default !== "function") {
-    throw new Error("Packed ./v1 export is not an OpenCode V1 plugin");
-  }
+  if (Object.keys(manifest.exports).join() !== ".")
+    throw new Error("Packed plugin has an unexpected compatibility export");
+  const pluginDependencies = Object.keys(manifest.dependencies).filter(
+    (name) => name.includes("opencode") && name.includes("plugin"),
+  );
+  if (pluginDependencies.join() !== "@opencode/plugin")
+    throw new Error("Packed plugin has an unexpected plugin API dependency");
   execFileSync(
     process.execPath,
     [join(root, "scripts", "smoke-opencode-v2.mjs")],
@@ -81,11 +88,7 @@ try {
       cwd: root,
       env: {
         ...process.env,
-        OPENCODE_CURSOR_PLUGIN_PATH: join(
-          packageRoot,
-          "dist",
-          "index.js",
-        ),
+        OPENCODE_CURSOR_PLUGIN_PATH: join(packageRoot, "dist"),
       },
       stdio: "inherit",
     },

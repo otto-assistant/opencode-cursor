@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import type { Plugin } from "@opencode/plugin";
+import type { ProviderEditor } from "@opencode/plugin/promise/provider";
 import {
   encodeCursorModelSelection,
   type CursorModel,
@@ -6,6 +8,7 @@ import {
 import {
   createCursorCatalogState,
   registerCursorCatalog,
+  updateCursorCatalogState,
 } from "../src/opencode/catalog";
 
 const model: CursorModel = {
@@ -32,44 +35,45 @@ const model: CursorModel = {
   },
 };
 
-describe("OpenCode V2 Cursor catalog", () => {
-  test("registers a native provider with exact model and variant routing", async () => {
-    let transform: ((draft: any) => void) | undefined;
-    const context = {
-      catalog: {
-        transform: async (value: (draft: any) => void) => {
-          transform = value;
+function captureProvider() {
+  let callback: Parameters<Plugin.Context["provider"]["transform"]>[0] | undefined;
+  const unexpected = () => { throw new Error("Expected a complete source definition"); };
+  return {
+    context: {
+      provider: {
+        transform: async (value: NonNullable<typeof callback>) => {
+          callback = value;
           return { dispose: async () => {} };
         },
       },
-    };
-    const state = createCursorCatalogState([model]);
+    },
+    replay() {
+      const sources: Parameters<ProviderEditor["add"]>[0][] = [];
+      if (!callback) throw new Error("Provider transform was not registered");
+      callback({
+        add: (source) => { sources.push(source); },
+        list: () => [],
+        get: unexpected,
+        update: unexpected,
+        remove: unexpected,
+        models: { set: unexpected, update: unexpected, remove: unexpected },
+      });
+      expect(sources).toHaveLength(1);
+      return sources[0]!;
+    },
+  };
+}
 
-    await registerCursorCatalog(context as never, state);
-
-    const provider: Record<string, any> = {};
-    const catalogModel: Record<string, any> = { variants: [] };
-    transform?.({
-      provider: {
-        update(id: string, update: (draft: Record<string, any>) => void) {
-          expect(id).toBe("cursor");
-          update(provider);
-        },
-      },
-      model: {
-        update(
-          providerID: string,
-          modelID: string,
-          update: (draft: Record<string, any>) => void,
-        ) {
-          expect(providerID).toBe("cursor");
-          expect(modelID).toBe(model.id);
-          update(catalogModel);
-        },
-      },
-    });
+describe("OpenCode V2 Cursor catalog", () => {
+  test("registers a native provider with exact model and variant routing", async () => {
+    const capture = captureProvider();
+    await registerCursorCatalog(capture.context, createCursorCatalogState([model]));
+    const { info: provider, models } = capture.replay();
+    expect(models).toHaveLength(1);
+    const catalogModel = models[0]!;
 
     expect(provider).toMatchObject({
+      id: "cursor",
       name: "Cursor",
       integrationID: "cursor",
       activation: "auto",
@@ -77,6 +81,8 @@ describe("OpenCode V2 Cursor catalog", () => {
     expect(provider.package).toStartWith("aisdk:file://");
     expect(provider.package).toEndWith("/opencode/provider.js");
     expect(catalogModel).toMatchObject({
+      providerID: "cursor",
+      id: model.id,
       name: model.name,
       modelID: model.id,
       capabilities: {
@@ -111,41 +117,14 @@ describe("OpenCode V2 Cursor catalog", () => {
   });
 
   test("keeps disconnected Cursor visible for the connect flow", async () => {
-    let transform: ((draft: any) => void) | undefined;
-    const context = {
-      catalog: {
-        transform: async (value: (draft: any) => void) => {
-          transform = value;
-          return { dispose: async () => {} };
-        },
-      },
-    };
-    const state = createCursorCatalogState([]);
-    await registerCursorCatalog(context as never, state);
-
-    const provider: Record<string, any> = {};
-    const models = new Map<string, Record<string, any>>();
-    transform?.({
-      provider: {
-        update(_id: string, update: (draft: Record<string, any>) => void) {
-          update(provider);
-        },
-      },
-      model: {
-        update(
-          _providerID: string,
-          modelID: string,
-          update: (draft: Record<string, any>) => void,
-        ) {
-          const draft = { variants: [] };
-          update(draft);
-          models.set(modelID, draft);
-        },
-      },
-    });
+    const capture = captureProvider();
+    await registerCursorCatalog(capture.context, createCursorCatalogState([]));
+    const { info: provider, models } = capture.replay();
 
     expect(provider.activation).toBe("enabled");
-    expect(models.get("connect")).toMatchObject({
+    expect(models).toHaveLength(1);
+    expect(models[0]).toMatchObject({
+      id: "connect",
       name: "Connect Cursor to load models",
       enabled: true,
       capabilities: {
@@ -154,5 +133,20 @@ describe("OpenCode V2 Cursor catalog", () => {
         output: ["text"],
       },
     });
+  });
+
+  test("replaces the source inventory on refresh without mutating prior reads", async () => {
+    const capture = captureProvider();
+    const state = createCursorCatalogState([]);
+    await registerCursorCatalog(capture.context, state);
+    const disconnected = capture.replay();
+    updateCursorCatalogState(state, [model]);
+    const connected = capture.replay();
+    expect(connected.models.map((item) => item.id)).toEqual([model.id]);
+    expect(disconnected.models.map((item) => item.id)).toEqual(["connect"]);
+
+    updateCursorCatalogState(state, []);
+    expect(capture.replay().models.map((item) => item.id)).toEqual(["connect"]);
+    expect(connected.models.map((item) => item.id)).toEqual([model.id]);
   });
 });

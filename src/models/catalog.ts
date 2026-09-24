@@ -1,35 +1,26 @@
+import { createHash } from "node:crypto";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { callCursorUnaryRpc } from "../cursor-rpc.js";
 import {
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
 } from "../proto/agent_pb.js";
-import { normalizeAvailableModels } from "./available-normalizer.js";
 import type { CursorModel } from "../model-selection.js";
-import { normalizeCursorModels } from "./usable-normalizer.js";
+import { publishCursorCatalog } from "./publish.js";
+import { log } from "../shared/log.js";
 
 const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
 const AVAILABLE_MODELS_PATH = "/aiserver.v1.AiService/AvailableModels";
 
-// Cursor's AvailableModels omits some catalog entries unless they are named
-// explicitly. Grok models are user-added and never appear with an empty list.
-const ADDITIONAL_MODEL_NAMES = [
-  "grok-4-5",
-  "grok-4.20",
-  "grok-code-fast-1",
-  "grok-4-fast-reasoning",
-  "grok-4-0709",
-] as const;
-
-async function fetchCursorAvailableModels(
+async function fetchCursorAvailableRaw(
   apiKey: string,
-): Promise<CursorModel[] | null> {
+): Promise<unknown[] | null> {
   try {
     const requestBody = new TextEncoder().encode(
       JSON.stringify({
         isNightly: false,
-        excludeMaxNamedModels: true,
-        additionalModelNames: [...ADDITIONAL_MODEL_NAMES],
+        excludeMaxNamedModels: false,
+        additionalModelNames: [],
         useModelParameters: true,
         useReactModelPicker: true,
       }),
@@ -40,70 +31,100 @@ async function fetchCursorAvailableModels(
       requestBody,
       contentType: "application/json",
       connectProtocolVersion: "1",
+      timeoutMs: 60_000,
     });
     if (response.timedOut || response.exitCode !== 0 || response.body.length === 0) {
+      log.warn("[opencode-cursor] AvailableModels request failed", {
+        timedOut: response.timedOut,
+        exitCode: response.exitCode,
+        responseBytes: response.body.length,
+      });
       return null;
     }
-
     const decoded = JSON.parse(new TextDecoder().decode(response.body)) as unknown;
-    const record = asRecord(decoded);
-    const models = Array.isArray(record?.models)
-      ? normalizeAvailableModels(record.models)
-      : [];
-    return models.length > 0 ? models : null;
-  } catch {
+    const models = asRecord(decoded)?.models;
+    if (!Array.isArray(models))
+      log.warn("[opencode-cursor] AvailableModels response has no models array");
+    return Array.isArray(models) ? models : null;
+  } catch (error) {
+    log.warn("[opencode-cursor] AvailableModels request could not be decoded", {
+      error: error instanceof Error ? error.name : "unknown",
+    });
     return null;
   }
 }
 
-async function fetchCursorUsableModels(
+async function fetchCursorUsableRaw(
   apiKey: string,
-): Promise<CursorModel[] | null> {
+): Promise<readonly unknown[] | null> {
   try {
-    const requestPayload = create(GetUsableModelsRequestSchema, {});
-    const requestBody = toBinary(GetUsableModelsRequestSchema, requestPayload);
-
+    const requestBody = toBinary(
+      GetUsableModelsRequestSchema,
+      create(GetUsableModelsRequestSchema, {}),
+    );
     const response = await callCursorUnaryRpc({
       accessToken: apiKey,
       rpcPath: GET_USABLE_MODELS_PATH,
       requestBody,
+      timeoutMs: 20_000,
     });
-
     if (response.timedOut || response.exitCode !== 0 || response.body.length === 0) {
       return null;
     }
-
-    const decoded = decodeGetUsableModelsResponse(response.body);
-    if (!decoded) return null;
-
-    const models = normalizeCursorModels(decoded.models);
-    return models.length > 0 ? models : null;
+    return decodeGetUsableModelsResponse(response.body)?.models ?? null;
   } catch {
     return null;
   }
 }
 
-let cachedModels: CursorModel[] | null = null;
+const cachedModels = new Map<string, CursorModel[]>();
+let cacheGeneration = 0;
+
+export interface CursorCatalogDiscovery {
+  models: CursorModel[];
+  /** False when only GetUsableModels responded; additional first-party models may be missing. */
+  complete: boolean;
+}
 
 /**
  * Discover the live Cursor model catalog for this account.
- * Returns [] on failure — never invents a hardcoded catalog.
+ * A partial discovery is usable but must never be cached as the final catalog.
  */
-export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
-  if (cachedModels) return cachedModels;
-  const discovered =
-    (await fetchCursorAvailableModels(apiKey)) ??
-    (await fetchCursorUsableModels(apiKey));
-  if (discovered && discovered.length > 0) {
-    cachedModels = discovered;
-    return cachedModels;
+export async function getCursorModels(apiKey: string): Promise<CursorCatalogDiscovery> {
+  const credential = createHash("sha256").update(apiKey).digest("hex");
+  const cached = cachedModels.get(credential);
+  if (cached) return { models: cached, complete: true };
+  const generation = cacheGeneration;
+  const usable = await fetchCursorUsableRaw(apiKey);
+  const available = await fetchCursorAvailableRaw(apiKey);
+  const discovered = publishCursorCatalog(available ?? [], usable ?? []);
+  const complete = available !== null && available.length > 0 && usable !== null;
+  if (generation !== cacheGeneration) return { models: [], complete: false };
+  if (complete && discovered.length > 0 && !cachedModels.has(credential)) {
+    cachedModels.set(credential, discovered);
+    rememberCursorModels(discovered);
   }
-  return [];
+  return {
+    models: cachedModels.get(credential) ?? discovered,
+    complete: cachedModels.has(credential),
+  };
+}
+
+let publishedModels: readonly CursorModel[] = [];
+
+export function currentCursorModels(): readonly CursorModel[] {
+  return publishedModels;
+}
+
+export function rememberCursorModels(models: readonly CursorModel[]): void {
+  publishedModels = models;
 }
 
 /** Invalidate the in-memory catalog (after login or account change). */
 export function clearModelCache(): void {
-  cachedModels = null;
+  cacheGeneration += 1;
+  cachedModels.clear();
+  publishedModels = [];
 }
 
 function decodeGetUsableModelsResponse(payload: Uint8Array): {

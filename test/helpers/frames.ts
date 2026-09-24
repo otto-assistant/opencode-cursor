@@ -68,6 +68,7 @@ export function frameTextThenEndServerMessages(text: string): Buffer[] {
   return [
     frameConnectUnaryMessage(textPayload),
     frameConnectUnaryMessage(endPayload),
+    Buffer.from([2, 0, 0, 0, 2, 123, 125]), // Connect EndStreamResponse: {}
   ];
 }
 

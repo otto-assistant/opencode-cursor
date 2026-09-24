@@ -17,7 +17,7 @@ const projectRoot = join(temporaryRoot, "project");
 const configRoot = join(projectRoot, ".opencode");
 const pluginPath =
   process.env.OPENCODE_CURSOR_PLUGIN_PATH ??
-  join(root, "dist", "index.js");
+  join(root, "dist");
 await mkdir(configRoot, { recursive: true });
 await writeFile(
   join(configRoot, "opencode.json"),
@@ -35,13 +35,18 @@ const authorization = `Basic ${Buffer.from(
 let output = "";
 
 const child = spawn(
-  "opencode2",
+  process.env.OPENCODE_CURSOR_HOST_BINARY ??
+    join(root, "node_modules/@opencode/cli/bin/opencode.exe"),
   ["serve", "--hostname", "127.0.0.1", "--port", String(port)],
   {
     cwd: projectRoot,
     env: {
-      ...process.env,
+      PATH: process.env.PATH,
+      HOME: temporaryRoot,
+      TMPDIR: temporaryRoot,
       OPENCODE_SERVER_PASSWORD: password,
+      OPENCODE_DB: join(temporaryRoot, "host.db"),
+      OPENCODE_CONFIG_DIR: configRoot,
       XDG_CONFIG_HOME: join(temporaryRoot, "config"),
       XDG_DATA_HOME: join(temporaryRoot, "data"),
       XDG_CACHE_HOME: join(temporaryRoot, "cache"),
@@ -51,10 +56,10 @@ const child = spawn(
 );
 
 child.stdout.on("data", (chunk) => {
-  output += chunk.toString();
+  output = (output + chunk.toString()).slice(-16000);
 });
 child.stderr.on("data", (chunk) => {
-  output += chunk.toString();
+  output = (output + chunk.toString()).slice(-16000);
 });
 
 try {
@@ -62,9 +67,9 @@ try {
     "/api/plugin",
     (body) =>
       body.data?.some(
-      (plugin) =>
-        plugin.id === "opencode.provider.cursor" &&
-        plugin.status === "active",
+        (plugin) =>
+          plugin.id === "opencode.provider.cursor" &&
+          plugin.state.status === "active",
       ),
   );
 
@@ -133,6 +138,10 @@ async function pollJson(path, ready = () => true) {
       if (response.ok) {
         const body = await response.json();
         if (ready(body)) return body;
+        const details = path === "/api/plugin"
+          ? body.data?.filter((plugin) => plugin.source.type !== "builtin")
+          : body;
+        throw new Error(`${path} not ready: ${JSON.stringify(details)}`);
       }
       lastError = new Error(`${path} returned HTTP ${response.status}`);
     } catch (error) {

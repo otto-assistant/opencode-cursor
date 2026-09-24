@@ -1,4 +1,5 @@
-import type { Plugin } from "@opencode-ai/plugin";
+import { createHash } from "node:crypto";
+import type { Plugin } from "@opencode/plugin";
 import { RefreshTokenInvalidError } from "../auth.js";
 import { clearModelCache, getCursorModels } from "../models.js";
 import { log } from "../shared/log.js";
@@ -33,7 +34,6 @@ export interface CursorRuntimeServices {
   stopTransport: typeof stopCursorTransport;
   resetLogin: typeof resetPendingCursorLogin;
   clearModelCache: typeof clearModelCache;
-  sleep: (milliseconds: number) => Promise<void>;
 }
 
 const defaultServices: CursorRuntimeServices = {
@@ -47,8 +47,6 @@ const defaultServices: CursorRuntimeServices = {
   stopTransport: stopCursorTransport,
   resetLogin: resetPendingCursorLogin,
   clearModelCache,
-  sleep: (milliseconds) =>
-    new Promise((resolve) => setTimeout(resolve, milliseconds)),
 };
 
 type Cleanup = () => Promise<void> | void;
@@ -85,44 +83,45 @@ export function createCursorRuntime(
       const getAccessToken =
         services.createAccessTokenProvider(context);
       services.startTransport();
-      cleanups.push(() => services.stopTransport());
+      const scope = crypto.randomUUID();
+      cleanups.push(() => services.stopTransport(scope));
       const languageRegistration =
-        await services.registerLanguage(context, getAccessToken);
+        await services.registerLanguage(context, getAccessToken, scope);
       cleanups.push(() => languageRegistration.dispose());
+      let catalogCredential: string | undefined;
       const discoverModels = async (
         fallback: CursorCatalogState["models"],
-      ) => {
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          try {
-            const credential =
-              await services.resolveCredential(context);
-            if (!credential?.access) return [];
-            const discovered = await services.getModels(
-              credential.access,
-            );
-            if (discovered.length > 0) return discovered;
-          } catch (error) {
-            const message =
-              error instanceof Error
-                ? error.message
-                : String(error);
-            log.warn(
-              `[opencode-cursor] failed to resolve Cursor catalog (attempt ${attempt + 1}/3): ${message}`,
-            );
-            if (error instanceof RefreshTokenInvalidError) {
-              return [];
-            }
-          }
-          if (attempt < 2) {
-            await services.sleep(1_000 * (attempt + 1));
-          }
+        connectionChanged = false,
+      ): Promise<{ models: CursorCatalogState["models"]; complete: boolean; credential?: string }> => {
+        try {
+          const credential = await services.resolveCredential(context);
+          if (!credential?.access) return { models: [], complete: true };
+          const key = createHash("sha256").update(credential.access).digest("hex");
+          const discovered = await services.getModels(credential.access);
+          return {
+            models: !discovered.complete && key === catalogCredential && fallback.length
+              ? fallback
+              : discovered.models,
+            complete: discovered.complete,
+            credential: key,
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          log.warn(`[opencode-cursor] failed to resolve Cursor catalog: ${message}`);
+          if (error instanceof RefreshTokenInvalidError)
+            return { models: [], complete: true };
+          return {
+            models: connectionChanged ? [] : fallback,
+            complete: false,
+            credential: connectionChanged ? undefined : catalogCredential,
+          };
         }
-        return fallback;
       };
 
-      const initialModels = await discoverModels([]);
+      const initial = await discoverModels([]);
+      catalogCredential = initial.credential;
       const catalogState = createCursorCatalogState(
-        initialModels,
+        initial.models,
       );
       const catalogRegistration =
         await services.registerCatalog(context, catalogState);
@@ -130,21 +129,51 @@ export function createCursorRuntime(
 
       let disposed = false;
       let reloadInFlight: Promise<void> | undefined;
-      const reload = async (): Promise<void> => {
-        if (reloadInFlight) return reloadInFlight;
+      let reloadGeneration = 0;
+      let retry: ReturnType<typeof setTimeout> | undefined;
+      let retryDelay = 5_000;
+      let generation = 0;
+      let pendingReload = false;
+      const scheduleRetry = () => {
+        if (disposed || retry) return;
+        retry = setTimeout(() => {
+          retry = undefined;
+          void reload().catch((error) => {
+            log.warn("[opencode-cursor] catalog retry failed", {
+              error: error instanceof Error ? error.name : "unknown",
+            });
+            scheduleRetry();
+          });
+        }, retryDelay);
+        retryDelay = Math.min(retryDelay * 2, 60_000);
+      };
+      const reload = async (connectionChanged = false): Promise<void> => {
+        if (reloadInFlight) {
+          await reloadInFlight;
+          if (reloadGeneration === generation) return;
+        }
+        const requestGeneration = generation;
+        reloadGeneration = requestGeneration;
         reloadInFlight = (async () => {
-          const models = await discoverModels(catalogState.models);
-          if (disposed) return;
-          updateCursorCatalogState(
-            catalogState,
-            models,
-          );
-          await context.catalog.reload();
+          const discovered = await discoverModels(catalogState.models, connectionChanged);
+          if (disposed || requestGeneration !== generation) return;
+          catalogCredential = discovered.credential;
+          if (discovered.complete) retryDelay = 5_000;
+          else scheduleRetry();
+          const changed = discovered.models !== catalogState.models;
+          if (changed)
+            updateCursorCatalogState(catalogState, discovered.models);
+          if (changed || connectionChanged || pendingReload) {
+            pendingReload = true;
+            await context.provider.reload();
+            pendingReload = false;
+          }
         })().finally(() => {
           reloadInFlight = undefined;
         });
         return reloadInFlight;
       };
+      if (!initial.complete) scheduleRetry();
 
       const controller = new AbortController();
       const eventTask = (async () => {
@@ -153,14 +182,19 @@ export function createCursorRuntime(
             signal: controller.signal,
           })) {
             if (
-              event.type !== "integration.connection.updated" ||
+              event.type !== "credential.switched" ||
               event.data.integrationID !== CURSOR_INTEGRATION_ID
             ) {
               continue;
             }
+            generation += 1;
+            clearTimeout(retry);
+            retry = undefined;
+            retryDelay = 5_000;
+            pendingReload = false;
             services.clearModelCache();
             try {
-              await reload();
+              await reload(true);
             } catch (error) {
               const message =
                 error instanceof Error
@@ -169,6 +203,7 @@ export function createCursorRuntime(
               log.warn(
                 `[opencode-cursor] failed to reload Cursor connection: ${message}`,
               );
+              scheduleRetry();
             }
           }
         } catch (error) {
@@ -185,6 +220,7 @@ export function createCursorRuntime(
       })();
       cleanups.push(async () => {
         disposed = true;
+        clearTimeout(retry);
         controller.abort();
         await eventTask;
       });

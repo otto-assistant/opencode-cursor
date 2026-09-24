@@ -12,11 +12,6 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
-    },
-    "./v1": {
-      "types": "./dist/v1.d.ts",
-      "import": "./dist/v1.js",
-      "default": "./dist/v1.js"
     }
   },
   "files": [
@@ -24,12 +19,17 @@
   ],
   "scripts": {
     "build": "node scripts/clean.mjs && tsc -p tsconfig.json && node scripts/copy-runtime.mjs",
-    "test": "bun test/smoke.ts",
-    "test:v2": "bun test test/v2-*.test.ts test/bridge-pool.test.ts test/node-runtime.test.ts test/model-normalizer.test.ts test/shared-constants.test.ts",
+    "test": "bun test test/v2-*.test.ts test/auth.test.ts test/cursor-rpc.test.ts test/model-selection.test.ts test/node-runtime.test.ts test/model-normalizer.test.ts test/shared-constants.test.ts",
+    "test:v2": "npm test",
+    "test:cursor-capability": "tsc -p tsconfig.cursor-capability.json && bun build ./test/cursor-capability.test.ts --target=node --outfile=node_modules/.cache/cursor-capability-test.mjs && node node_modules/.cache/cursor-capability-test.mjs",
+    "probe:cursor-capability": "bun build ./scripts/probe-opencode-v2-cursor.ts --target=node --outfile=node_modules/.cache/cursor-capability-probe.mjs && node node_modules/.cache/cursor-capability-probe.mjs",
     "test:package": "node scripts/check-package.mjs",
     "test:v2-loader": "node scripts/smoke-opencode-v2.mjs",
+    "test:v2-host": "node scripts/test-opencode-v2-host.mjs",
+    "test:v2-probe": "node scripts/test-opencode-v2-probe.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "verify": "npm test && npm run test:v2 && npm run typecheck && npm run build && npm run test:package && npm run test:v2-loader",
+    "typecheck:fixtures": "tsc -p tsconfig.host-fixtures.json",
+    "verify": "npm test && npm run test:cursor-capability && npm run typecheck && npm run build && npm run typecheck:fixtures && npm run test:v2-host && npm run test:v2-probe && npm run test:package && npm run test:v2-loader",
     "prepublishOnly": "npm run build"
   },
   "repository": {
@@ -46,7 +46,6 @@
     "cursor",
     "cursor-pro",
     "oauth",
-    "openai-compatible",
     "ai",
     "llm",
     "streaming",
@@ -61,17 +60,16 @@
   },
   "dependencies": {
     "@ai-sdk/provider": "3.0.8",
-    "@bufbuild/protobuf": "^2.0.0",
-    "@opencode-ai/plugin": "0.0.0-beta-18050",
-    "@opencode-ai/plugin-v1": "npm:@opencode-ai/plugin@1.15.7",
-    "@opencode-ai/schema": "0.0.0-beta-18050"
+    "@bufbuild/protobuf": "^2.14.1",
+    "@opencode/plugin": "2.0.6",
+    "@opencode/schema": "2.0.6"
   },
   "devDependencies": {
-    "@opencode-ai/cli": "0.0.0-beta-18050",
-    "@types/bun": "^1.3.11",
+    "@opencode/cli": "2.0.6",
+    "@types/bun": "^1.4.2",
     "typescript": "^5.9.3"
   },
   "trustedDependencies": [
-    "@opencode-ai/cli"
+    "@opencode/cli"
   ]
 }
