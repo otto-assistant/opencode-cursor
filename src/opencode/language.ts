@@ -123,6 +123,7 @@ export function createCursorLanguageModel(
           ? { sessionID, observer: options.toolObserver }
           : undefined,
     });
+    const serverNotices: string[] = [];
     let openBlock: { type: "text" | "reasoning"; id: string } | undefined;
     const closeBlock = (
       controller: TransformStreamDefaultController<LanguageModelV3StreamPart>,
@@ -141,6 +142,10 @@ export function createCursorLanguageModel(
             controller.enqueue({ type: "stream-start", warnings });
           },
           transform(event, controller) {
+            if (event.type === "server-notice") {
+              serverNotices.push(event.text);
+              return;
+            }
             if (event.type === "text" || event.type === "reasoning") {
               if (
                 openBlock?.type !== event.type ||
@@ -230,6 +235,9 @@ export function createCursorLanguageModel(
                   ...(event.turnUsage === undefined
                     ? {}
                     : { turnUsage: reportedCounts(event.turnUsage) }),
+                  ...(serverNotices.length
+                    ? { serverNotice: serverNotices.join("").trim() }
+                    : {}),
                   billedCost: "unavailable",
                 },
               },
@@ -291,6 +299,9 @@ export function createCursorLanguageModel(
           finalUsage = part.usage;
           finishReason = part.finishReason;
           providerMetadata = part.providerMetadata;
+          const notice = providerMetadata?.cursor?.serverNotice;
+          if (typeof notice === "string" && notice)
+            warnings = [...warnings, { type: "other", message: notice }];
         }
       }
       return {

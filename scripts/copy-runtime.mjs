@@ -1,7 +1,7 @@
 import { cpSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-const runtimeFiles = ["h2-unary.mjs", "h2-v2.mjs"];
+const runtimeFiles = ["cursor-client.mjs", "h2-unary.mjs", "h2-v2.mjs"];
 
 mkdirSync("dist", { recursive: true });
 

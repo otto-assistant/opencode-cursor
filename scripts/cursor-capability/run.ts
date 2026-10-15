@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import * as p from "../../src/proto/agent_pb.js";
+import { CURSOR_CLIENT_HEADERS } from "../../src/cursor-client.mjs";
 import { buildRequest, decodeArgs, frame } from "./protocol.js";
 
 export type ObservedCall = { id: string; name: string; args: ReturnType<typeof decodeArgs> };
@@ -57,7 +58,7 @@ export async function runProbe(input: Parameters<typeof buildRequest>[0] & {
       ":method": "POST", ":path": "/agent.v1.AgentService/Run",
       "content-type": "application/connect+proto", "connect-protocol-version": "1", te: "trailers",
       authorization: `Bearer ${input.accessToken}`, "x-ghost-mode": "true",
-      "x-cursor-client-version": "cli-2026.01.09-231024f", "x-cursor-client-type": "cli",
+      ...CURSOR_CLIENT_HEADERS,
       "x-request-id": randomUUID(),
     };
     if (!input.tools.length) {

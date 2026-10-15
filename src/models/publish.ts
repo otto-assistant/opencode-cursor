@@ -17,6 +17,7 @@ export function publishCursorCatalog(
   const usableWires = usableModelIds(usableRaw);
   applyUsableWireIds(available, usableWires);
   const byId = new Map(available.map((model) => [model.id, model]));
+  const availableWires = new Set(available.flatMap(wireIds));
 
   for (const model of usable) {
     const existing = byId.get(model.id);
@@ -26,6 +27,9 @@ export function publishCursorCatalog(
       }
       continue;
     }
+    // A usable family sharing a wire ID with an AvailableModels family under
+    // another id is a legacy alias of it, not a separate model.
+    if (wireIds(model).some((id) => availableWires.has(id))) continue;
     byId.set(model.id, model);
   }
 

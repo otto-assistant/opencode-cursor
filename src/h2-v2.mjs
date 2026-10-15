@@ -3,6 +3,7 @@
 import http2 from "node:http2";
 import { randomUUID } from "node:crypto";
 import { gunzipSync } from "node:zlib";
+import { CURSOR_CLIENT_HEADERS } from "./cursor-client.mjs";
 
 const LIMIT = 8 * 1024 * 1024;
 let client;
@@ -11,6 +12,7 @@ let ended = false;
 let finished = false;
 let encoding = "identity";
 let network = Buffer.alloc(0);
+let frames = 0;
 let ipc = Buffer.alloc(0);
 
 function packet(type, data = Buffer.alloc(0)) {
@@ -75,8 +77,7 @@ function open(config) {
     te: "trailers",
     authorization: `Bearer ${config.accessToken}`,
     "x-ghost-mode": "true",
-    "x-cursor-client-version": "cli-2026.01.09-231024f",
-    "x-cursor-client-type": "cli",
+    ...CURSOR_CLIENT_HEADERS,
     "x-request-id": randomUUID(),
   };
   // Cursor's MCP tool family. Allowing only mcp_tool_call hides
@@ -111,6 +112,7 @@ function open(config) {
         if (network.length < 5 + size) break;
         let bytes = network.subarray(5, 5 + size);
         network = network.subarray(5 + size);
+        frames++;
         if (flags & 1) {
           if (encoding !== "gzip") throw new Error("unsupported-compression");
           bytes = gunzipSync(bytes, { maxOutputLength: LIMIT });
@@ -133,9 +135,15 @@ function open(config) {
       fail("invalid-connect-frame");
     }
   });
-  stream.on("end", () =>
-    finish(ended && network.length === 0 ? undefined : "premature-eof"),
-  );
+  stream.on("end", () => {
+    if (ended && network.length === 0) return finish();
+    if (!network.length) return finish("premature-eof");
+    // Sizes only: the cut frame's declared and received bytes.
+    const declared = network.length >= 5 ? network.readUInt32BE(1) : -1;
+    finish(
+      `premature-eof-partial-frame (declared=${declared}, received=${Math.max(0, network.length - 5)}, frames=${frames})`,
+    );
+  });
   stream.on("close", () => {
     if (!finished) fail("stream-closed");
   });

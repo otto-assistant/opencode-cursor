@@ -788,8 +788,8 @@ test("drains final checkpoint/blob work after turnEnded before accepting Connect
   expect(result.providerMetadata?.cursor?.contextTokens).toBe(321);
 });
 
-test("ignores a post-turn feedback form but still rejects unknown terminal updates", async () => {
-  for (const field of [21, 22]) {
+test("ignores post-turn presentation updates but still rejects unknown terminal updates", async () => {
+  for (const field of [21, 24, 99]) {
     const backend = await peer((message, stream) => {
       if (message.case !== "runRequest") return;
       stream.write(end());
@@ -799,14 +799,16 @@ test("ignores a post-turn feedback form but still rejects unknown terminal updat
             case: "interactionUpdate",
             value: fromBinary(
               p.InteractionUpdateSchema,
-              new Uint8Array([(((field << 3) | 2) & 127) | 128, 1, 0]),
+              new Uint8Array([(((field << 3) | 2) & 127) | 128, field >> 4, 0]),
             ),
           }),
         ),
       );
+      // SDK 1.0.37 latency telemetry, AgentServerMessage field 8.
+      stream.write(frame(Uint8Array.of((8 << 3) | 2, 0)));
       stream.end(close());
     });
-    if (field === 21)
+    if (field !== 99)
       expect(
         (await model(backend.url).doGenerate({ prompt })).finishReason.unified,
       ).toBe("stop");
@@ -1690,6 +1692,36 @@ test("a matching final checkpoint uses Cursor input when output deltas omit gene
   expect(result.providerMetadata?.cursor?.turnUsage).toMatchObject({ input: 90, output: 13 });
 });
 
+test("Cursor server notices become a warning and metadata, never assistant text", async () => {
+  const notice = "Switched to a fallback model after a safety filter.";
+  const flagged = create(p.TextDeltaUpdateSchema, { text: `\n\n${notice}` });
+  flagged.$unknown = [
+    { no: 2, wireType: WireType.Varint, data: Uint8Array.of(1) },
+  ];
+  const backend = await peer((message, stream) => {
+    if (message.case !== "runRequest") return;
+    stream.write(text("answer"));
+    stream.write(
+      frame(
+        encoded({
+          case: "interactionUpdate",
+          value: create(p.InteractionUpdateSchema, {
+            message: { case: "textDelta", value: flagged },
+          }),
+        }),
+      ),
+    );
+    stream.write(end());
+    stream.end(close());
+  });
+  const result = await model(backend.url).doGenerate({ prompt });
+  expect(result.content).toEqual([
+    { type: "text", text: "answer", providerMetadata: undefined },
+  ]);
+  expect(result.warnings).toEqual([{ type: "other", message: notice }]);
+  expect(result.providerMetadata?.cursor?.serverNotice).toBe(notice);
+});
+
 test("usage preserves explicit zeros and unknown fields, and rejects unsafe counters", () => {
   const decode = (
     input: Parameters<typeof create<typeof TurnUsageSchema>>[1],
@@ -1873,14 +1905,18 @@ test("declines Cursor-hosted interaction queries so the Run continues with host 
           value: create(p.CreatePlanRequestQuerySchema),
         }),
       );
-      const webFetch = create(p.InteractionQuerySchema, { id: 7 });
-      webFetch.$unknown = [
-        { no: 9, wireType: WireType.LengthDelimited, data: Uint8Array.of(0) },
-      ];
-      stream.write(frame(encoded({ case: "interactionQuery", value: webFetch })));
+      // SDK 1.0.37 queries newer than the descriptor: web fetch, PR
+      // management, MCP auth, image generation, env replacement, SCM.
+      for (const no of [9, 10, 11, 12, 13, 14]) {
+        const newer = create(p.InteractionQuerySchema, { id: no - 2 });
+        newer.$unknown = [
+          { no, wireType: WireType.LengthDelimited, data: Uint8Array.of(0) },
+        ];
+        stream.write(frame(encoded({ case: "interactionQuery", value: newer })));
+      }
     } else if (message.case === "interactionResponse") {
       answers.set(message.value.id, message.value);
-      if (answers.size === 7) {
+      if (answers.size === 12) {
         stream.write(text("continued"));
         stream.write(end());
         stream.end(close());
@@ -1902,15 +1938,17 @@ test("declines Cursor-hosted interaction queries so the Run continues with host 
     ["switchModeRequestResponse", "rejected"],
     ["createPlanRequestResponse", "error"],
   ]);
-  const webFetch = answers.get(7)!;
-  expect(webFetch.result.case).toBeUndefined();
-  const field = webFetch.$unknown?.find((item) => item.no === 9);
-  expect(field?.wireType).toBe(WireType.LengthDelimited);
-  const response = new BinaryReader(new BinaryReader(field!.data).bytes());
-  expect(response.tag()).toEqual([2, WireType.LengthDelimited]);
-  const rejected = new BinaryReader(response.bytes());
-  expect(rejected.tag()).toEqual([1, WireType.LengthDelimited]);
-  expect(rejected.string()).toContain("host tool");
+  for (const no of [9, 10, 11, 12, 13, 14]) {
+    const answer = answers.get(no - 2)!;
+    expect(answer.result.case).toBeUndefined();
+    const field = answer.$unknown?.find((item) => item.no === no);
+    expect(field?.wireType).toBe(WireType.LengthDelimited);
+    const response = new BinaryReader(new BinaryReader(field!.data).bytes());
+    expect(response.tag()).toEqual([2, WireType.LengthDelimited]);
+    const declined = new BinaryReader(response.bytes());
+    expect(declined.tag()).toEqual([1, WireType.LengthDelimited]);
+    expect(declined.string()).toMatch(no === 9 ? /host tool/ : /disabled/);
+  }
 });
 
 test("declines Cursor's native edit so formatted host reads are never written back", async () => {

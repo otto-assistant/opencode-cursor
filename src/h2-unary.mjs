@@ -2,6 +2,7 @@
 import http2 from "node:http2";
 import { randomUUID } from "node:crypto";
 import { gunzipSync } from "node:zlib";
+import { CURSOR_CLIENT_HEADERS } from "./cursor-client.mjs";
 
 const LIMIT = 8 * 1024 * 1024;
 let input = Buffer.alloc(0);
@@ -62,8 +63,7 @@ process.stdin.on("end", () => {
       te: "trailers",
       authorization: `Bearer ${config.accessToken}`,
       "x-ghost-mode": "true",
-      "x-cursor-client-version": "cli-2026.01.09-231024f",
-      "x-cursor-client-type": "cli",
+      ...CURSOR_CLIENT_HEADERS,
       "x-request-id": randomUUID(),
     });
     let response = Buffer.alloc(0);

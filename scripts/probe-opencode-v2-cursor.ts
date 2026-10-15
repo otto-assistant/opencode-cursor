@@ -3,6 +3,7 @@ import { parseArgs } from "node:util";
 import { decodeCursorModelSelection, encodeCursorModelSelection, type CursorModelSelection } from "../src/model-selection.js";
 import { contaminatedHistory, errorTrial, syntheticLongContext, tools, toolPrompt, toolTrial } from "./cursor-capability/cases.js";
 import { runProbe, type Observation } from "./cursor-capability/run.js";
+import { CURSOR_CLIENT_HEADERS } from "../src/cursor-client.mjs";
 
 async function main() {
   const { values } = parseArgs({ options: {
@@ -59,7 +60,7 @@ async function main() {
   };
   console.log(JSON.stringify({ type: "probe", version: 3, suite: values["follow-up"] ? "follow-up" : "matrix", startedAt: new Date().toISOString(),
     runBudget, timeoutMs, selections,
-    endpoint: "https://api2.cursor.sh", clientVersion: "cli-2026.01.09-231024f",
+    endpoint: "https://api2.cursor.sh", clientVersion: CURSOR_CLIENT_HEADERS["x-cursor-client-version"],
   }));
   const run = async (selection: CursorModelSelection, name: string,
     input: Omit<Parameters<typeof runProbe>[0], "accessToken" | "selection">) => {

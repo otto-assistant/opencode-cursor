@@ -289,6 +289,37 @@ describe("Cursor model normalization", () => {
     expect(models[0]?.defaultSelection.publicId).toBe("gemini-3.7-flash");
   });
 
+  test("drops a usable family that aliases an AvailableModels family under another id", () => {
+    const models = publishCursorCatalog(
+      [{
+        name: "claude-opus-9",
+        clientDisplayName: "Claude Opus 9",
+        serverModelName: "claude-opus-9",
+        parameterDefinitions: [{
+          id: "effort",
+          parameterType: {
+            enumParameter: { values: [{ value: "high" }, { value: "max" }] },
+          },
+        }],
+        variants: ["high", "max"].map((effort) => ({
+          parameterValues: [{ id: "effort", value: effort }],
+          legacySlug: `claude-9-opus-${effort}-thinking`,
+        })),
+      }],
+      [
+        { modelId: "claude-9-opus-high", displayName: "Claude Opus 9 Legacy" },
+        { modelId: "claude-9-opus-high-thinking", displayName: "Claude Opus 9 Legacy" },
+        { modelId: "claude-9-opus-max-thinking", displayName: "Claude Opus 9 Legacy" },
+        { modelId: "claude-fable-5.1", displayName: "Claude Fable 5.1" },
+      ],
+    );
+
+    expect(models.map((model) => model.id)).toEqual([
+      "claude-fable-5.1",
+      "claude-opus-9",
+    ]);
+  });
+
   test("keeps grok-4.6 stable and sends the usable wire id", () => {
     const models = publishCursorCatalog(
       [

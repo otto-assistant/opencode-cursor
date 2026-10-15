@@ -27,6 +27,7 @@ try {
   for (const required of [
     "dist/index.js",
     "dist/index.d.ts",
+    "dist/cursor-client.mjs",
     "dist/h2-v2.mjs",
     "dist/h2-unary.mjs",
     "LICENSE",
